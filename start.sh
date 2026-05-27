@@ -8,6 +8,9 @@
 set -uo pipefail  # 不用 set -e，关键节点显式错误处理
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Ctrl-C 优雅中断
+trap 'echo -e "\n${YELLOW}收到中断信号，保存状态后退出...${NC}"; exit 130' INT TERM
 cd "${SCRIPT_DIR}"
 
 RED='\033[0;31m'
@@ -178,13 +181,17 @@ _continue_project() {
     REVIEW_NUM=$(echo "$LATEST_REVIEW" | grep -oP 'iter\K\d+')
     NEXT_ITER=$((ITERATION + 1))
 
-    echo -e "${CYAN}━━━ 修订迭代 #${NEXT_ITER} ━━━${NC}"
+    echo ""
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${CYAN}  修订迭代 #${NEXT_ITER}${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo "  审稿意见: ${LATEST_REVIEW}"
     echo "  文献综述: ${WORKSPACE}/literature/literature_review.md"
     echo "  当前论文: ${WORKSPACE}/paper/paper.tex"
     echo ""
 
-    # 用 Claude Code 修订论文
+    # 阶段 A: 分析审稿 + 修订论文
+    echo -e "${CYAN}━━━ [${NEXT_ITER}.1] 分析审稿 + 修订论文 ━━━${NC}"
     cat > /tmp/cr_revise_prompt.txt << PROMPT_EOF
 你是一个论文修订专家。请根据审稿意见修改论文。
 
@@ -217,9 +224,14 @@ sm.save(state)
 sm.complete_stage(state, Stage.REVISE)
 "
 
-    # 重新提交审稿
+    # 阶段 B: 重新提交审稿
     echo ""
-    echo -e "${CYAN}━━━ 重新提交审稿 ━━━${NC}"
+    echo -e "${CYAN}━━━ [${NEXT_ITER}.2] 编译 + 提交审稿 ━━━${NC}"
+    echo "  编译 PDF: ${WORKSPACE}/paper/paper.pdf"
+
+    # 阶段 C: 等待审稿
+    echo ""
+    echo -e "${CYAN}━━━ [${NEXT_ITER}.3] 等待 paperreview.ai 审稿 ━━━${NC}"
 
     PDF_FILE="${WORKSPACE}/paper/paper.pdf"
     if [[ -f "$PDF_FILE" ]]; then
