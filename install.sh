@@ -47,16 +47,22 @@ else
   },
   "permissions": {
     "allow": [
-      "Bash(curl *)",
-      "Bash(python *)",
-      "Bash(sco *)",
-      "Bash(pdflatex *)",
-      "Bash(tectonic *)",
+      "WebSearch(*)",
       "WebFetch(*)",
+      "Bash(*)",
       "Read(*)",
       "Write(*)",
-      "Edit(*)"
-    ]
+      "Edit(*)",
+      "NotebookEdit(*)",
+      "Task(*)",
+      "Agent(*)",
+      "Skill(*)",
+      "Search(*)",
+      "Grep(*)",
+      "Glob(*)",
+      "List(*)"
+    ],
+    "deny": []
   }
 }
 CLAUDE_EOF
