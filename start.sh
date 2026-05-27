@@ -290,14 +290,13 @@ print(s)
     fi
 done
 
-# ---- 选择项目 ----
+# ---- 选择项目（↑↓ 键导航，回车确认）----
 if [[ ${#PROJECT_SLUGS[@]} -gt 0 ]]; then
-    echo -e "${CYAN}已有项目:${NC}"
-    echo ""
-    i=1
+    # 构建菜单项列表
+    MENU_FILE="/tmp/cr_menu_items.txt"
+    > "$MENU_FILE"
     for idx in "${!PROJECT_SLUGS[@]}"; do
         s="${PROJECT_STAGES[$idx]}"
-        # Translate stage to readable Chinese
         case "$s" in
             literature_search) s_disp="文献检索" ;;
             experiment_design) s_disp="实验设计" ;;
@@ -307,37 +306,29 @@ if [[ ${#PROJECT_SLUGS[@]} -gt 0 ]]; then
             poll_review) s_disp="等待审稿" ;;
             revise) s_disp="修订中" ;;
             resubmit) s_disp="重新提交" ;;
-            done) s_disp="已完成 ✓" ;;
-            failed) s_disp="失败 ✗" ;;
+            done) s_disp="已完成" ;;
+            failed) s_disp="失败" ;;
             *) s_disp="$s" ;;
         esac
-        echo "  [$i] ${PROJECT_TOPICS[$idx]:0:60}"
-        echo "      阶段: ${s_disp} | 迭代: ${PROJECT_ITERS[$idx]}"
-        echo ""
-        i=$((i + 1))
+        echo "${PROJECT_TOPICS[$idx]:0:60}  [${s_disp}] [迭代 ${PROJECT_ITERS[$idx]}]" >> "$MENU_FILE"
     done
-    echo "  [N]  开始全新研究"
-    echo "  [Q]  退出"
-    echo ""
-    read -rp "请选择 [N]: " CHOICE
-    CHOICE="${CHOICE:-N}"
 
-    if [[ "$CHOICE" =~ ^[Qq]$ ]]; then
+    CHOICE=$(python menu.py < "$MENU_FILE" 2>/dev/null)
+    rm -f "$MENU_FILE"
+
+    if [[ "$CHOICE" == "__QUIT__" ]]; then
         exit 0
-    elif [[ "$CHOICE" =~ ^[Nn]$ ]]; then
-        # 开始新项目 — 清空变量
+    elif [[ "$CHOICE" == "__NEW__" ]]; then
         PROJECT_SLUGS=()
-    elif [[ "$CHOICE" =~ ^[0-9]+$ ]] && [[ "$CHOICE" -ge 1 ]] && [[ "$CHOICE" -le ${#PROJECT_SLUGS[@]} ]]; then
-        idx=$((CHOICE - 1))
+    elif [[ "$CHOICE" =~ ^[0-9]+$ ]]; then
+        idx="$CHOICE"
         SLUG="${PROJECT_SLUGS[$idx]}"
         TOPIC="${PROJECT_TOPICS[$idx]}"
         STAGE="${PROJECT_STAGES[$idx]}"
         ITERATION="${PROJECT_ITERS[$idx]}"
         WORKSPACE="${PROJECT_WORKSPACES[$idx]}"
-        # 跳转到情况 B（继续已有项目）
         _continue_project
     else
-        echo "无效选择"
         exit 1
     fi
 fi
