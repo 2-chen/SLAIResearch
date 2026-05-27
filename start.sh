@@ -129,29 +129,22 @@ print(state.topic_slug)
     echo -e "${CYAN}━━━ Stage 1/4: 文献检索 ━━━${NC}"
     echo ""
 
-    claude -p --model "${CLAUDE_MODEL:-deepseek-v4-pro}" --output-format text \
-        --allowedTools "WebSearch,WebFetch,Bash,Read,Write,Edit" \
-        "你是一个科研助手。请针对以下研究主题进行文献检索。
+    # 直接调用学术 API（arXiv + Semantic Scholar + OpenAlex）
+    python search_papers.py "${TOPIC}" -n 20 -o "${WORKSPACE}/literature/" 2>&1
 
-研究主题: ${TOPIC}
+    # 让 Claude Code 补充分析和整理
+    if [[ -f "${WORKSPACE}/literature/literature_review.md" ]]; then
+        claude -p --model "${CLAUDE_MODEL:-deepseek-v4-pro}" --output-format text \
+            --allowedTools "Bash,Read,Write,Edit" \
+            "请阅读 ${WORKSPACE}/literature/literature_review.md，基于检索到的论文进行分析：
+1. 提炼领域概览和关键趋势
+2. 识别研究空白
+3. 提出具体的研究方向建议
+将分析结果追加到 ${WORKSPACE}/literature/literature_review.md 末尾。
 
-请完成以下任务：
-1. 使用 WebSearch 搜索该领域相关论文（arXiv、Semantic Scholar、Google Scholar）
-2. 找到至少 10-15 篇相关论文
-3. 整理成结构化的文献综述，包括：
-   - 领域概览
-   - 关键论文及其贡献
-   - 常用方法和基准
-   - 当前 SOTA 结果
-   - 研究空白
-4. 保存文献综签到: ${WORKSPACE}/literature/literature_review.md
-5. 保存 BibTeX 参考文献到: ${WORKSPACE}/literature/references.bib
-
-重要：只做文献检索，不要做其他事情。完成后明确报告'文献检索完成'。"
-
-    # 验证输出
-    if [[ ! -f "${WORKSPACE}/literature/literature_review.md" ]]; then
-        echo -e "${RED}文献检索失败：未生成 literature_review.md${NC}"
+只做分析和建议，不超过500字。完成后报告'文献分析完成'。" 2>&1
+    else
+        echo -e "${RED}文献检索失败：search_papers.py 未生成输出${NC}"
         exit 1
     fi
 

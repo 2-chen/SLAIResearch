@@ -5,9 +5,12 @@
 ## 可用工具
 
 ### 文献检索
-- `WebSearch` — 搜索网络资源
-- arXiv API: `curl "https://export.arxiv.org/api/query?search_query=..." `
-- Semantic Scholar API: key 在 config.py
+首选工具 — 直接调用学术 API:
+```bash
+python search_papers.py "research query" -o workspace/<topic>/literature/
+```
+这会自动调用 arXiv + Semantic Scholar + OpenAlex，生成 `literature_review.md` + `references.bib`。
+- WebSearch 仅作补充
 
 ### SCO 云端 GPU
 - `sco acp jobs create` — 提交训练任务
