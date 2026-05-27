@@ -1,75 +1,53 @@
 #!/usr/bin/env bash
 # =============================================================================
-# ChenResearch — 启动脚本
-# 一键启动交互式科研助手。首次运行会引导配置 API Key。
+# ChenResearch — 代码驱动的会话管理器
+# start.sh 是真正的控制器，Claude Code 是执行工具。
+# 每次启动：检查 state → 确定当前阶段 → 生成精准 prompt → claude -p 执行
+# 审稿后自动退出，下次重开继续迭代 — 保持每轮上下文干净。
 # =============================================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-echo "╔══════════════════════════════════════════════╗"
-echo "║        ChenResearch — 全自动科研系统         ║"
-echo "╚══════════════════════════════════════════════╝"
-echo ""
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
 
-# ---------------------------------------------------------------------------
-# 检查 Python 依赖
-# ---------------------------------------------------------------------------
-python -c "import requests" 2>/dev/null || {
-    echo "[setup] 安装 Python 依赖..."
-    pip install requests -q
+banner() {
+    echo ""
+    echo -e "${CYAN}╔══════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║        ChenResearch — 全自动科研系统         ║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════╝${NC}"
+    echo ""
 }
 
 # ---------------------------------------------------------------------------
-# 首次运行：配置向导
+# 首次运行配置
 # ---------------------------------------------------------------------------
 if [[ ! -f ".chenresearch_configured" ]]; then
     echo "┌──────────────────────────────────────────────┐"
-    echo "│  首次运行 — API Key 配置向导                  │"
+    echo "│  首次运行 — API Key 配置                      │"
     echo "└──────────────────────────────────────────────┘"
     echo ""
+    read -rp "DeepSeek API Key: " CLAUDE_API_KEY
+    CLAUDE_API_KEY="${CLAUDE_API_KEY:-sk-5d8ed00d568645efb4f6a544160b3849}"
+    read -rp "模型名称 [deepseek-v4-pro]: " CLAUDE_MODEL
+    CLAUDE_MODEL="${CLAUDE_MODEL:-deepseek-v4-pro}"
+    read -rp "API Base URL [https://api.deepseek.com/anthropic]: " CLAUDE_BASE_URL
+    CLAUDE_BASE_URL="${CLAUDE_BASE_URL:-https://api.deepseek.com/anthropic}"
 
-    # --- Model selection ---
-    echo "选择 AI 模型:"
-    echo "  [1] DeepSeek V4 Pro (推荐)"
-    echo "  [2] 自定义模型"
-    read -rp "请选择 [1]: " MODEL_CHOICE
-    MODEL_CHOICE="${MODEL_CHOICE:-1}"
-
-    if [[ "${MODEL_CHOICE}" == "2" ]]; then
-        read -rp "模型名称: " CLAUDE_MODEL
-        read -rp "API Base URL: " CLAUDE_BASE_URL
-        read -rp "API Key: " CLAUDE_API_KEY
-    else
-        CLAUDE_MODEL="deepseek-v4-pro"
-        CLAUDE_BASE_URL="https://api.deepseek.com/anthropic"
-        read -rp "DeepSeek API Key [默认: sk-5d8ed00d568645efb4f6a544160b3849]: " CLAUDE_API_KEY
-        CLAUDE_API_KEY="${CLAUDE_API_KEY:-sk-5d8ed00d568645efb4f6a544160b3849}"
-    fi
-    echo ""
-
-    # --- Semantic Scholar key ---
-    read -rp "Semantic Scholar API Key [默认: s2k-TxOJNhO0O615j3huoEbRfhfIUfnzoXLE2V9ZfEaq]: " S2_KEY
-    S2_KEY="${S2_KEY:-s2k-TxOJNhO0O615j3huoEbRfhfIUfnzoXLE2V9ZfEaq}"
-
-    # --- Email ---
-    read -rp "联系邮箱 [默认: 250010008@slai.edu.cn]: " EMAIL
-    EMAIL="${EMAIL:-250010008@slai.edu.cn}"
-
-    # --- 写入配置 ---
     cat > .env <<EOF
 export CLAUDE_MODEL="${CLAUDE_MODEL}"
 export CLAUDE_BASE_URL="${CLAUDE_BASE_URL}"
 export CLAUDE_API_KEY="${CLAUDE_API_KEY}"
-export SEMANTIC_SCHOLAR_API_KEY="${S2_KEY}"
-export PAPERREVIEW_EMAIL="${EMAIL}"
+export SEMANTIC_SCHOLAR_API_KEY="s2k-TxOJNhO0O615j3huoEbRfhfIUfnzoXLE2V9ZfEaq"
+export PAPERREVIEW_EMAIL="250010008@slai.edu.cn"
 export PAPERREVIEW_VENUE="AAAI"
 EOF
 
-    source .env
-
-    # 写入 Claude Code settings
     mkdir -p .claude
     cat > .claude/settings.json <<EOF
 {
@@ -79,92 +57,415 @@ EOF
     "ANTHROPIC_API_KEY": "${CLAUDE_API_KEY}"
   },
   "permissions": {
-    "allow": [
-      "WebSearch(*)",
-      "WebFetch(*)",
-      "Bash(*)",
-      "Read(*)",
-      "Write(*)",
-      "Edit(*)",
-      "NotebookEdit(*)",
-      "Task(*)",
-      "Agent(*)",
-      "Skill(*)",
-      "Search(*)",
-      "Grep(*)",
-      "Glob(*)",
-      "List(*)"
-    ],
+    "allow": ["WebSearch(*)", "WebFetch(*)", "Bash(*)", "Read(*)", "Write(*)", "Edit(*)", "NotebookEdit(*)", "Task(*)", "Agent(*)", "Skill(*)", "Search(*)", "Grep(*)", "Glob(*)", "List(*)"],
     "deny": []
   }
 }
 EOF
-
     touch .chenresearch_configured
-    echo ""
-    echo "✓ 配置完成！"
-    echo ""
+    echo -e "${GREEN}✓ 配置完成${NC}"
 fi
 
-# ---------------------------------------------------------------------------
-# 加载环境变量
-# ---------------------------------------------------------------------------
-[[ -f ".env" ]] && source .env || true
+source .env 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# 检查 Claude Code
+# 确保 Claude Code 可用
 # ---------------------------------------------------------------------------
 if ! command -v claude &>/dev/null; then
-    echo "[setup] Claude Code 未安装，正在安装..."
+    echo "[setup] 安装 Claude Code..."
     npm install -g @anthropic-ai/claude-code 2>/dev/null || {
-        echo "请手动安装 Claude Code: https://claude.ai/code"
-        exit 1
+        echo "请手动安装: https://claude.ai/code"; exit 1;
     }
 fi
 
 # ---------------------------------------------------------------------------
-# 检查是否有进行中的项目
+# 核心：根据 state 决定执行什么
 # ---------------------------------------------------------------------------
-HAS_PROJECT=false
-for state_dir in state/*/; do
-    state_file="${state_dir}state.json"
-    if [[ -f "$state_file" ]]; then
-        HAS_PROJECT=true
-        topic=$(python -c "import json; print(json.load(open('$state_file'))['topic'])" 2>/dev/null || echo "?")
-        stage=$(python -c "import json; print(json.load(open('$state_file'))['stage'])" 2>/dev/null || echo "?")
-        iteration=$(python -c "import json; print(json.load(open('$state_file'))['iteration'])" 2>/dev/null || echo "0")
-        echo "  进行中的项目: ${topic}"
-        echo "  当前阶段: ${stage} (第 ${iteration} 轮迭代)"
-        echo ""
+banner
 
-        # 检查是否有待处理的审稿
-        slug=$(basename "$state_dir")
-        review_count=$(ls workspace/*/review/review_iter*.md 2>/dev/null | wc -l)
+# 查找进行中的项目
+PROJECT_DIR=""
+TOPIC=""
+STAGE=""
+ITERATION=0
 
-        if [[ "$review_count" -gt 0 ]] && [[ "$stage" == "poll_review" || "$stage" == "revise" ]]; then
-            echo "  ⚡ 检测到审稿意见待处理 — 将进入修订模式"
-            echo "  Agent 会自动读取审稿意见并开始修订"
-        fi
+for d in state/*/; do
+    sf="${d}state.json"
+    if [[ -f "$sf" ]]; then
+        PROJECT_DIR="$d"
+        TOPIC=$(python -c "import json; print(json.load(open('$sf'))['topic'])" 2>/dev/null || echo "")
+        STAGE=$(python -c "import json; print(json.load(open('$sf'))['stage'])" 2>/dev/null || echo "")
+        ITERATION=$(python -c "import json; print(json.load(open('$sf'))['iteration'])" 2>/dev/null || echo "0")
+        SLUG=$(basename "$d")
+        WORKSPACE="workspace/$(echo "$TOPIC" | tr ' ' '_' | cut -c1-50)"
         break
     fi
 done
 
-# ---------------------------------------------------------------------------
-# 启动
-# ---------------------------------------------------------------------------
-echo ""
-echo "  模型: ${CLAUDE_MODEL:-deepseek-v4-pro}"
-echo "  会场: ${PAPERREVIEW_VENUE:-AAAI}"
-echo ""
+# ---- 情况 A：新项目 ----
+if [[ -z "$PROJECT_DIR" ]]; then
+    echo -e "${YELLOW}没有进行中的项目。请输入研究主题。${NC}"
+    echo ""
+    read -rp "研究主题: " TOPIC
+    if [[ -z "$TOPIC" ]]; then
+        echo "主题不能为空。"
+        exit 1
+    fi
 
-if $HAS_PROJECT; then
-    echo "  输入 \"继续\" 让 Agent 自动继续上一轮"
-    echo "  或输入新的研究主题开始新项目"
+    SAFE_TOPIC=$(echo "$TOPIC" | tr ' ' '_' | cut -c1-50)
+    WORKSPACE="workspace/${SAFE_TOPIC}"
+
+    # 创建目录和初始 state
+    python -c "
+from state_manager import StateManager
+sm = StateManager('state')
+state = sm.create('${TOPIC}', work_dir='${WORKSPACE}')
+print(state.topic_slug)
+" > /tmp/cr_slug.txt
+    SLUG=$(cat /tmp/cr_slug.txt)
+
+    # ===== Stage 1: 文献检索 =====
+    echo ""
+    echo -e "${CYAN}━━━ Stage 1/4: 文献检索 ━━━${NC}"
+    echo ""
+
+    claude -p --model "${CLAUDE_MODEL:-deepseek-v4-pro}" --output-format text \
+        --allowedTools "WebSearch,WebFetch,Bash,Read,Write,Edit" \
+        "你是一个科研助手。请针对以下研究主题进行文献检索。
+
+研究主题: ${TOPIC}
+
+请完成以下任务：
+1. 使用 WebSearch 搜索该领域相关论文（arXiv、Semantic Scholar、Google Scholar）
+2. 找到至少 10-15 篇相关论文
+3. 整理成结构化的文献综述，包括：
+   - 领域概览
+   - 关键论文及其贡献
+   - 常用方法和基准
+   - 当前 SOTA 结果
+   - 研究空白
+4. 保存文献综签到: ${WORKSPACE}/literature/literature_review.md
+5. 保存 BibTeX 参考文献到: ${WORKSPACE}/literature/references.bib
+
+重要：只做文献检索，不要做其他事情。完成后明确报告'文献检索完成'。"
+
+    # 验证输出
+    if [[ ! -f "${WORKSPACE}/literature/literature_review.md" ]]; then
+        echo -e "${RED}文献检索失败：未生成 literature_review.md${NC}"
+        exit 1
+    fi
+
+    python -c "
+from state_manager import StateManager, Stage
+sm = StateManager('state')
+state = sm.load('${SLUG}')
+sm.complete_stage(state, Stage.LITERATURE_SEARCH, {'papers_found': 0})
+"
+
+    # ===== Stage 2: 实验设计 =====
+    echo ""
+    echo -e "${CYAN}━━━ Stage 2/4: 实验设计 ━━━${NC}"
+    echo ""
+
+    claude -p --model "${CLAUDE_MODEL:-deepseek-v4-pro}" --output-format text \
+        --allowedTools "Bash,Read,Write,Edit,WebSearch" \
+        "你是一个机器学习研究员。请基于文献综述设计实验方案。
+
+研究主题: ${TOPIC}
+文献综述: ${WORKSPACE}/literature/literature_review.md
+
+请完成以下任务：
+1. 阅读文献综述
+2. 设计完整的实验方案，包括：
+   - 研究问题和假设
+   - 方法/模型详细描述
+   - 数据集选择
+   - 基线方法
+   - 评估指标
+   - 实验配置（超参、硬件）
+   - 消融实验设计
+3. 编写可执行的 Python 实验代码
+4. 编写 run_experiment.sh（包含环境设置、依赖安装、实验执行的全部命令）
+5. 保存实验方案到: ${WORKSPACE}/experiment/experiment_plan.md
+6. 保存代码和脚本到: ${WORKSPACE}/experiment/
+
+重要：只做实验设计，不要做其他事情。完成后明确报告'实验设计完成'。"
+
+    python -c "
+from state_manager import StateManager, Stage
+sm = StateManager('state')
+state = sm.load('${SLUG}')
+sm.complete_stage(state, Stage.EXPERIMENT_DESIGN)
+sm.start_stage(state, Stage.EXPERIMENT_EXECUTION)
+"
+
+    # ===== Stage 3: SCO 实验执行 =====
+    echo ""
+    echo -e "${CYAN}━━━ Stage 3/4: SCO 云端实验 ━━━${NC}"
+    echo ""
+
+    EXP_SCRIPT="${WORKSPACE}/experiment/run_experiment.sh"
+    if [[ -f "$EXP_SCRIPT" ]]; then
+        JOB_NAME="cr-${SLUG:0:30}"
+        echo "提交 SCO 任务: ${JOB_NAME}"
+
+        JOB_OUT=$(sco acp jobs create \
+            --workspace-name share-space \
+            --aec2-name share-cluster \
+            --job-name "${JOB_NAME}" \
+            --container-image-url registry.cn-sh-01.sensecore.cn/ccr-zhicheng-02/chen-mirror2:2chen-mini-20260410132739 \
+            --training-framework pytorch \
+            --worker-nodes 1 \
+            --worker-spec n6ls.iu.i40.4.32c512g \
+            --storage-mount 01995892-d478-76d8-aec7-13fd8284477e:/data:/250010008 \
+            --command "$(cat ${EXP_SCRIPT})" 2>&1)
+
+        JOB_ID=$(echo "$JOB_OUT" | grep -oP 'job \K\S+' || echo "")
+        echo "Job ID: ${JOB_ID}"
+
+        if [[ -n "$JOB_ID" ]]; then
+            # 轮询等待
+            echo "等待任务完成..."
+            for i in $(seq 1 120); do
+                STATUS=$(sco acp jobs describe --workspace-name share-space -o json "$JOB_ID" 2>/dev/null | python -c "import json,sys; print(json.load(sys.stdin).get('state','UNKNOWN'))" 2>/dev/null || echo "UNKNOWN")
+                echo "  状态: ${STATUS} (${i}/120)"
+                if [[ "$STATUS" == "SUCCEEDED" || "$STATUS" == "FAILED" || "$STATUS" == "STOPPED" ]]; then
+                    break
+                fi
+                sleep 30
+            done
+
+            # 获取日志
+            sco acp jobs stream-logs --workspace-name share-space "$JOB_ID" > "${WORKSPACE}/experiment/sco_logs.txt" 2>/dev/null || true
+
+            python -c "
+from state_manager import StateManager, Stage
+sm = StateManager('state')
+state = sm.load('${SLUG}')
+sm.complete_stage(state, Stage.EXPERIMENT_EXECUTION, {'job_id': '${JOB_ID}', 'job_status': '${STATUS}'})
+"
+            echo -e "${GREEN}实验完成: ${STATUS}${NC}"
+        fi
+    else
+        echo -e "${YELLOW}未找到实验脚本，跳过 SCO 执行${NC}"
+    fi
+
+    # ===== Stage 4: 论文撰写 =====
+    echo ""
+    echo -e "${CYAN}━━━ Stage 4/4: 论文撰写 ━━━${NC}"
+    echo ""
+
+    claude -p --model "${CLAUDE_MODEL:-deepseek-v4-pro}" --output-format text \
+        --allowedTools "Bash,Read,Write,Edit" \
+        "你是一个学术论文撰写专家。请撰写完整的 AAAI 格式论文。
+
+研究主题: ${TOPIC}
+会议: AAAI
+
+请阅读以下材料：
+1. 文献综述: ${WORKSPACE}/literature/literature_review.md
+2. 实验日志: ${WORKSPACE}/experiment/sco_logs.txt
+
+请完成：
+1. 撰写完整 LaTeX 论文（Title, Abstract, Introduction, Related Work, Method, Experimental Setup, Results, Discussion, Conclusion）
+2. 所有数据必须来自真实实验日志，不要编造
+3. 保存到: ${WORKSPACE}/paper/paper.tex
+4. 使用 pdflatex 编译为 PDF: ${WORKSPACE}/paper/paper.pdf
+5. 保存 BibTeX: ${WORKSPACE}/paper/references.bib
+
+重要：完成后明确报告'论文撰写完成'。"
+
+    python -c "
+from state_manager import StateManager, Stage
+sm = StateManager('state')
+state = sm.load('${SLUG}')
+sm.complete_stage(state, Stage.PAPER_WRITING)
+"
+
+    # ===== Stage 5: 提交审稿 =====
+    echo ""
+    echo -e "${CYAN}━━━ Stage 5: 提交 paperreview.ai 审稿 ━━━${NC}"
+    echo ""
+
+    PDF_FILE="${WORKSPACE}/paper/paper.pdf"
+    if [[ -f "$PDF_FILE" ]]; then
+        TOKEN=$(python -c "
+import sys; sys.path.insert(0, '.')
+from paperreview_api import submit_paper
+token = submit_paper('${PDF_FILE}', email='250010008@slai.edu.cn', venue='AAAI')
+print(token)
+" 2>&1)
+
+        echo -e "${GREEN}审稿已提交${NC}"
+        echo -e "Token: ${YELLOW}${TOKEN}${NC}"
+        echo "查看审稿: https://paperreview.ai/review?token=${TOKEN}"
+
+        python -c "
+from state_manager import StateManager, Stage, ReviewRecord
+sm = StateManager('state')
+state = sm.load('${SLUG}')
+record = ReviewRecord(iteration=0, token='${TOKEN}', submitted_at='${PDF_FILE}')
+sm.add_review(state, record)
+sm.start_stage(state, Stage.POLL_REVIEW)
+"
+
+        # ===== Stage 6: 轮询审稿 =====
+        echo ""
+        echo -e "${CYAN}━━━ Stage 6: 等待审稿结果 ━━━${NC}"
+        echo "  等待 5 分钟后开始轮询..."
+
+        REVIEW_DATA=$(python -c "
+import sys; sys.path.insert(0, '.')
+from paperreview_api import poll_review, review_to_markdown, extract_verdict
+review = poll_review('${TOKEN}', initial_wait=300, interval=60, max_wait=7200)
+md = review_to_markdown(review)
+with open('${WORKSPACE}/review/review_iter00.md', 'w') as f: f.write(md)
+verdict = extract_verdict(review)
+print(f'VERDICT={verdict}')
+" 2>&1)
+
+        VERDICT=$(echo "$REVIEW_DATA" | grep "VERDICT=" | cut -d= -f2)
+        echo ""
+        echo -e "审稿结果: ${YELLOW}${VERDICT}${NC}"
+        echo "审稿详情: ${WORKSPACE}/review/review_iter00.md"
+
+        python -c "
+from state_manager import StateManager, Stage
+sm = StateManager('state')
+state = sm.load('${SLUG}')
+state.reviews[-1]['verdict'] = '${VERDICT}'
+state.reviews[-1]['review_md_path'] = '${WORKSPACE}/review/review_iter00.md'
+sm.complete_stage(state, Stage.POLL_REVIEW, {'verdict': '${VERDICT}'})
+"
+
+        # ===== 判断是否完成 =====
+        if [[ "$VERDICT" == "accept" ]] || [[ "$VERDICT" == "weak accept" ]]; then
+            echo ""
+            echo -e "${GREEN}══════════════════════════════════════════════${NC}"
+            echo -e "${GREEN}  ★ 论文已通过审稿！Verdict: ${VERDICT}${NC}"
+            echo -e "${GREEN}══════════════════════════════════════════════${NC}"
+            python -c "
+from state_manager import StateManager
+sm = StateManager('state')
+state = sm.load('${SLUG}')
+state.stage = 'done'
+sm.save(state)
+"
+            exit 0
+        else
+            echo ""
+            echo -e "${YELLOW}══════════════════════════════════════════════${NC}"
+            echo -e "${YELLOW}  审稿未通过 (${VERDICT})${NC}"
+            echo -e "${YELLOW}  审稿意见已保存到文件${NC}"
+            echo -e "${YELLOW}  请运行 bash start.sh 启动新一轮修订${NC}"
+            echo -e "${YELLOW}══════════════════════════════════════════════${NC}"
+            exit 0
+        fi
+    fi
+
+# ---- 情况 B: 修订迭代 ----
 else
-    echo "  直接输入你的研究主题，例如："
-    echo "    \"研究多智能体强化学习在机器人协作中的应用\""
-fi
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo -e "${YELLOW}项目: ${TOPIC}${NC}"
+    echo -e "阶段: ${STAGE} (第 ${ITERATION} 轮迭代)"
+    echo ""
 
-exec claude --model "${CLAUDE_MODEL:-deepseek-v4-pro}"
+    # 找到最新的审稿
+    LATEST_REVIEW=$(ls -t "${WORKSPACE}/review/review_iter"*.md 2>/dev/null | head -1)
+
+    if [[ -z "$LATEST_REVIEW" ]]; then
+        echo "没有找到审稿意见，无法继续修订。"
+        exit 1
+    fi
+
+    REVIEW_NUM=$(echo "$LATEST_REVIEW" | grep -oP 'iter\K\d+')
+    NEXT_ITER=$((ITERATION + 1))
+
+    echo -e "${CYAN}━━━ 修订迭代 #${NEXT_ITER} ━━━${NC}"
+    echo ""
+
+    # 用 Claude Code 修订论文
+    claude -p --model "${CLAUDE_MODEL:-deepseek-v4-pro}" --output-format text \
+        --allowedTools "Bash,Read,Write,Edit,WebSearch" \
+        "你是一个论文修订专家。请根据审稿意见修改论文。
+
+研究主题: ${TOPIC}
+当前迭代: 第 ${NEXT_ITER} 轮修订
+
+请依次阅读以下文件：
+1. 审稿意见: ${LATEST_REVIEW}
+2. 文献综述: ${WORKSPACE}/literature/literature_review.md
+3. 当前论文: ${WORKSPACE}/paper/paper.tex
+
+请完成：
+1. 逐条分析审稿意见，确定哪些需要修改
+2. 修改论文。如果需要补充实验，编写实验脚本
+3. 如果补充了实验，提交 SCO 并等待结果
+4. 将修订后的论文保存到: ${WORKSPACE}/paper/paper.tex
+5. 重新编译 PDF: ${WORKSPACE}/paper/paper.pdf
+6. 撰写 response letter: ${WORKSPACE}/paper/response_letter_iter${NEXT_ITER}.md
+
+完成后明确报告'修订完成，请提交审稿'。"
+
+    python -c "
+from state_manager import StateManager, Stage
+sm = StateManager('state')
+state = sm.load('${SLUG}')
+state.iteration = ${NEXT_ITER}
+sm.save(state)
+sm.complete_stage(state, Stage.REVISE)
+"
+
+    # 重新提交审稿
+    echo ""
+    echo -e "${CYAN}━━━ 重新提交审稿 ━━━${NC}"
+
+    PDF_FILE="${WORKSPACE}/paper/paper.pdf"
+    if [[ -f "$PDF_FILE" ]]; then
+        TOKEN=$(python -c "
+import sys; sys.path.insert(0, '.')
+from paperreview_api import submit_paper
+token = submit_paper('${PDF_FILE}', email='250010008@slai.edu.cn', venue='AAAI')
+print(token)
+" 2>&1)
+
+        echo -e "新 Token: ${YELLOW}${TOKEN}${NC}"
+
+        python -c "
+from state_manager import StateManager, ReviewRecord
+sm = StateManager('state')
+state = sm.load('${SLUG}')
+record = ReviewRecord(iteration=${NEXT_ITER}, token='${TOKEN}', submitted_at='${PDF_FILE}')
+sm.add_review(state, record)
+"
+
+        # 轮询审稿
+        echo "等待审稿结果..."
+        REVIEW_DATA=$(python -c "
+import sys; sys.path.insert(0, '.')
+from paperreview_api import poll_review, review_to_markdown, extract_verdict
+review = poll_review('${TOKEN}', initial_wait=300, interval=60, max_wait=7200)
+md = review_to_markdown(review)
+iter_num = '${NEXT_ITER}'
+with open('${WORKSPACE}/review/review_iter' + iter_num.zfill(2) + '.md', 'w') as f: f.write(md)
+verdict = extract_verdict(review)
+print(f'VERDICT={verdict}')
+" 2>&1)
+
+        VERDICT=$(echo "$REVIEW_DATA" | grep "VERDICT=" | cut -d= -f2)
+
+        python -c "
+from state_manager import StateManager, Stage
+sm = StateManager('state')
+state = sm.load('${SLUG}')
+state.reviews[-1]['verdict'] = '${VERDICT}'
+state.reviews[-1]['review_md_path'] = '${WORKSPACE}/review/review_iter${NEXT_ITER}.md'
+sm.complete_stage(state, Stage.POLL_REVIEW, {'verdict': '${VERDICT}'})
+"
+
+        if [[ "$VERDICT" == "accept" ]] || [[ "$VERDICT" == "weak accept" ]]; then
+            echo -e "${GREEN}★ 论文已通过审稿！${NC}"
+        else
+            echo -e "${YELLOW}审稿未通过 (${VERDICT})，请运行 bash start.sh 继续修订${NC}"
+        fi
+    fi
+fi
