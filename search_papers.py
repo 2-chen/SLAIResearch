@@ -150,9 +150,9 @@ def search_openalex(query: str, max_results: int = 20) -> list[dict]:
             "year": str(p.get("publication_year", "")),
             "abstract": abstract,
             "url": p.get("doi", ""),
-            "arxiv_id": p.get("primary_location", {}).get("landing_page_url", "").split("/")[-1] if p.get("primary_location") else "",
-            "citations": p.get("cited_by_count", 0),
-            "venue": p.get("primary_location", {}).get("source", {}).get("display_name", ""),
+            "arxiv_id": ((p.get("primary_location") or {}).get("landing_page_url") or "").split("/")[-1] if p.get("primary_location") else "",
+            "citations": p.get("cited_by_count") or 0,
+            "venue": ((p.get("primary_location") or {}).get("source") or {}).get("display_name", ""),
         })
     return papers
 

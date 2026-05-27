@@ -185,15 +185,9 @@ print(state.topic_slug)
 
     # 让 Claude Code 补充分析和整理
     if [[ -f "${WORKSPACE}/literature/literature_review.md" ]]; then
-        claude -p --model "${CLAUDE_MODEL:-deepseek-v4-pro}" --output-format text \
-            --allowedTools "Bash,Read,Write,Edit" \
-            "请阅读 ${WORKSPACE}/literature/literature_review.md，基于检索到的论文进行分析：
-1. 提炼领域概览和关键趋势
-2. 识别研究空白
-3. 提出具体的研究方向建议
-将分析结果追加到 ${WORKSPACE}/literature/literature_review.md 末尾。
-
-只做分析和建议，不超过500字。完成后报告'文献分析完成'。" 2>&1
+        REVIEW_MD="${WORKSPACE}/literature/literature_review.md"
+        ANALYSIS_PROMPT="请阅读 ${REVIEW_MD}，基于检索到的论文进行分析：提炼领域概览和关键趋势、识别研究空白、提出具体的研究方向建议。将分析结果追加到 ${REVIEW_MD} 末尾。只做分析和建议，不超过500字。完成后报告'文献分析完成'。"
+        claude -p --model "${CLAUDE_MODEL:-deepseek-v4-pro}" --output-format text "${ANALYSIS_PROMPT}" 2>&1 || echo "[WARN] Claude 分析跳过（可手动完成）"
     else
         echo -e "${RED}文献检索失败：search_papers.py 未生成输出${NC}"
         exit 1
