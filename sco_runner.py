@@ -49,23 +49,33 @@ class SCOJob:
 def submit_job(
     script_path: str | Path,
     job_name: str,
-    remote_project_dir: str = "/data",
+    afs_work_dir: str | None = None,
     extra_env: dict[str, str] | None = None,
     config: SCOConfig | None = None,
     dry_run: bool = False,
 ) -> SCOJob:
-    """Submit an ACP training job. Returns SCOJob with job_id."""
+    """
+    提交 ACP 任务。先将脚本 cp 到 AFS 共享目录，再提交。
+    AFS 文件在本地和容器间互通，所以 --command 可以直接 cd && bash。
+    """
     if shutil.which("sco") is None:
         raise RuntimeError("sco CLI not found on PATH")
 
     cfg = config or SCOConfig()
-    script_path = Path(script_path)
+    script_path = Path(script_path).resolve()
 
-    command = _build_remote_command(
-        remote_project_dir=remote_project_dir,
-        target_script=script_path,  # 本地脚本路径，内容会被嵌入 heredoc
-        extra_env=extra_env or {},
-    )
+    # 默认 AFS 工作目录
+    if afs_work_dir is None:
+        import time
+        afs_work_dir = f"{AFS_BASE}/{job_name}_{int(time.time())}"
+    Path(afs_work_dir).mkdir(parents=True, exist_ok=True)
+
+    # 复制脚本到 AFS
+    dest = Path(afs_work_dir) / "run_experiment.sh"
+    shutil.copy2(script_path, dest)
+    logger.info("Script copied to AFS: %s", dest)
+
+    command = _build_remote_command(afs_work_dir, extra_env or {})
 
     cmd = [
         "sco", "acp", "jobs", "create",
@@ -158,26 +168,19 @@ def list_jobs(limit: int = 20, config: SCOConfig | None = None) -> list[dict]:
 # Internal
 # ---------------------------------------------------------------------------
 
-def _build_remote_command(
-    remote_project_dir: str, target_script: str | Path, extra_env: dict[str, str]
-) -> str:
-    """
-    规范格式：将脚本内容写入容器内文件，再执行。
-    --command 始终是干净的 "heredoc 写文件 → bash 执行" 两步。
-    """
-    script_path = Path(target_script)
-    script_content = script_path.read_text()
+AFS_BASE = "/data/250010008/chenresearch"
 
-    # 用 heredoc 把脚本写入容器内的固定路径
+
+def _build_remote_command(afs_work_dir: str, extra_env: dict[str, str]) -> str:
+    """
+    规范格式：cd 到 AFS 工作目录，执行 run_experiment.sh。
+    脚本文件由 submit_job 提前 cp 到 AFS，--command 极简。
+    """
     lines = ["set -euo pipefail"]
-    lines.append(f"cd {remote_project_dir}")
-    lines.append(f"export ROOT_DIR={remote_project_dir}")
-    for k, v in extra_env.items():
+    lines.append(f"cd {afs_work_dir}")
+    for k, v in (extra_env or {}).items():
         lines.append(f"export {k}={v}")
-    lines.append("cat > /data/run_experiment.sh << 'CR_SCRIPT_EOF'")
-    lines.append(script_content.rstrip())
-    lines.append("CR_SCRIPT_EOF")
-    lines.append("bash /data/run_experiment.sh")
+    lines.append("bash run_experiment.sh")
     return "\n".join(lines)
 
 
