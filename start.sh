@@ -484,6 +484,7 @@ print(f'JOB_ID={job.job_id}')
             # 轮询 + 失败自动重试（最多 3 次）
             MAX_RETRIES=3
             RETRY=0
+            SCO_FAILED=0
             while [[ $RETRY -le $MAX_RETRIES ]]; do
                 echo "等待任务完成... (第 $((RETRY+1)) 次尝试)"
                 for i in $(seq 1 180); do
@@ -543,8 +544,17 @@ print(f'JOB_ID={job.job_id}')
                     JOB_ID=$(echo "$JOB_OUT" | grep -oP 'JOB_ID=\K\S+')
                     RETRY=$((RETRY + 1))
                 else
-                    echo -e "${RED}实验失败 ${MAX_RETRIES} 次，将基于已有日志撰写论文${NC}"
+                    echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+                    echo -e "${RED}  实验失败 ${MAX_RETRIES} 次，流水线终止${NC}"
+                    echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+                    echo ""
+                    echo "  错误日志: ${WORKSPACE}/experiment/sco_logs.txt"
+                    echo "  实验脚本: ${WORKSPACE}/experiment/run_experiment.sh"
+                    echo ""
+                    echo "  请检查并修复实验脚本后重新运行 bash start.sh"
+                    echo "  或在 workspace 中手动修复后选择继续项目"
                     RETRY=$((RETRY + 1))
+                    SCO_FAILED=1
                 fi
             done
 
@@ -555,6 +565,13 @@ state = sm.load('${SLUG}')
 sm.complete_stage(state, Stage.EXPERIMENT_EXECUTION, {'job_id': '${JOB_ID}', 'job_status': '${STATUS}'})
 "
             echo -e "${GREEN}实验阶段结束: ${STATUS}${NC}"
+
+            # 实验全部失败 → 终止，不写论文
+            if [[ "${SCO_FAILED:-0}" == "1" ]]; then
+                echo ""
+                echo -e "${YELLOW}实验未成功，跳过论文撰写。修复实验后重试。${NC}"
+                exit 1
+            fi
         fi
     else
         echo -e "${YELLOW}未找到实验脚本，跳过 SCO 执行${NC}"
