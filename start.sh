@@ -141,6 +141,126 @@ PROMPT_EOF
 }
 
 # ---------------------------------------------------------------------------
+# ---- _continue_project: 继续已有项目 ----
+_continue_project() {
+    echo -e "${CYAN}继续项目: ${TOPIC}${NC}"
+    echo -e "阶段: ${STAGE} | 迭代: ${ITERATION}"
+    echo ""
+
+    # 找到最新的审稿
+    # 查找最新外部审稿
+    LATEST_REVIEW=$(ls -t "${WORKSPACE}/review/paperreview/iter"*.md 2>/dev/null | head -1)
+
+    if [[ -z "$LATEST_REVIEW" ]]; then
+        echo -e "${YELLOW}该项目尚未提交审稿（阶段: ${STAGE}）。${NC}"
+        echo "项目文件完整保留在: ${WORKSPACE}"
+        exit 1
+    fi
+
+    REVIEW_NUM=$(echo "$LATEST_REVIEW" | grep -oP 'iter\K\d+')
+    NEXT_ITER=$((ITERATION + 1))
+
+    echo -e "${CYAN}━━━ 修订迭代 #${NEXT_ITER} ━━━${NC}"
+    echo ""
+
+    # 用 Claude Code 修订论文
+    cat > /tmp/cr_revise_prompt.txt << PROMPT_EOF
+你是一个论文修订专家。请根据审稿意见修改论文。
+
+研究主题: ${TOPIC}
+当前迭代: 第 ${NEXT_ITER} 轮修订
+
+请依次阅读以下文件：
+1. 审稿意见: ${LATEST_REVIEW}
+2. 文献综述: ${WORKSPACE}/literature/literature_review.md
+3. 当前论文: ${WORKSPACE}/paper/paper.tex
+
+请完成：
+1. 逐条分析审稿意见，确定哪些需要修改
+2. 修改论文。如果需要补充实验，编写实验脚本
+3. 如果补充了实验，提交 SCO 并等待结果
+4. 将修订后的论文保存到: ${WORKSPACE}/paper/paper.tex
+5. 重新编译 PDF: ${WORKSPACE}/paper/paper.pdf
+6. 撰写 response letter: ${WORKSPACE}/paper/response_letter_iter${NEXT_ITER}.md
+
+完成后明确报告'修订完成，请提交审稿'。
+PROMPT_EOF
+    _claude_task "$(cat /tmp/cr_revise_prompt.txt)"
+
+    python -c "
+from state_manager import StateManager, Stage
+sm = StateManager('state')
+state = sm.load('${SLUG}')
+state.iteration = ${NEXT_ITER}
+sm.save(state)
+sm.complete_stage(state, Stage.REVISE)
+"
+
+    # 重新提交审稿
+    echo ""
+    echo -e "${CYAN}━━━ 重新提交审稿 ━━━${NC}"
+
+    PDF_FILE="${WORKSPACE}/paper/paper.pdf"
+    if [[ -f "$PDF_FILE" ]]; then
+        TOKEN=$(python -c "
+import sys; sys.path.insert(0, '.')
+from paperreview_api import submit_paper
+token = submit_paper('${PDF_FILE}', email='250010008@slai.edu.cn', venue='AAAI')
+print(token)
+" 2>&1)
+
+        echo -e "新 Token: ${YELLOW}${TOKEN}${NC}"
+
+        python -c "
+from state_manager import StateManager, ReviewRecord
+sm = StateManager('state')
+state = sm.load('${SLUG}')
+record = ReviewRecord(iteration=${NEXT_ITER}, token='${TOKEN}', submitted_at='${PDF_FILE}')
+sm.add_review(state, record)
+"
+
+        # 内部审稿 + 外部审稿（并行）
+        mkdir -p "${WORKSPACE}/review/paperreview" "${WORKSPACE}/review/internal"
+        ITER_PAD=$(printf "%02d" ${NEXT_ITER})
+        python internal_review.py "${PDF_FILE}" -o "${WORKSPACE}/review/internal/" &
+        INTERNAL_REVIEW_PID=$!
+
+        echo "等待 paperreview.ai 审稿结果..."
+        REVIEW_DATA=$(python -c "
+import sys; sys.path.insert(0, '.')
+from paperreview_api import poll_review, review_to_markdown, extract_verdict
+review = poll_review('${TOKEN}', initial_wait=300, interval=60, max_wait=7200)
+md = review_to_markdown(review)
+with open('${WORKSPACE}/review/paperreview/iter${ITER_PAD}.md', 'w') as f: f.write(md)
+verdict = extract_verdict(review)
+print(f'VERDICT={verdict}')
+" 2>&1)
+
+        if kill -0 ${INTERNAL_REVIEW_PID} 2>/dev/null; then
+            wait ${INTERNAL_REVIEW_PID} 2>/dev/null || true
+        fi
+
+        VERDICT=$(echo "$REVIEW_DATA" | grep "VERDICT=" | cut -d= -f2)
+
+        python -c "
+from state_manager import StateManager, Stage
+sm = StateManager('state')
+state = sm.load('${SLUG}')
+state.reviews[-1]['verdict'] = '${VERDICT}'
+state.reviews[-1]['review_md_path'] = '${WORKSPACE}/review/paperreview/iter${ITER_PAD}.md'
+sm.complete_stage(state, Stage.POLL_REVIEW, {'verdict': '${VERDICT}'})
+"
+
+        if [[ "$VERDICT" == "accept" ]] || [[ "$VERDICT" == "weak accept" ]]; then
+            echo -e "${GREEN}★ 论文已通过审稿！${NC}"
+        else
+            echo -e "${YELLOW}审稿未通过 (${VERDICT}) — 自动进入下一轮修订${NC}"
+            ITERATION=${NEXT_ITER}
+            _continue_project  # 递归自动迭代
+        fi
+    fi
+}
+
 # 核心：根据 state 决定执行什么
 # ---------------------------------------------------------------------------
 banner
@@ -556,123 +676,3 @@ sm.save(state)
         fi
     fi
 fi  # 情况 A 结束
-
-# ---- _continue_project: 继续已有项目 ----
-_continue_project() {
-    echo -e "${CYAN}继续项目: ${TOPIC}${NC}"
-    echo -e "阶段: ${STAGE} | 迭代: ${ITERATION}"
-    echo ""
-
-    # 找到最新的审稿
-    # 查找最新外部审稿
-    LATEST_REVIEW=$(ls -t "${WORKSPACE}/review/paperreview/iter"*.md 2>/dev/null | head -1)
-
-    if [[ -z "$LATEST_REVIEW" ]]; then
-        echo -e "${YELLOW}该项目尚未提交审稿（阶段: ${STAGE}）。${NC}"
-        echo "项目文件完整保留在: ${WORKSPACE}"
-        exit 1
-    fi
-
-    REVIEW_NUM=$(echo "$LATEST_REVIEW" | grep -oP 'iter\K\d+')
-    NEXT_ITER=$((ITERATION + 1))
-
-    echo -e "${CYAN}━━━ 修订迭代 #${NEXT_ITER} ━━━${NC}"
-    echo ""
-
-    # 用 Claude Code 修订论文
-    cat > /tmp/cr_revise_prompt.txt << PROMPT_EOF
-你是一个论文修订专家。请根据审稿意见修改论文。
-
-研究主题: ${TOPIC}
-当前迭代: 第 ${NEXT_ITER} 轮修订
-
-请依次阅读以下文件：
-1. 审稿意见: ${LATEST_REVIEW}
-2. 文献综述: ${WORKSPACE}/literature/literature_review.md
-3. 当前论文: ${WORKSPACE}/paper/paper.tex
-
-请完成：
-1. 逐条分析审稿意见，确定哪些需要修改
-2. 修改论文。如果需要补充实验，编写实验脚本
-3. 如果补充了实验，提交 SCO 并等待结果
-4. 将修订后的论文保存到: ${WORKSPACE}/paper/paper.tex
-5. 重新编译 PDF: ${WORKSPACE}/paper/paper.pdf
-6. 撰写 response letter: ${WORKSPACE}/paper/response_letter_iter${NEXT_ITER}.md
-
-完成后明确报告'修订完成，请提交审稿'。
-PROMPT_EOF
-    _claude_task "$(cat /tmp/cr_revise_prompt.txt)"
-
-    python -c "
-from state_manager import StateManager, Stage
-sm = StateManager('state')
-state = sm.load('${SLUG}')
-state.iteration = ${NEXT_ITER}
-sm.save(state)
-sm.complete_stage(state, Stage.REVISE)
-"
-
-    # 重新提交审稿
-    echo ""
-    echo -e "${CYAN}━━━ 重新提交审稿 ━━━${NC}"
-
-    PDF_FILE="${WORKSPACE}/paper/paper.pdf"
-    if [[ -f "$PDF_FILE" ]]; then
-        TOKEN=$(python -c "
-import sys; sys.path.insert(0, '.')
-from paperreview_api import submit_paper
-token = submit_paper('${PDF_FILE}', email='250010008@slai.edu.cn', venue='AAAI')
-print(token)
-" 2>&1)
-
-        echo -e "新 Token: ${YELLOW}${TOKEN}${NC}"
-
-        python -c "
-from state_manager import StateManager, ReviewRecord
-sm = StateManager('state')
-state = sm.load('${SLUG}')
-record = ReviewRecord(iteration=${NEXT_ITER}, token='${TOKEN}', submitted_at='${PDF_FILE}')
-sm.add_review(state, record)
-"
-
-        # 内部审稿 + 外部审稿（并行）
-        mkdir -p "${WORKSPACE}/review/paperreview" "${WORKSPACE}/review/internal"
-        ITER_PAD=$(printf "%02d" ${NEXT_ITER})
-        python internal_review.py "${PDF_FILE}" -o "${WORKSPACE}/review/internal/" &
-        INTERNAL_REVIEW_PID=$!
-
-        echo "等待 paperreview.ai 审稿结果..."
-        REVIEW_DATA=$(python -c "
-import sys; sys.path.insert(0, '.')
-from paperreview_api import poll_review, review_to_markdown, extract_verdict
-review = poll_review('${TOKEN}', initial_wait=300, interval=60, max_wait=7200)
-md = review_to_markdown(review)
-with open('${WORKSPACE}/review/paperreview/iter${ITER_PAD}.md', 'w') as f: f.write(md)
-verdict = extract_verdict(review)
-print(f'VERDICT={verdict}')
-" 2>&1)
-
-        if kill -0 ${INTERNAL_REVIEW_PID} 2>/dev/null; then
-            wait ${INTERNAL_REVIEW_PID} 2>/dev/null || true
-        fi
-
-        VERDICT=$(echo "$REVIEW_DATA" | grep "VERDICT=" | cut -d= -f2)
-
-        python -c "
-from state_manager import StateManager, Stage
-sm = StateManager('state')
-state = sm.load('${SLUG}')
-state.reviews[-1]['verdict'] = '${VERDICT}'
-state.reviews[-1]['review_md_path'] = '${WORKSPACE}/review/paperreview/iter${ITER_PAD}.md'
-sm.complete_stage(state, Stage.POLL_REVIEW, {'verdict': '${VERDICT}'})
-"
-
-        if [[ "$VERDICT" == "accept" ]] || [[ "$VERDICT" == "weak accept" ]]; then
-            echo -e "${GREEN}★ 论文已通过审稿！${NC}"
-        else
-            echo -e "${YELLOW}审稿未通过 (${VERDICT}) — 自动进入下一轮修订${NC}"
-            ITERATION=${NEXT_ITER}
-            _continue_project  # 递归自动迭代
-        fi
-    fi
-}
