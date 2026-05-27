@@ -123,14 +123,47 @@ if ! command -v claude &>/dev/null; then
 fi
 
 # ---------------------------------------------------------------------------
+# 检查是否有进行中的项目
+# ---------------------------------------------------------------------------
+HAS_PROJECT=false
+for state_dir in state/*/; do
+    state_file="${state_dir}state.json"
+    if [[ -f "$state_file" ]]; then
+        HAS_PROJECT=true
+        topic=$(python -c "import json; print(json.load(open('$state_file'))['topic'])" 2>/dev/null || echo "?")
+        stage=$(python -c "import json; print(json.load(open('$state_file'))['stage'])" 2>/dev/null || echo "?")
+        iteration=$(python -c "import json; print(json.load(open('$state_file'))['iteration'])" 2>/dev/null || echo "0")
+        echo "  进行中的项目: ${topic}"
+        echo "  当前阶段: ${stage} (第 ${iteration} 轮迭代)"
+        echo ""
+
+        # 检查是否有待处理的审稿
+        slug=$(basename "$state_dir")
+        review_count=$(ls workspace/*/review/review_iter*.md 2>/dev/null | wc -l)
+
+        if [[ "$review_count" -gt 0 ]] && [[ "$stage" == "poll_review" || "$stage" == "revise" ]]; then
+            echo "  ⚡ 检测到审稿意见待处理 — 将进入修订模式"
+            echo "  Agent 会自动读取审稿意见并开始修订"
+        fi
+        break
+    fi
+done
+
+# ---------------------------------------------------------------------------
 # 启动
 # ---------------------------------------------------------------------------
 echo ""
 echo "  模型: ${CLAUDE_MODEL:-deepseek-v4-pro}"
 echo "  会场: ${PAPERREVIEW_VENUE:-AAAI}"
 echo ""
-echo "  直接输入你的研究主题，例如："
-echo "    \"研究多智能体强化学习在机器人协作中的应用\""
+
+if $HAS_PROJECT; then
+    echo "  输入 \"继续\" 让 Agent 自动继续上一轮"
+    echo "  或输入新的研究主题开始新项目"
+else
+    echo "  直接输入你的研究主题，例如："
+    echo "    \"研究多智能体强化学习在机器人协作中的应用\""
+fi
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
