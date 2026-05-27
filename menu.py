@@ -47,19 +47,19 @@ def menu(items: list[str], title: str = "请选择", default_new: bool = True) -
     options.append("✕ 退出")
 
     def draw():
-        sys.stdout.write('\x1b[H\x1b[J')  # clear screen
-        sys.stdout.write(f'\x1b[1;36m{title}\x1b[0m\n\n')
+        sys.stderr.write('\x1b[H\x1b[J')  # clear screen
+        sys.stderr.write(f'\x1b[1;36m{title}\x1b[0m\n\n')
         for i, opt in enumerate(options):
             if i < extra_start:
                 prefix = "  "
             else:
                 prefix = ""
             if i == idx:
-                sys.stdout.write(f'\x1b[7m  ► {opt}  \x1b[0m\n')  # reverse video
+                sys.stderr.write(f'\x1b[7m  ► {opt}  \x1b[0m\n')  # reverse video
             else:
-                sys.stdout.write(f'    {opt}\n')
-        sys.stdout.write('\n\x1b[90m↑↓ 移动  ↵ 确认  Ctrl-C 退出\x1b[0m\n')
-        sys.stdout.flush()
+                sys.stderr.write(f'    {opt}\n')
+        sys.stderr.write('\n\x1b[90m↑↓ 移动  ↵ 确认  Ctrl-C 退出\x1b[0m\n')
+        sys.stderr.flush()
 
     draw()
     while True:
