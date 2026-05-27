@@ -381,17 +381,35 @@ sm.save(state)
         fi
     fi
 
-# ---- 情况 B: 修订迭代 ----
+# ---- 情况 B: 已有项目 ----
 else
-    echo -e "${YELLOW}项目: ${TOPIC}${NC}"
-    echo -e "阶段: ${STAGE} (第 ${ITERATION} 轮迭代)"
+    echo -e "${YELLOW}发现进行中的项目:${NC}"
+    echo -e "  主题: ${TOPIC}"
+    echo -e "  阶段: ${STAGE} (第 ${ITERATION} 轮迭代)"
     echo ""
+    echo "  [1] 继续已有项目"
+    echo "  [2] 开始全新研究（删除旧项目）"
+    echo "  [3] 退出"
+    echo ""
+    read -rp "请选择 [1]: " CHOICE
+    CHOICE="${CHOICE:-1}"
+
+    if [[ "$CHOICE" == "2" ]]; then
+        echo "删除旧项目..."
+        rm -rf "state/${SLUG}" "${WORKSPACE}" 2>/dev/null
+        echo "已清理。请重新运行 bash start.sh"
+        exit 0
+    elif [[ "$CHOICE" == "3" ]]; then
+        exit 0
+    fi
 
     # 找到最新的审稿
     LATEST_REVIEW=$(ls -t "${WORKSPACE}/review/review_iter"*.md 2>/dev/null | head -1)
 
     if [[ -z "$LATEST_REVIEW" ]]; then
-        echo "没有找到审稿意见，无法继续修订。"
+        echo ""
+        echo -e "${YELLOW}该项目尚未提交审稿（阶段: ${STAGE}），无法继续修订。${NC}"
+        echo "请选择 [2] 开始新研究，或手动清理 state/ 目录。"
         exit 1
     fi
 
