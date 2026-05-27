@@ -2,7 +2,7 @@
 # =============================================================================
 # ChenResearch — 全自动科研系统 安装脚本
 # =============================================================================
-# 一键安装：Python 依赖 + Claude Code + LaTeX 编译环境
+# 一键安装：Python 依赖 + Claude Code + LaTeX + SCO 检查
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
@@ -98,9 +98,22 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 4. 验证
+# 4. SCO CLI（SenseCore 内部工具，仅检查）
 # ---------------------------------------------------------------------------
-echo "[4/4] 验证安装 …"
+echo "[4/5] 检查 SCO CLI …"
+if command -v sco &>/dev/null; then
+    SCO_USER=$(sco config list 2>/dev/null | grep username | cut -d= -f2 | tr -d " '" || echo "?")
+    SCO_ZONE=$(sco config list 2>/dev/null | grep zone | cut -d= -f2 | tr -d " '" || echo "?")
+    echo "  SCO CLI: 已安装 (用户: ${SCO_USER}, zone: ${SCO_ZONE})"
+else
+    echo "  [WARN] SCO CLI 未安装 — 云端 GPU 实验功能不可用"
+    echo "  SCO 是 SenseCore 内部工具，需在 SenseCore 环境中使用"
+fi
+
+# ---------------------------------------------------------------------------
+# 5. 验证
+# ---------------------------------------------------------------------------
+echo "[5/5] 验证安装 …"
 
 # Python
 python -c "import requests; print('  requests: OK')"
@@ -114,6 +127,13 @@ if command -v claude &>/dev/null; then
     echo "  Claude Code: $(claude --version 2>/dev/null || echo 'installed')"
 else
     echo "  [WARN] Claude Code CLI 未安装 — 请手动执行: npm install -g @anthropic-ai/claude-code"
+fi
+
+# SCO CLI
+if command -v sco &>/dev/null; then
+    echo "  SCO CLI: 已安装 (云端 GPU 实验可用)"
+else
+    echo "  [WARN] SCO CLI 未安装 — 云端 GPU 实验不可用"
 fi
 
 # LaTeX
