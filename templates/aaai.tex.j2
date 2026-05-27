@@ -1,32 +1,45 @@
 <%doc>
-AAAI Press LaTeX template (Jinja2).
-Variables: title, authors (list of {name, affiliation}), abstract, sections (list of {heading, content}), references_bibtex
+AAAI 2026 LaTeX Template (Jinja2) — based on official AAAI Press formatting instructions.
+Requires: aaai2026.sty, aaai2026.bst (in same directory or texmf path)
+
+Variables:
+  title        — paper title (mixed case, NOT sentence case)
+  authors      — list of {name: str}
+  affiliations — list of str (one per line)
+  abstract     — abstract text
+  sections     — list of {heading: str, content: str}
+  bibliography_file — .bib filename without extension (default: references)
 <%doc>
-
-\documentclass[letterpaper]{article}
-
-% AAAI style
-\usepackage{aaai24}
-
-% Math and symbols
+\documentclass[letterpaper]{article} % DO NOT CHANGE THIS
+\usepackage[submission]{aaai2026}  % DO NOT CHANGE THIS
+\usepackage{times}  % DO NOT CHANGE THIS
+\usepackage{helvet}  % DO NOT CHANGE THIS
+\usepackage{courier}  % DO NOT CHANGE THIS
+\usepackage[hyphens]{url}  % DO NOT CHANGE THIS
+\usepackage{graphicx} % DO NOT CHANGE THIS
+\urlstyle{rm} % DO NOT CHANGE THIS
+\def\UrlFont{\rm}  % DO NOT CHANGE THIS
+\usepackage{natbib}  % DO NOT CHANGE THIS AND DO NOT ADD ANY OPTIONS TO IT
+\usepackage{caption} % DO NOT CHANGE THIS AND DO NOT ADD ANY OPTIONS TO IT
+\usepackage{booktabs}
 \usepackage{amsmath,amssymb,amsfonts}
 \usepackage{bm}
-\usepackage{booktabs}
-\usepackage{graphicx}
 \usepackage{subcaption}
-\usepackage{multirow}
-\usepackage[table]{xcolor}
-\usepackage{hyperref}
-\usepackage{cleveref}
+\frenchspacing  % DO NOT CHANGE THIS
+\setlength{\pdfpagewidth}{8.5in} % DO NOT CHANGE THIS
+\setlength{\pdfpageheight}{11in} % DO NOT CHANGE THIS
+\pdfinfo{/TemplateVersion (2026.1)}
 
+\setcounter{secnumdepth}{0}
+
+% ── Title (must be mixed case, not sentence case) ──
 \title{<< title >>}
 
-\author{
-<<% for author in authors %>>
-    << author.name >> \textsuperscript{<< loop.index >>} \\
-    <<% if author.affiliation %>>
-    \textsuperscript{<< loop.index >>}<< author.affiliation >> \\
-    <<% endif %>>
+% ── Authors ──
+\author{<< authors|map(attribute='name')|join(', ') >>}
+\affiliations{
+<<% for aff in affiliations %>>
+    << aff >>
 <<% endfor %>>
 }
 
@@ -43,8 +56,6 @@ Variables: title, authors (list of {name, affiliation}), abstract, sections (lis
 
 <<% endfor %>>
 
-% Bibliography
-\bibliography{references}
-\bibliographystyle{aaai24}
+\bibliography{<< bibliography_file | default('references') >>}
 
 \end{document}

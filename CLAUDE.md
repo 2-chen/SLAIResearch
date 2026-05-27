@@ -20,7 +20,8 @@ python search_papers.py "research query" -o workspace/<topic>/literature/
 
 ### 论文工具
 - `pdflatex` — 编译 LaTeX
-- AAAI 模板: `templates/aaai.tex.j2`
+- AAAI 2026 模板: `templates/aaai.tex.j2` (Jinja2) + `templates/aaai2026.sty` + `templates/aaai2026.bst`
+- 编译前必须把 `aaai2026.sty` 和 `aaai2026.bst` 复制到 paper 目录
 - `python internal_review.py paper.pdf` — 内部多维度审稿（5位审稿人）
 
 ### Python 工具

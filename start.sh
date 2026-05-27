@@ -248,23 +248,33 @@ sm.complete_stage(state, Stage.EXPERIMENT_EXECUTION, {'job_id': '${JOB_ID}', 'jo
     echo -e "${CYAN}━━━ Stage 4/4: 论文撰写 ━━━${NC}"
     echo ""
 
+    # 复制 AAAI 2026 样式文件
+    cp templates/aaai2026.sty "${WORKSPACE}/paper/" 2>/dev/null || true
+    cp templates/aaai2026.bst "${WORKSPACE}/paper/" 2>/dev/null || true
+
     claude -p --model "${CLAUDE_MODEL:-deepseek-v4-pro}" --output-format text \
         --allowedTools "Bash,Read,Write,Edit" \
-        "你是一个学术论文撰写专家。请撰写完整的 AAAI 格式论文。
+        "你是一个学术论文撰写专家。请撰写完整的 AAAI 2026 格式论文。
 
 研究主题: ${TOPIC}
-会议: AAAI
+会议: AAAI 2026
+
+样式文件已放在 ${WORKSPACE}/paper/ 目录下（aaai2026.sty, aaai2026.bst）。
+LaTeX 模板参考: templates/aaai.tex.j2
 
 请阅读以下材料：
 1. 文献综述: ${WORKSPACE}/literature/literature_review.md
 2. 实验日志: ${WORKSPACE}/experiment/sco_logs.txt
 
 请完成：
-1. 撰写完整 LaTeX 论文（Title, Abstract, Introduction, Related Work, Method, Experimental Setup, Results, Discussion, Conclusion）
-2. 所有数据必须来自真实实验日志，不要编造
-3. 保存到: ${WORKSPACE}/paper/paper.tex
-4. 使用 pdflatex 编译为 PDF: ${WORKSPACE}/paper/paper.pdf
-5. 保存 BibTeX: ${WORKSPACE}/paper/references.bib
+1. 撰写 LaTeX 论文，必须使用 \usepackage[submission]{aaai2026} 样式
+2. Preamble 必须包含: times, helvet, courier, natbib, caption, graphicx
+3. 禁止使用的包: hyperref, authblk, geometry, float, titlesec, setspace, fullpage, ulem
+4. 所有数据必须来自真实实验日志，不要编造
+5. 保存到: ${WORKSPACE}/paper/paper.tex
+6. 编译前确保 aaai2026.sty 和 aaai2026.bst 在同一目录
+7. 用 pdflatex 编译为 PDF: ${WORKSPACE}/paper/paper.pdf
+8. 保存 BibTeX: ${WORKSPACE}/paper/references.bib
 
 重要：完成后明确报告'论文撰写完成'。"
 
