@@ -249,17 +249,23 @@ sm.start_stage(state, Stage.EXPERIMENT_EXECUTION)
         JOB_NAME="cr-${SLUG:0:30}"
         echo "提交 SCO 任务: ${JOB_NAME}"
 
-        # 通过 sco_runner 规范提交（自动 heredoc 包装脚本 → bash 执行）
+        # 通过 sco_runner 规范提交（cp 到 AFS → cd && bash）
+        set +e  # 暂时关闭 errexit，捕获错误
         JOB_OUT=$(python -c "
 from sco_runner import submit_job
 from pathlib import Path
 job = submit_job(Path('${EXP_SCRIPT}'), '${JOB_NAME}')
 print(f'JOB_ID={job.job_id}')
 " 2>&1)
-        JOB_ID=$(echo "$JOB_OUT" | grep "JOB_ID=" | cut -d= -f2)
-        echo "Job ID: ${JOB_ID}"
+        SCO_EXIT=$?
+        set -e
 
-        if [[ -n "$JOB_ID" && "$JOB_ID" != "dry-run-0" ]]; then
+        echo "${JOB_OUT}"
+        JOB_ID=$(echo "$JOB_OUT" | grep -oP 'JOB_ID=\K\S+')
+
+        if [[ "$SCO_EXIT" -ne 0 ]] || [[ -z "$JOB_ID" ]]; then
+            echo -e "${RED}SCO 提交失败，跳过实验执行阶段${NC}"
+        else
             echo "等待任务完成..."
             for i in $(seq 1 180); do
                 STATUS=$(sco acp jobs describe --workspace-name share-space -o json "$JOB_ID" 2>/dev/null | python -c "import json,sys; print(json.load(sys.stdin).get('state','UNKNOWN'))" 2>/dev/null || echo "UNKNOWN")
