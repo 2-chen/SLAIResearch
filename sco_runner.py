@@ -178,6 +178,13 @@ def _parse_job_id(stdout: str) -> str:
             return data.get("job_id") or data.get("id") or data.get("name", "")
     except json.JSONDecodeError:
         pass
+    # "job pt-xxx submitted successfully, ..." → second word
+    for line in stdout.strip().splitlines():
+        line = line.strip()
+        if line.startswith("job ") and "submitted" in line:
+            parts = line.split()
+            if len(parts) >= 2:
+                return parts[1]
     for line in stdout.strip().splitlines():
         line = line.strip()
         if line and not line.startswith("+") and not line.startswith("|"):

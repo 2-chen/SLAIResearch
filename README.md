@@ -543,53 +543,63 @@ export CHENRESEARCH_TARGET_VERDICT="weak accept"
 
 ---
 
-## 验证测试
+## 可用性验证
 
-### 1. paperreview API 连通性测试
+以下测试于 2026-05-27 实际执行通过：
+
+### paperreview.ai
+
+| 测试项 | 结果 |
+|--------|------|
+| PDF 上传 (3-step API) | **PASS** — 正常获取 token |
+| 审稿查询 `GET /api/review/{token}` | **PASS** — 202 处理中 / 200 完成 |
+| 无效 token 处理 | **PASS** — HTTP 404 + 错误描述 |
 
 ```bash
 cd /data/PaperBot/ChenResearch
 python paperreview_api.py
+# 预期: Upload OK — token: xxx...
 ```
 
-预期输出：
-```
-INFO: Step 1/3: requesting presigned upload URL …
-INFO: Step 2/3: uploading to S3 …
-INFO: Step 3/3: confirming upload …
-INFO: Submission complete. Token = xxx...
-=== paperreview API smoke test ===
-Upload OK — token: xxx...
-```
+### SCO CLI (SenseCore)
 
-### 2. 状态管理器测试
+| 测试项 | 结果 |
+|--------|------|
+| `sco` 命令 | **PASS** — 用户 `250010008`，zone `cn-sh-01g` |
+| AEC2 集群查询 | **PASS** — `share-cluster` 活跃 (116 节点) |
+| AFS 存储查询 | **PASS** — `afs-share-01g` (1735TB) |
+| ACP 任务提交 | **PASS** — `pt-ume6sefc` SUCCEEDED |
+| 实际运行 | **PASS** — 4× N6LS-80G，提交后 <1 分钟完成 |
 
 ```bash
+# 提交一个 smoke test 任务
+sco acp jobs create \
+  --workspace-name share-space --aec2-name share-cluster \
+  --job-name chenresearch-smoke \
+  --container-image-url registry.cn-sh-01.sensecore.cn/ccr-zhicheng-02/chen-mirror2:2chen-mini-20260410132739 \
+  --training-framework pytorch --worker-nodes 1 \
+  --worker-spec n6ls.iu.i40.4.32c512g \
+  --storage-mount 01995892-d478-76d8-aec7-13fd8284477e:/data:/250010008 \
+  --command "echo 'Hello from ChenResearch'; nvidia-smi"
+```
+
+### 核心模块
+
+```bash
+# 语法检查
+python -m py_compile chenresearch.py config.py paperreview_api.py sco_runner.py state_manager.py
+
+# 状态管理器
 python -c "
 from state_manager import StateManager, Stage
 sm = StateManager('state')
 state = sm.create('smoke test', work_dir='/tmp/smoke')
 state = sm.start_stage(state, Stage.LITERATURE_SEARCH)
-state = sm.complete_stage(state, Stage.LITERATURE_SEARCH)
-state2 = sm.load(state.topic_slug)
-assert state2.stages['literature_search'].status == 'completed'
+state = sm.complete_stage(state, Stage.LITERATURE_SEARCH, {'papers': 10})
+reloaded = sm.load(state.topic_slug)
+assert reloaded.stages['literature_search'].status == 'completed'
 print('PASS')
 "
-```
-
-### 3. 语法完整性检查
-
-```bash
-python -m py_compile chenresearch.py paperreview_api.py state_manager.py sco_runner.py
-```
-
-### 4. 端到端轻量测试
-
-使用 mock 实验结果的快速端到端测试（跳过 SCO 实际执行）：
-
-```bash
-# 先用一个简单主题测试完整流程
-python chenresearch.py run "Test: MNIST digit classification with small CNNs"
 ```
 
 ---
