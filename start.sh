@@ -83,7 +83,22 @@ fi
 # ---------------------------------------------------------------------------
 _claude_task() {
     local prompt="$1"
-    echo "$prompt" | claude -p --model "${CLAUDE_MODEL:-deepseek-v4-pro}" --output-format text 2>&1
+    local log="${2:-/tmp/cr_claude_output.txt}"
+
+    echo -e "${CYAN}  Claude Code 正在工作中...${NC}"
+    echo "  (输出实时显示，可能需要几分钟)"
+
+    # 实时输出到终端 + 同时保存到日志
+    echo "$prompt" | claude -p --model "${CLAUDE_MODEL:-deepseek-v4-pro}" --output-format text 2>&1 | tee "$log"
+
+    local rc=${PIPESTATUS[0]}
+    echo ""
+    if [[ $rc -eq 0 ]]; then
+        echo -e "${GREEN}  Claude Code 完成${NC}"
+    else
+        echo -e "${YELLOW}  Claude Code 退出码: $rc${NC}"
+    fi
+    return $rc
 }
 
 # 故障接管：遇到报错时保存状态 → 启动 Claude Code 诊断修复
@@ -164,6 +179,9 @@ _continue_project() {
     NEXT_ITER=$((ITERATION + 1))
 
     echo -e "${CYAN}━━━ 修订迭代 #${NEXT_ITER} ━━━${NC}"
+    echo "  审稿意见: ${LATEST_REVIEW}"
+    echo "  文献综述: ${WORKSPACE}/literature/literature_review.md"
+    echo "  当前论文: ${WORKSPACE}/paper/paper.tex"
     echo ""
 
     # 用 Claude Code 修订论文
