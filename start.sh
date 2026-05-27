@@ -312,7 +312,8 @@ if [[ ${#PROJECT_SLUGS[@]} -gt 0 ]]; then
         MENU_ARGS+=("${PROJECT_TOPICS[$idx]:0:60}  [${s_disp}] [迭代 ${PROJECT_ITERS[$idx]}]")
     done
 
-    CHOICE=$(python menu.py "${MENU_ARGS[@]}")
+    python menu.py "${MENU_ARGS[@]}"
+    CHOICE=$(cat /tmp/cr_menu_result.txt 2>/dev/null || echo "__QUIT__")
 
     if [[ "$CHOICE" == "__QUIT__" ]]; then
         exit 0

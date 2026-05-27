@@ -64,13 +64,15 @@ if __name__ == '__main__':
         line.rstrip('\n') for line in sys.stdin if line.strip()
     ]
     if not items:
-        print("No items", file=sys.stderr)
         sys.exit(1)
 
     result = menu_curses(items)
+
+    # 结果写入临时文件（不能 print 到 stdout，因为 $() 会破坏 curses）
+    outfile = "/tmp/cr_menu_result.txt"
     if result is None:
-        print("__NEW__")
+        with open(outfile, 'w') as f: f.write("__NEW__")
     elif result == -1:
-        print("__QUIT__")
+        with open(outfile, 'w') as f: f.write("__QUIT__")
     else:
-        print(result)
+        with open(outfile, 'w') as f: f.write(str(result))
