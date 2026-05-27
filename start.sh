@@ -167,7 +167,7 @@ _continue_project() {
 
     # 找到最新的审稿
     # 查找最新外部审稿（兼容新旧路径）
-    LATEST_REVIEW=$(ls -t "${WORKSPACE}/review/paperreview/iter"*.md "${WORKSPACE}/review/review_iter"*.md 2>/dev/null | head -1)
+    LATEST_REVIEW=$(ls -t "${WORKSPACE}/review/round_"*/external.md 2>/dev/null | head -1)
 
     if [[ -z "$LATEST_REVIEW" ]]; then
         echo -e "${YELLOW}该项目尚未提交审稿，或审稿文件路径不匹配。${NC}"
@@ -253,9 +253,9 @@ sm.add_review(state, record)
 "
 
         # 内部审稿 + 外部审稿（并行）
-        mkdir -p "${WORKSPACE}/review/paperreview" "${WORKSPACE}/review/internal"
-        ITER_PAD=$(printf "%02d" ${NEXT_ITER})
-        python internal_review.py "${PDF_FILE}" -o "${WORKSPACE}/review/internal/" &
+        ROUND_DIR="${WORKSPACE}/review/round_$(printf "%03d" ${NEXT_ITER})"
+        mkdir -p "${ROUND_DIR}/internal"
+        python internal_review.py "${PDF_FILE}" -o "${ROUND_DIR}/internal/" &
         INTERNAL_REVIEW_PID=$!
 
         echo "等待 paperreview.ai 审稿结果..."
@@ -264,7 +264,7 @@ import sys; sys.path.insert(0, '.')
 from paperreview_api import poll_review, review_to_markdown, extract_verdict
 review = poll_review('${TOKEN}', initial_wait=300, interval=60, max_wait=7200)
 md = review_to_markdown(review)
-with open('${WORKSPACE}/review/paperreview/iter${ITER_PAD}.md', 'w') as f: f.write(md)
+with open('${ROUND_DIR}/external.md', 'w') as f: f.write(md)
 verdict = extract_verdict(review)
 print(f'VERDICT={verdict}')
 " 2>&1)
@@ -280,7 +280,7 @@ from state_manager import StateManager, Stage
 sm = StateManager('state')
 state = sm.load('${SLUG}')
 state.reviews[-1]['verdict'] = '${VERDICT}'
-state.reviews[-1]['review_md_path'] = '${WORKSPACE}/review/paperreview/iter${ITER_PAD}.md'
+state.reviews[-1]['review_md_path'] = '${ROUND_DIR}/external.md'
 sm.complete_stage(state, Stage.POLL_REVIEW, {'verdict': '${VERDICT}'})
 "
 
@@ -632,23 +632,22 @@ sm.start_stage(state, Stage.POLL_REVIEW)
         echo -e "${CYAN}━━━ Stage 6a: 启动内部多维度审稿 ━━━${NC}"
         echo "  在等待 paperreview.ai 的同时，启动 5 位内部审稿人..."
 
-        # 内部审稿在后台运行
-        python internal_review.py "${PDF_FILE}" -o "${WORKSPACE}/review/internal/" &
+        # Round 0: 内部审稿在后台运行
+        ROUND_DIR="${WORKSPACE}/review/round_000"
+        mkdir -p "${ROUND_DIR}/internal"
+        python internal_review.py "${PDF_FILE}" -o "${ROUND_DIR}/internal/" &
         INTERNAL_REVIEW_PID=$!
 
         echo ""
         echo -e "${CYAN}━━━ Stage 6b: 等待 paperreview.ai 外部审稿 ━━━${NC}"
         echo "  等待 5 分钟后开始轮询..."
 
-        # 确保审稿目录存在
-        mkdir -p "${WORKSPACE}/review/paperreview" "${WORKSPACE}/review/internal"
-
         REVIEW_DATA=$(python -c "
 import sys; sys.path.insert(0, '.')
 from paperreview_api import poll_review, review_to_markdown, extract_verdict
 review = poll_review('${TOKEN}', initial_wait=300, interval=60, max_wait=7200)
 md = review_to_markdown(review)
-with open('${WORKSPACE}/review/paperreview/iter00.md', 'w') as f: f.write(md)
+with open('${ROUND_DIR}/external.md', 'w') as f: f.write(md)
 verdict = extract_verdict(review)
 print(f'VERDICT={verdict}')
 " 2>&1)
@@ -658,20 +657,19 @@ print(f'VERDICT={verdict}')
             echo "  等待内部审稿完成..."
             wait ${INTERNAL_REVIEW_PID} 2>/dev/null || true
         fi
-        echo "  内部审稿: ${WORKSPACE}/review/internal/iter00.md"
 
         VERDICT=$(echo "$REVIEW_DATA" | grep "VERDICT=" | cut -d= -f2)
         echo ""
         echo -e "paperreview.ai 审稿结果: ${YELLOW}${VERDICT}${NC}"
-        echo "外部审稿: ${WORKSPACE}/review/paperreview/iter00.md"
-        echo "内部审稿: ${WORKSPACE}/review/internal/iter00.md"
+        echo "审稿文件: ${ROUND_DIR}/external.md"
+        echo "内部审稿: ${ROUND_DIR}/internal/"
 
         python -c "
 from state_manager import StateManager, Stage
 sm = StateManager('state')
 state = sm.load('${SLUG}')
 state.reviews[-1]['verdict'] = '${VERDICT}'
-state.reviews[-1]['review_md_path'] = '${WORKSPACE}/review/paperreview/iter00.md'
+state.reviews[-1]['review_md_path'] = '${ROUND_DIR}/external.md'
 sm.complete_stage(state, Stage.POLL_REVIEW, {'verdict': '${VERDICT}'})
 "
 
