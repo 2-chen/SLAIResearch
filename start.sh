@@ -335,17 +335,72 @@ print(f'JOB_ID={job.job_id}')
                 echo -e "${RED}SCO 提交仍然失败，跳过实验执行阶段${NC}"
             fi
         else
-            echo "等待任务完成..."
-            for i in $(seq 1 180); do
-                STATUS=$(sco acp jobs describe --workspace-name share-space -o json "$JOB_ID" 2>/dev/null | python -c "import json,sys; print(json.load(sys.stdin).get('state','UNKNOWN'))" 2>/dev/null || echo "UNKNOWN")
-                echo "  状态: ${STATUS} (${i}/180)"
-                if [[ "$STATUS" == "SUCCEEDED" || "$STATUS" == "FAILED" || "$STATUS" == "STOPPED" ]]; then
+            # 轮询 + 失败自动重试（最多 3 次）
+            MAX_RETRIES=3
+            RETRY=0
+            while [[ $RETRY -le $MAX_RETRIES ]]; do
+                echo "等待任务完成... (第 $((RETRY+1)) 次尝试)"
+                for i in $(seq 1 180); do
+                    STATUS=$(sco acp jobs describe --workspace-name share-space -o json "$JOB_ID" 2>/dev/null | python -c "import json,sys; print(json.load(sys.stdin).get('state','UNKNOWN'))" 2>/dev/null || echo "UNKNOWN")
+                    echo "  状态: ${STATUS} (${i}/180)"
+                    if [[ "$STATUS" == "SUCCEEDED" || "$STATUS" == "FAILED" || "$STATUS" == "STOPPED" ]]; then
+                        break
+                    fi
+                    sleep 30
+                done
+
+                # 获取日志
+                sco acp jobs stream-logs --workspace-name share-space "$JOB_ID" > "${WORKSPACE}/experiment/sco_logs.txt" 2>/dev/null || true
+
+                if [[ "$STATUS" == "SUCCEEDED" ]]; then
+                    echo -e "${GREEN}实验成功！${NC}"
                     break
                 fi
-                sleep 30
-            done
 
-            sco acp jobs stream-logs --workspace-name share-space "$JOB_ID" > "${WORKSPACE}/experiment/sco_logs.txt" 2>/dev/null || true
+                # 失败了 → Claude Code 诊断修复
+                if [[ $RETRY -lt $MAX_RETRIES ]]; then
+                    echo -e "${YELLOW}实验失败 (${STATUS})，启动 Claude Code 诊断修复...${NC}"
+                    ERROR_LOG=$(tail -100 "${WORKSPACE}/experiment/sco_logs.txt" 2>/dev/null || echo "无法读取日志")
+                    cat > /tmp/cr_debug_prompt.txt << PROMPT_EOF
+你是实验调试专家。SCO 云端实验失败了。
+
+**任务状态**: ${STATUS}
+**错误日志**:
+${ERROR_LOG}
+
+**实验脚本**: ${WORKSPACE}/experiment/run_experiment.sh
+**工作目录**: ${WORKSPACE}/experiment/
+
+你的任务:
+1. 仔细分析错误日志，找出失败原因
+2. 修改实验脚本或代码来修复问题
+3. 保存修改后的文件
+4. 报告 "FIX_READY" 表示已修复，等待重新提交
+
+常见问题及修复:
+- 依赖缺失 → 在 run_experiment.sh 中添加 pip install
+- 路径错误 → 修正文件路径
+- 内存不足 → 减小 batch_size 或模型大小
+- 语法错误 → 修正代码
+PROMPT_EOF
+                    _claude_task "$(cat /tmp/cr_debug_prompt.txt)" 2>&1
+
+                    # 重新提交
+                    echo "重新提交实验..."
+                    JOB_NAME="cr-${SLUG:0:25}-r$((RETRY+1))"
+                    JOB_OUT=$(python -c "
+from sco_runner import submit_job
+from pathlib import Path
+job = submit_job(Path('${EXP_SCRIPT}'), '${JOB_NAME}')
+print(f'JOB_ID={job.job_id}')
+" 2>&1) && SCO_EXIT=0 || SCO_EXIT=$?
+                    JOB_ID=$(echo "$JOB_OUT" | grep -oP 'JOB_ID=\K\S+')
+                    RETRY=$((RETRY + 1))
+                else
+                    echo -e "${RED}实验失败 ${MAX_RETRIES} 次，将基于已有日志撰写论文${NC}"
+                    RETRY=$((RETRY + 1))
+                fi
+            done
 
             python -c "
 from state_manager import StateManager, Stage
@@ -353,7 +408,7 @@ sm = StateManager('state')
 state = sm.load('${SLUG}')
 sm.complete_stage(state, Stage.EXPERIMENT_EXECUTION, {'job_id': '${JOB_ID}', 'job_status': '${STATUS}'})
 "
-            echo -e "${GREEN}实验完成: ${STATUS}${NC}"
+            echo -e "${GREEN}实验阶段结束: ${STATUS}${NC}"
         fi
     else
         echo -e "${YELLOW}未找到实验脚本，跳过 SCO 执行${NC}"
