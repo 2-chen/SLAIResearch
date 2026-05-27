@@ -63,7 +63,7 @@ def submit_job(
 
     command = _build_remote_command(
         remote_project_dir=remote_project_dir,
-        target_script=f"/data/{script_path.name}",
+        target_script=script_path,  # 本地脚本路径，内容会被嵌入 heredoc
         extra_env=extra_env or {},
     )
 
@@ -159,15 +159,25 @@ def list_jobs(limit: int = 20, config: SCOConfig | None = None) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _build_remote_command(
-    remote_project_dir: str, target_script: str, extra_env: dict[str, str]
+    remote_project_dir: str, target_script: str | Path, extra_env: dict[str, str]
 ) -> str:
+    """
+    规范格式：将脚本内容写入容器内文件，再执行。
+    --command 始终是干净的 "heredoc 写文件 → bash 执行" 两步。
+    """
+    script_path = Path(target_script)
+    script_content = script_path.read_text()
+
+    # 用 heredoc 把脚本写入容器内的固定路径
     lines = ["set -euo pipefail"]
     lines.append(f"cd {remote_project_dir}")
     lines.append(f"export ROOT_DIR={remote_project_dir}")
     for k, v in extra_env.items():
         lines.append(f"export {k}={v}")
-    lines.append(f'echo "[SCO] TARGET_SCRIPT={target_script}"')
-    lines.append(f"bash {target_script}")
+    lines.append("cat > /data/run_experiment.sh << 'CR_SCRIPT_EOF'")
+    lines.append(script_content.rstrip())
+    lines.append("CR_SCRIPT_EOF")
+    lines.append("bash /data/run_experiment.sh")
     return "\n".join(lines)
 
 

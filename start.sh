@@ -249,37 +249,27 @@ sm.start_stage(state, Stage.EXPERIMENT_EXECUTION)
         JOB_NAME="cr-${SLUG:0:30}"
         echo "提交 SCO 任务: ${JOB_NAME}"
 
-        # 构建远程命令：把脚本写入 heredoc 再执行
-        SCRIPT_CONTENT=$(cat "${EXP_SCRIPT}")
-        REMOTE_CMD="cat > /tmp/run_exp.sh << 'CR_SCRIPT_EOF'"$'\n'"${SCRIPT_CONTENT}"$'\n'"CR_SCRIPT_EOF"$'\n'"bash /tmp/run_exp.sh"
-
-        JOB_OUT=$(sco acp jobs create \
-            --workspace-name share-space \
-            --aec2-name share-cluster \
-            --job-name "${JOB_NAME}" \
-            --container-image-url registry.cn-sh-01.sensecore.cn/ccr-zhicheng-02/chen-mirror2:2chen-mini-20260410132739 \
-            --training-framework pytorch \
-            --worker-nodes 1 \
-            --worker-spec n6ls.iu.i40.4.32c512g \
-            --storage-mount 01995892-d478-76d8-aec7-13fd8284477e:/data:/250010008 \
-            --command "${REMOTE_CMD}" 2>&1)
-
-        JOB_ID=$(echo "$JOB_OUT" | grep -oP 'job \K\S+' || echo "")
+        # 通过 sco_runner 规范提交（自动 heredoc 包装脚本 → bash 执行）
+        JOB_OUT=$(python -c "
+from sco_runner import submit_job
+from pathlib import Path
+job = submit_job(Path('${EXP_SCRIPT}'), '${JOB_NAME}')
+print(f'JOB_ID={job.job_id}')
+" 2>&1)
+        JOB_ID=$(echo "$JOB_OUT" | grep "JOB_ID=" | cut -d= -f2)
         echo "Job ID: ${JOB_ID}"
 
-        if [[ -n "$JOB_ID" ]]; then
-            # 轮询等待
+        if [[ -n "$JOB_ID" && "$JOB_ID" != "dry-run-0" ]]; then
             echo "等待任务完成..."
-            for i in $(seq 1 120); do
+            for i in $(seq 1 180); do
                 STATUS=$(sco acp jobs describe --workspace-name share-space -o json "$JOB_ID" 2>/dev/null | python -c "import json,sys; print(json.load(sys.stdin).get('state','UNKNOWN'))" 2>/dev/null || echo "UNKNOWN")
-                echo "  状态: ${STATUS} (${i}/120)"
+                echo "  状态: ${STATUS} (${i}/180)"
                 if [[ "$STATUS" == "SUCCEEDED" || "$STATUS" == "FAILED" || "$STATUS" == "STOPPED" ]]; then
                     break
                 fi
                 sleep 30
             done
 
-            # 获取日志
             sco acp jobs stream-logs --workspace-name share-space "$JOB_ID" > "${WORKSPACE}/experiment/sco_logs.txt" 2>/dev/null || true
 
             python -c "
