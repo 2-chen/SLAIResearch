@@ -15,7 +15,8 @@ def read_key() -> str:
         tty.setraw(fd)
         ch = sys.stdin.read(1)
         if ch == '\x1b':
-            r, _, _ = select.select([sys.stdin], [], [], 0.15)
+            # Arrow keys: ESC [ A/B/C/D
+            r, _, _ = select.select([sys.stdin], [], [], 0.3)
             if r:
                 seq = sys.stdin.read(2)
                 if seq == '[A': return 'UP'
@@ -45,15 +46,10 @@ def menu(items: list[str]) -> int | None:
     extra_start = len(items)
     idx = 0
     n = len(options)
-    last_displayed = -1
-
     def draw():
-        nonlocal last_displayed
-        if last_displayed >= 0:
-            # Move cursor back up to overwrite previous display
-            lines = last_displayed + 2
-            sys.stdout.write(f'\x1b[{lines}A')
-        sys.stdout.write('\x1b[J')  # clear to end of screen
+        # Clear screen + redraw — 避免滚动
+        sys.stdout.write('\x1b[2J\x1b[H')  # 清屏 + 光标归位
+        sys.stdout.write('\x1b[1;36m已有项目:\x1b[0m\n\n')
         for i, opt in enumerate(options):
             prefix = "  " if i < extra_start else ""
             line = f"{prefix}{opt}"
@@ -65,7 +61,6 @@ def menu(items: list[str]) -> int | None:
                 sys.stdout.write(f'    {line}\n')
         sys.stdout.write('\n\x1b[90m↑↓/jk 移动  ↵/Enter 确认  q 退出\x1b[0m')
         sys.stdout.flush()
-        last_displayed = n
 
     # Print initial header
     sys.stdout.write('\n\x1b[1;36m已有项目:\x1b[0m\n\n')
