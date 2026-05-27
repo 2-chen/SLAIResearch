@@ -482,7 +482,7 @@ print(f'JOB_ID={job.job_id}')
             fi
         else
             # 轮询 + 失败自动重试（最多 3 次）
-            MAX_RETRIES=3
+            MAX_RETRIES=20
             RETRY=0
             SCO_FAILED=0
             while [[ $RETRY -le $MAX_RETRIES ]]; do
