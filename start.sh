@@ -249,6 +249,10 @@ sm.start_stage(state, Stage.EXPERIMENT_EXECUTION)
         JOB_NAME="cr-${SLUG:0:30}"
         echo "提交 SCO 任务: ${JOB_NAME}"
 
+        # 构建远程命令：把脚本写入 heredoc 再执行
+        SCRIPT_CONTENT=$(cat "${EXP_SCRIPT}")
+        REMOTE_CMD="cat > /tmp/run_exp.sh << 'CR_SCRIPT_EOF'"$'\n'"${SCRIPT_CONTENT}"$'\n'"CR_SCRIPT_EOF"$'\n'"bash /tmp/run_exp.sh"
+
         JOB_OUT=$(sco acp jobs create \
             --workspace-name share-space \
             --aec2-name share-cluster \
@@ -258,7 +262,7 @@ sm.start_stage(state, Stage.EXPERIMENT_EXECUTION)
             --worker-nodes 1 \
             --worker-spec n6ls.iu.i40.4.32c512g \
             --storage-mount 01995892-d478-76d8-aec7-13fd8284477e:/data:/250010008 \
-            --command "$(cat ${EXP_SCRIPT})" 2>&1)
+            --command "${REMOTE_CMD}" 2>&1)
 
         JOB_ID=$(echo "$JOB_OUT" | grep -oP 'job \K\S+' || echo "")
         echo "Job ID: ${JOB_ID}"
