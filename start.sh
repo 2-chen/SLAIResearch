@@ -79,6 +79,14 @@ if ! command -v claude &>/dev/null; then
 fi
 
 # ---------------------------------------------------------------------------
+# Claude Code 调用辅助 — 通过 stdin 传 prompt，避免多行解析问题
+# ---------------------------------------------------------------------------
+_claude_task() {
+    local prompt="$1"
+    echo "$prompt" | claude -p --model "${CLAUDE_MODEL:-deepseek-v4-pro}" --output-format text 2>&1
+}
+
+# ---------------------------------------------------------------------------
 # 核心：根据 state 决定执行什么
 # ---------------------------------------------------------------------------
 banner
@@ -187,7 +195,7 @@ print(state.topic_slug)
     if [[ -f "${WORKSPACE}/literature/literature_review.md" ]]; then
         REVIEW_MD="${WORKSPACE}/literature/literature_review.md"
         ANALYSIS_PROMPT="请阅读 ${REVIEW_MD}，基于检索到的论文进行分析：提炼领域概览和关键趋势、识别研究空白、提出具体的研究方向建议。将分析结果追加到 ${REVIEW_MD} 末尾。只做分析和建议，不超过500字。完成后报告'文献分析完成'。"
-        claude -p --model "${CLAUDE_MODEL:-deepseek-v4-pro}" --output-format text "${ANALYSIS_PROMPT}" 2>&1 || echo "[WARN] Claude 分析跳过（可手动完成）"
+        _claude_task "${ANALYSIS_PROMPT}" || echo "[WARN] Claude 分析跳过（可手动完成）"
     else
         echo -e "${RED}文献检索失败：search_papers.py 未生成输出${NC}"
         exit 1
@@ -205,29 +213,23 @@ sm.complete_stage(state, Stage.LITERATURE_SEARCH, {'papers_found': 0})
     echo -e "${CYAN}━━━ Stage 2/4: 实验设计 ━━━${NC}"
     echo ""
 
-    claude -p --model "${CLAUDE_MODEL:-deepseek-v4-pro}" --output-format text \
-        --allowedTools "Bash,Read,Write,Edit,WebSearch" \
-        "你是一个机器学习研究员。请基于文献综述设计实验方案。
+    cat > /tmp/cr_stage2_prompt.txt << PROMPT_EOF
+你是一个机器学习研究员。请基于文献综述设计实验方案。
 
 研究主题: ${TOPIC}
 文献综述: ${WORKSPACE}/literature/literature_review.md
 
 请完成以下任务：
 1. 阅读文献综述
-2. 设计完整的实验方案，包括：
-   - 研究问题和假设
-   - 方法/模型详细描述
-   - 数据集选择
-   - 基线方法
-   - 评估指标
-   - 实验配置（超参、硬件）
-   - 消融实验设计
+2. 设计完整的实验方案，包括：研究问题和假设、方法/模型详细描述、数据集选择、基线方法、评估指标、实验配置（超参、硬件）、消融实验设计
 3. 编写可执行的 Python 实验代码
 4. 编写 run_experiment.sh（包含环境设置、依赖安装、实验执行的全部命令）
 5. 保存实验方案到: ${WORKSPACE}/experiment/experiment_plan.md
 6. 保存代码和脚本到: ${WORKSPACE}/experiment/
 
-重要：只做实验设计，不要做其他事情。完成后明确报告'实验设计完成'。"
+重要：只做实验设计，不要做其他事情。完成后明确报告'实验设计完成'。
+PROMPT_EOF
+    _claude_task "$(cat /tmp/cr_stage2_prompt.txt)"
 
     python -c "
 from state_manager import StateManager, Stage
@@ -297,9 +299,8 @@ sm.complete_stage(state, Stage.EXPERIMENT_EXECUTION, {'job_id': '${JOB_ID}', 'jo
     cp templates/aaai2026.sty "${WORKSPACE}/paper/" 2>/dev/null || true
     cp templates/aaai2026.bst "${WORKSPACE}/paper/" 2>/dev/null || true
 
-    claude -p --model "${CLAUDE_MODEL:-deepseek-v4-pro}" --output-format text \
-        --allowedTools "Bash,Read,Write,Edit" \
-        "你是一个学术论文撰写专家。请撰写完整的 AAAI 2026 格式论文。
+    cat > /tmp/cr_stage4_prompt.txt << PROMPT_EOF
+你是一个学术论文撰写专家。请撰写完整的 AAAI 2026 格式论文。
 
 研究主题: ${TOPIC}
 会议: AAAI 2026
@@ -321,7 +322,9 @@ LaTeX 模板参考: templates/aaai.tex.j2
 7. 用 pdflatex 编译为 PDF: ${WORKSPACE}/paper/paper.pdf
 8. 保存 BibTeX: ${WORKSPACE}/paper/references.bib
 
-重要：完成后明确报告'论文撰写完成'。"
+重要：完成后明确报告'论文撰写完成'。
+PROMPT_EOF
+    _claude_task "$(cat /tmp/cr_stage4_prompt.txt)"
 
     python -c "
 from state_manager import StateManager, Stage
@@ -451,9 +454,8 @@ _continue_project() {
     echo ""
 
     # 用 Claude Code 修订论文
-    claude -p --model "${CLAUDE_MODEL:-deepseek-v4-pro}" --output-format text \
-        --allowedTools "Bash,Read,Write,Edit,WebSearch" \
-        "你是一个论文修订专家。请根据审稿意见修改论文。
+    cat > /tmp/cr_revise_prompt.txt << PROMPT_EOF
+你是一个论文修订专家。请根据审稿意见修改论文。
 
 研究主题: ${TOPIC}
 当前迭代: 第 ${NEXT_ITER} 轮修订
@@ -471,7 +473,9 @@ _continue_project() {
 5. 重新编译 PDF: ${WORKSPACE}/paper/paper.pdf
 6. 撰写 response letter: ${WORKSPACE}/paper/response_letter_iter${NEXT_ITER}.md
 
-完成后明确报告'修订完成，请提交审稿'。"
+完成后明确报告'修订完成，请提交审稿'。
+PROMPT_EOF
+    _claude_task "$(cat /tmp/cr_revise_prompt.txt)"
 
     python -c "
 from state_manager import StateManager, Stage
