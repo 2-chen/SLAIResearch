@@ -149,6 +149,10 @@ class StateManager:
         slug = _slugify(topic_or_slug) if " " in topic_or_slug else topic_or_slug
         return self._path(slug).exists()
 
+    def slug_for(self, topic: str) -> str:
+        """Return the slug for *topic* without creating state."""
+        return _slugify(topic)
+
     def list_topics(self) -> list[str]:
         """Return slugs of all saved research topics."""
         if not self._base.exists():

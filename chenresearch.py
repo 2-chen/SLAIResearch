@@ -43,13 +43,20 @@ logging.basicConfig(
 # ======================================================================
 
 
-def cmd_run(topic: str) -> None:
+def cmd_run(topic: str, force: bool = False) -> None:
     """Execute the full ChenResearch pipeline for *topic*."""
     sm = StateManager(PROJECT_ROOT / "state")
 
     if sm.exists(topic):
-        print(f"Topic already exists. Use 'resume' to continue: python chenresearch.py resume {topic}")
-        return
+        if force:
+            import shutil
+            slug = sm.slug_for(topic)
+            shutil.rmtree(PROJECT_ROOT / "state" / slug, ignore_errors=True)
+            shutil.rmtree(PROJECT_ROOT / "workspace" / _safe_dirname(topic), ignore_errors=True)
+            print(f"Force restart: cleaned previous state for '{topic}'")
+        else:
+            print(f"Topic already exists. Use '--force' to restart, or 'resume' to continue.")
+            return
 
     work_dir = PROJECT_ROOT / "workspace" / _safe_dirname(topic)
     state = sm.create(topic, work_dir=work_dir)
@@ -399,20 +406,22 @@ def main() -> None:
         print(__doc__)
         sys.exit(1)
 
-    cmd, arg = sys.argv[1], (sys.argv[2] if len(sys.argv) > 2 else None)
+    cmd, *args = sys.argv[1], sys.argv[2:]
 
     if cmd == "run":
-        if not arg:
-            print("Usage: python chenresearch.py run \"<topic>\"")
+        if not args:
+            print("Usage: python chenresearch.py run [--force] \"<topic>\"")
             sys.exit(1)
-        cmd_run(arg)
+        force = args[0] == "--force"
+        topic = args[1] if force else args[0]
+        cmd_run(topic, force=force)
     elif cmd == "resume":
-        if not arg:
+        if not args:
             print("Usage: python chenresearch.py resume <topic_or_slug>")
             sys.exit(1)
-        cmd_resume(arg)
+        cmd_resume(args[0])
     elif cmd == "status":
-        cmd_status(arg)
+        cmd_status(args[0] if args else None)
     elif cmd == "list":
         cmd_list()
     else:
