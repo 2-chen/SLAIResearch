@@ -371,12 +371,50 @@ fi
 
 # ---- 情况 A：新项目 ----
 if [[ ${#PROJECT_SLUGS[@]} -eq 0 ]]; then
-    echo -e "${YELLOW}开始全新研究。请输入研究主题。${NC}"
+    echo -e "${YELLOW}开始全新研究。请描述你的想法（可以是口语化的，Agent 会帮你提炼）:${NC}"
     echo ""
-    read -rp "研究主题: " TOPIC
-    if [[ -z "$TOPIC" ]]; then
-        echo "主题不能为空。"
+    read -rp "你的想法: " USER_INPUT
+    if [[ -z "$USER_INPUT" ]]; then
+        echo "输入不能为空。"
         exit 1
+    fi
+
+    # 调用 Agent 提炼研究主题
+    echo ""
+    echo -e "${CYAN}Agent 正在分析你的想法并提炼研究主题...${NC}"
+    cat > /tmp/cr_topic_prompt.txt << PROMPT_EOF
+你是一个科研助手。用户描述了以下研究想法：
+
+"${USER_INPUT}"
+
+你的任务：
+1. 理解用户的核心意图
+2. 提炼为一个清晰、具体、可执行的研究主题（英文，适合作为论文学术标题）
+3. 如果用户想法太模糊，基于该方向给出 2-3 个具体的主题建议
+4. 最终输出格式：TOPIC: <提炼后的研究主题>（一行，不要多余内容）
+
+要求：主题要具体（包含方法+问题+场景），例如 "Improving Few-Shot Learning through Adaptive Prompt Optimization for Cross-Domain NLP Tasks"
+PROMPT_EOF
+
+    REFINED=$(cat /tmp/cr_topic_prompt.txt | claude -p --model "${CLAUDE_MODEL:-deepseek-v4-pro}" --output-format text 2>&1) || true
+    TOPIC=$(echo "$REFINED" | grep -oP 'TOPIC:\s*\K.+' | head -1)
+
+    if [[ -z "$TOPIC" ]]; then
+        # 如果解析失败，取最后一行非空内容作为主题
+        TOPIC=$(echo "$REFINED" | grep -v '^\s*$' | tail -1)
+    fi
+    if [[ -z "$TOPIC" ]]; then
+        TOPIC="$USER_INPUT"  # 兜底：用原始输入
+    fi
+
+    echo ""
+    echo -e "${GREEN}提炼后的研究主题:${NC}"
+    echo -e "  ${TOPIC}"
+    echo ""
+    read -rp "确认使用此主题? [Y/n] " CONFIRM
+    if [[ "$CONFIRM" =~ ^[Nn] ]]; then
+        echo "已取消。你可以重新运行 bash start.sh。"
+        exit 0
     fi
 
     SAFE_TOPIC=$(echo "$TOPIC" | tr ' ' '_' | cut -c1-50)
