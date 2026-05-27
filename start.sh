@@ -292,9 +292,8 @@ done
 
 # ---- 选择项目（↑↓ 键导航，回车确认）----
 if [[ ${#PROJECT_SLUGS[@]} -gt 0 ]]; then
-    # 构建菜单项列表
-    MENU_FILE="/tmp/cr_menu_items.txt"
-    > "$MENU_FILE"
+    # 构建菜单项并调用 ↑↓ 选择器
+    MENU_ARGS=()
     for idx in "${!PROJECT_SLUGS[@]}"; do
         s="${PROJECT_STAGES[$idx]}"
         case "$s" in
@@ -310,11 +309,10 @@ if [[ ${#PROJECT_SLUGS[@]} -gt 0 ]]; then
             failed) s_disp="失败" ;;
             *) s_disp="$s" ;;
         esac
-        echo "${PROJECT_TOPICS[$idx]:0:60}  [${s_disp}] [迭代 ${PROJECT_ITERS[$idx]}]" >> "$MENU_FILE"
+        MENU_ARGS+=("${PROJECT_TOPICS[$idx]:0:60}  [${s_disp}] [迭代 ${PROJECT_ITERS[$idx]}]")
     done
 
-    CHOICE=$(python menu.py < "$MENU_FILE")
-    rm -f "$MENU_FILE"
+    CHOICE=$(python menu.py "${MENU_ARGS[@]}")
 
     if [[ "$CHOICE" == "__QUIT__" ]]; then
         exit 0

@@ -81,7 +81,11 @@ def menu(items: list[str], title: str = "请选择", default_new: bool = True) -
 
 
 if __name__ == '__main__':
-    items = [line.rstrip('\n') for line in sys.stdin if line.strip()]
+    # 从命令行参数或 stdin 读取菜单项（命令行优先，保留 stdin 为 TTY）
+    if len(sys.argv) > 1:
+        items = sys.argv[1:]
+    else:
+        items = [line.rstrip('\n') for line in sys.stdin if line.strip()]
     if not items:
         print("No items", file=sys.stderr)
         sys.exit(1)
