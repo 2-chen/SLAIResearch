@@ -302,9 +302,17 @@ sm.add_review(state, record)
 sm.start_stage(state, Stage.POLL_REVIEW)
 "
 
-        # ===== Stage 6: 轮询审稿 =====
+        # ===== Stage 6: 内部审稿 + 外部审稿（并行） =====
         echo ""
-        echo -e "${CYAN}━━━ Stage 6: 等待审稿结果 ━━━${NC}"
+        echo -e "${CYAN}━━━ Stage 6a: 启动内部多维度审稿 ━━━${NC}"
+        echo "  在等待 paperreview.ai 的同时，启动 5 位内部审稿人..."
+
+        # 内部审稿在后台运行
+        python internal_review.py "${PDF_FILE}" -o "${WORKSPACE}/review/" &
+        INTERNAL_REVIEW_PID=$!
+
+        echo ""
+        echo -e "${CYAN}━━━ Stage 6b: 等待 paperreview.ai 外部审稿 ━━━${NC}"
         echo "  等待 5 分钟后开始轮询..."
 
         REVIEW_DATA=$(python -c "
@@ -316,6 +324,13 @@ with open('${WORKSPACE}/review/review_iter00.md', 'w') as f: f.write(md)
 verdict = extract_verdict(review)
 print(f'VERDICT={verdict}')
 " 2>&1)
+
+        # 等待内部审稿完成
+        if kill -0 ${INTERNAL_REVIEW_PID} 2>/dev/null; then
+            echo "  等待内部审稿完成..."
+            wait ${INTERNAL_REVIEW_PID} 2>/dev/null || true
+        fi
+        echo "  内部审稿已完成: ${WORKSPACE}/review/internal_review_iter00.md"
 
         VERDICT=$(echo "$REVIEW_DATA" | grep "VERDICT=" | cut -d= -f2)
         echo ""
@@ -431,8 +446,11 @@ record = ReviewRecord(iteration=${NEXT_ITER}, token='${TOKEN}', submitted_at='${
 sm.add_review(state, record)
 "
 
-        # 轮询审稿
-        echo "等待审稿结果..."
+        # 内部审稿 + 外部审稿（并行）
+        python internal_review.py "${PDF_FILE}" -o "${WORKSPACE}/review/" &
+        INTERNAL_REVIEW_PID=$!
+
+        echo "等待 paperreview.ai 审稿结果..."
         REVIEW_DATA=$(python -c "
 import sys; sys.path.insert(0, '.')
 from paperreview_api import poll_review, review_to_markdown, extract_verdict
@@ -443,6 +461,10 @@ with open('${WORKSPACE}/review/review_iter' + iter_num.zfill(2) + '.md', 'w') as
 verdict = extract_verdict(review)
 print(f'VERDICT={verdict}')
 " 2>&1)
+
+        if kill -0 ${INTERNAL_REVIEW_PID} 2>/dev/null; then
+            wait ${INTERNAL_REVIEW_PID} 2>/dev/null || true
+        fi
 
         VERDICT=$(echo "$REVIEW_DATA" | grep "VERDICT=" | cut -d= -f2)
 

@@ -21,6 +21,7 @@ python search_papers.py "research query" -o workspace/<topic>/literature/
 ### 论文工具
 - `pdflatex` — 编译 LaTeX
 - AAAI 模板: `templates/aaai.tex.j2`
+- `python internal_review.py paper.pdf` — 内部多维度审稿（5位审稿人）
 
 ### Python 工具
 - `paperreview_api.py` — paperreview.ai 上传和轮询
