@@ -86,20 +86,36 @@ _claude_task() {
     echo "$prompt" | claude -p --model "${CLAUDE_MODEL:-deepseek-v4-pro}" --output-format text 2>&1
 }
 
-# 故障接管：遇到报错时启动 Claude Code 诊断并修复
+# 故障接管：遇到报错时保存状态 → 启动 Claude Code 诊断修复
 _on_error() {
     local stage="$1"
     local err_msg="$2"
     local ws="$3"
 
+    # 保存错误状态（项目不丢）
+    if [[ -n "${SLUG:-}" ]]; then
+        python -c "
+from state_manager import StateManager
+sm = StateManager('state')
+try:
+    state = sm.load('${SLUG}')
+    # 记录错误但不改变当前阶段
+    state.stages.setdefault(state.stage, {}).__setitem__('error_note', '${stage}: ${err_msg}'[:500])
+    sm.save(state)
+except Exception:
+    pass
+" 2>/dev/null || true
+    fi
+
     echo ""
     echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${RED}  ${stage} 出错，启动 Claude Code 接管...${NC}"
+    echo -e "${RED}  ${stage} 出错 — 项目已保留，可稍后恢复${NC}"
+    echo -e "${RED}  启动 Claude Code 尝试诊断修复...${NC}"
     echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
 
     cat > /tmp/cr_recover_prompt.txt << PROMPT_EOF
-你是 ChenResearch 科研系统的故障恢复助手。流水线在 **${stage}** 阶段出错了。
+你是 ChenResearch 科研系统的故障恢复助手。流水线在 **${stage}** 阶段出错。
 
 **错误信息**:
 ${err_msg}
@@ -108,18 +124,19 @@ ${err_msg}
 
 **你的任务**:
 1. 检查工作目录下的文件，理解当前状态
-2. 诊断错误原因
-3. 尝试修复问题（修改代码、补充缺失文件、调整配置等）
-4. 如果修复成功，明确报告 "RECOVERY_OK"
-5. 如果无法修复，报告 "RECOVERY_FAILED" 并说明原因
+2. 诊断错误原因并尝试修复
+3. 如果修复成功，报告 "RECOVERY_OK"
+4. 如果无法修复，报告 "RECOVERY_FAILED" 并说明原因
 
-**重要**: 只做必要的修复，不要重新执行整个阶段。修复后让流水线继续。
+**关键**: 项目文件和工作目录都已保留，修复后流水线会继续。不要重新执行已完成的阶段。
 PROMPT_EOF
 
-    _claude_task "$(cat /tmp/cr_recover_prompt.txt)"
-
-    echo ""
-    echo -e "${YELLOW}Claude Code 接管完成。继续流水线...${NC}"
+    if _claude_task "$(cat /tmp/cr_recover_prompt.txt)" 2>&1 | grep -q "RECOVERY_OK"; then
+        echo -e "${GREEN}Claude Code 修复成功，继续流水线${NC}"
+    else
+        echo -e "${YELLOW}Claude Code 无法完全修复，但项目已保留${NC}"
+        echo -e "${YELLOW}后续阶段将继续执行（跳过当前阶段）${NC}"
+    fi
     echo ""
 }
 
@@ -140,7 +157,14 @@ for d in state/*/; do
     if [[ -f "$sf" ]]; then
         PROJECT_SLUGS+=("$(basename "$d")")
         PROJECT_TOPICS+=("$(python -c "import json; print(json.load(open('$sf'))['topic'])" 2>/dev/null || echo "?")")
-        PROJECT_STAGES+=("$(python -c "import json; print(json.load(open('$sf'))['stage'])" 2>/dev/null || echo "?")")
+        PROJECT_STAGES+=("$(python -c "
+import json
+d=json.load(open('$sf'))
+s=d.get('stage','?')
+for v in d.get('stages',{}).values():
+    if isinstance(v,dict) and v.get('status')=='error': s+=' [有错误]'; break
+print(s)
+" 2>/dev/null || echo "?")")
         PROJECT_ITERS+=("$(python -c "import json; print(json.load(open('$sf'))['iteration'])" 2>/dev/null || echo "0")")
         PROJECT_WORKSPACES+=("workspace/$(echo "${PROJECT_TOPICS[-1]}" | tr ' ' '_' | cut -c1-50)")
     fi
@@ -486,9 +510,11 @@ _continue_project() {
 
     if [[ -z "$LATEST_REVIEW" ]]; then
         echo -e "${YELLOW}该项目尚未提交审稿（阶段: ${STAGE}）。${NC}"
-        echo "无法自动继续。请在 Claude Code 中手动操作："
-        echo "  cd ${WORKSPACE}"
-        echo "  查看 prompts/ 下的任务模板"
+        echo "项目文件完整保留在: ${WORKSPACE}"
+        echo ""
+        echo "你可以："
+        echo "  1. 在 Claude Code 中手动继续: cd ${WORKSPACE}"
+        echo "  2. 或者用 bash start.sh 新建项目，该项目会保留"
         exit 1
     fi
 
