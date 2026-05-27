@@ -266,7 +266,7 @@ Output ONLY your structured review section (no preamble, no meta-commentary)."""
         raise RuntimeError(f"claude -p failed: {result.stderr[:300]}")
 
     # Save individual review
-    review_file = output_dir / f"internal_review_{reviewer['name'].replace(' ', '_').lower()}.md"
+    review_file = output_dir / f"reviewer_{reviewer['name'].replace(' ', '_').lower()}.md"
     review_file.write_text(f"# Internal Review: {reviewer['name']}\n\n{output}")
 
     # Try to extract score
@@ -323,15 +323,15 @@ def save_review(merged: dict, output_dir: str | Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Find next available iteration number
-    existing = list(output_dir.glob("internal_review_iter*.md"))
+    existing = list(output_dir.glob("iter*.md"))
     iter_num = len(existing)
 
-    review_path = output_dir / f"internal_review_iter{iter_num:02d}.md"
+    review_path = output_dir / f"iter{iter_num:02d}.md"
     full_text = merged["header"] + merged["sections"]
     review_path.write_text(full_text)
 
     # Also save summary
-    summary_path = output_dir / f"internal_review_iter{iter_num:02d}_summary.md"
+    summary_path = output_dir / f"iter{iter_num:02d}_summary.md"
     summary = f"""# Internal Review Summary (Iteration {iter_num})
 **Average Score**: {merged['avg_score']:.1f} / 10
 **Consensus**: {merged['verdict'].upper()}

@@ -490,19 +490,22 @@ sm.start_stage(state, Stage.POLL_REVIEW)
         echo "  在等待 paperreview.ai 的同时，启动 5 位内部审稿人..."
 
         # 内部审稿在后台运行
-        python internal_review.py "${PDF_FILE}" -o "${WORKSPACE}/review/" &
+        python internal_review.py "${PDF_FILE}" -o "${WORKSPACE}/review/internal/" &
         INTERNAL_REVIEW_PID=$!
 
         echo ""
         echo -e "${CYAN}━━━ Stage 6b: 等待 paperreview.ai 外部审稿 ━━━${NC}"
         echo "  等待 5 分钟后开始轮询..."
 
+        # 确保审稿目录存在
+        mkdir -p "${WORKSPACE}/review/paperreview" "${WORKSPACE}/review/internal"
+
         REVIEW_DATA=$(python -c "
 import sys; sys.path.insert(0, '.')
 from paperreview_api import poll_review, review_to_markdown, extract_verdict
 review = poll_review('${TOKEN}', initial_wait=300, interval=60, max_wait=7200)
 md = review_to_markdown(review)
-with open('${WORKSPACE}/review/review_iter00.md', 'w') as f: f.write(md)
+with open('${WORKSPACE}/review/paperreview/iter00.md', 'w') as f: f.write(md)
 verdict = extract_verdict(review)
 print(f'VERDICT={verdict}')
 " 2>&1)
@@ -512,19 +515,20 @@ print(f'VERDICT={verdict}')
             echo "  等待内部审稿完成..."
             wait ${INTERNAL_REVIEW_PID} 2>/dev/null || true
         fi
-        echo "  内部审稿已完成: ${WORKSPACE}/review/internal_review_iter00.md"
+        echo "  内部审稿: ${WORKSPACE}/review/internal/iter00.md"
 
         VERDICT=$(echo "$REVIEW_DATA" | grep "VERDICT=" | cut -d= -f2)
         echo ""
-        echo -e "审稿结果: ${YELLOW}${VERDICT}${NC}"
-        echo "审稿详情: ${WORKSPACE}/review/review_iter00.md"
+        echo -e "paperreview.ai 审稿结果: ${YELLOW}${VERDICT}${NC}"
+        echo "外部审稿: ${WORKSPACE}/review/paperreview/iter00.md"
+        echo "内部审稿: ${WORKSPACE}/review/internal/iter00.md"
 
         python -c "
 from state_manager import StateManager, Stage
 sm = StateManager('state')
 state = sm.load('${SLUG}')
 state.reviews[-1]['verdict'] = '${VERDICT}'
-state.reviews[-1]['review_md_path'] = '${WORKSPACE}/review/review_iter00.md'
+state.reviews[-1]['review_md_path'] = '${WORKSPACE}/review/paperreview/iter00.md'
 sm.complete_stage(state, Stage.POLL_REVIEW, {'verdict': '${VERDICT}'})
 "
 
@@ -545,11 +549,10 @@ sm.save(state)
         else
             echo ""
             echo -e "${YELLOW}══════════════════════════════════════════════${NC}"
-            echo -e "${YELLOW}  审稿未通过 (${VERDICT})${NC}"
-            echo -e "${YELLOW}  审稿意见已保存到文件${NC}"
-            echo -e "${YELLOW}  请运行 bash start.sh 启动新一轮修订${NC}"
+            echo -e "${YELLOW}  审稿未通过 (${VERDICT}) — 自动进入修订迭代${NC}"
             echo -e "${YELLOW}══════════════════════════════════════════════${NC}"
-            exit 0
+            ITERATION=0  # 首次迭代
+            _continue_project
         fi
     fi
 fi  # 情况 A 结束
@@ -561,15 +564,12 @@ _continue_project() {
     echo ""
 
     # 找到最新的审稿
-    LATEST_REVIEW=$(ls -t "${WORKSPACE}/review/review_iter"*.md 2>/dev/null | head -1)
+    # 查找最新外部审稿
+    LATEST_REVIEW=$(ls -t "${WORKSPACE}/review/paperreview/iter"*.md 2>/dev/null | head -1)
 
     if [[ -z "$LATEST_REVIEW" ]]; then
         echo -e "${YELLOW}该项目尚未提交审稿（阶段: ${STAGE}）。${NC}"
         echo "项目文件完整保留在: ${WORKSPACE}"
-        echo ""
-        echo "你可以："
-        echo "  1. 在 Claude Code 中手动继续: cd ${WORKSPACE}"
-        echo "  2. 或者用 bash start.sh 新建项目，该项目会保留"
         exit 1
     fi
 
@@ -636,7 +636,9 @@ sm.add_review(state, record)
 "
 
         # 内部审稿 + 外部审稿（并行）
-        python internal_review.py "${PDF_FILE}" -o "${WORKSPACE}/review/" &
+        mkdir -p "${WORKSPACE}/review/paperreview" "${WORKSPACE}/review/internal"
+        ITER_PAD=$(printf "%02d" ${NEXT_ITER})
+        python internal_review.py "${PDF_FILE}" -o "${WORKSPACE}/review/internal/" &
         INTERNAL_REVIEW_PID=$!
 
         echo "等待 paperreview.ai 审稿结果..."
@@ -645,8 +647,7 @@ import sys; sys.path.insert(0, '.')
 from paperreview_api import poll_review, review_to_markdown, extract_verdict
 review = poll_review('${TOKEN}', initial_wait=300, interval=60, max_wait=7200)
 md = review_to_markdown(review)
-iter_num = '${NEXT_ITER}'
-with open('${WORKSPACE}/review/review_iter' + iter_num.zfill(2) + '.md', 'w') as f: f.write(md)
+with open('${WORKSPACE}/review/paperreview/iter${ITER_PAD}.md', 'w') as f: f.write(md)
 verdict = extract_verdict(review)
 print(f'VERDICT={verdict}')
 " 2>&1)
@@ -662,14 +663,16 @@ from state_manager import StateManager, Stage
 sm = StateManager('state')
 state = sm.load('${SLUG}')
 state.reviews[-1]['verdict'] = '${VERDICT}'
-state.reviews[-1]['review_md_path'] = '${WORKSPACE}/review/review_iter${NEXT_ITER}.md'
+state.reviews[-1]['review_md_path'] = '${WORKSPACE}/review/paperreview/iter${ITER_PAD}.md'
 sm.complete_stage(state, Stage.POLL_REVIEW, {'verdict': '${VERDICT}'})
 "
 
         if [[ "$VERDICT" == "accept" ]] || [[ "$VERDICT" == "weak accept" ]]; then
             echo -e "${GREEN}★ 论文已通过审稿！${NC}"
         else
-            echo -e "${YELLOW}审稿未通过 (${VERDICT})，请运行 bash start.sh 继续修订${NC}"
+            echo -e "${YELLOW}审稿未通过 (${VERDICT}) — 自动进入下一轮修订${NC}"
+            ITERATION=${NEXT_ITER}
+            _continue_project  # 递归自动迭代
         fi
     fi
 }
