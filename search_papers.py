@@ -102,7 +102,7 @@ def search_semantic_scholar(query: str, max_results: int = 20) -> list[dict]:
         papers.append({
             "source": "semantic_scholar",
             "title": p.get("title", ""),
-            "authors": [a.get("name", "") for a in p.get("authors", [])],
+            "authors": [(a or {}).get("name", "") for a in (p.get("authors") or [])],
             "year": str(p.get("year", "")),
             "abstract": p.get("abstract", ""),
             "url": p.get("url", ""),
@@ -146,7 +146,7 @@ def search_openalex(query: str, max_results: int = 20) -> list[dict]:
         papers.append({
             "source": "openalex",
             "title": p.get("title", ""),
-            "authors": [a.get("author", {}).get("display_name", "") for a in p.get("authorships", [])],
+            "authors": [(a.get("author") or {}).get("display_name", "") for a in (p.get("authorships") or [])],
             "year": str(p.get("publication_year", "")),
             "abstract": abstract,
             "url": p.get("doi", ""),
@@ -202,7 +202,7 @@ def format_markdown(papers: list[dict], query: str) -> str:
         venue = p.get("venue", "")
         citations = p.get("citations", 0)
         source = p["source"]
-        abstract = p.get("abstract", "")[:500]
+        abstract = (p.get("abstract") or "")[:500]
 
         lines.append(f"### {i}. {title}")
         lines.append(f"**{authors}** — {year} | {venue} | cited {citations}× | {source}")
