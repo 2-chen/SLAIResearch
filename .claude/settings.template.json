@@ -1,0 +1,21 @@
+{
+  "model": "deepseek-v4-pro",
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+    "ANTHROPIC_API_KEY": "your-api-key-here"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(curl *)",
+      "Bash(python *)",
+      "Bash(sco *)",
+      "Bash(pdflatex *)",
+      "Bash(tectonic *)",
+      "Bash(bash *)",
+      "WebFetch(*)",
+      "Read(*)",
+      "Write(*)",
+      "Edit(*)"
+    ]
+  }
+}

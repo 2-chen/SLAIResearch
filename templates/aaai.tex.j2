@@ -1,0 +1,50 @@
+<%doc>
+AAAI Press LaTeX template (Jinja2).
+Variables: title, authors (list of {name, affiliation}), abstract, sections (list of {heading, content}), references_bibtex
+<%doc>
+
+\documentclass[letterpaper]{article}
+
+% AAAI style
+\usepackage{aaai24}
+
+% Math and symbols
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{multirow}
+\usepackage[table]{xcolor}
+\usepackage{hyperref}
+\usepackage{cleveref}
+
+\title{<< title >>}
+
+\author{
+<<% for author in authors %>>
+    << author.name >> \textsuperscript{<< loop.index >>} \\
+    <<% if author.affiliation %>>
+    \textsuperscript{<< loop.index >>}<< author.affiliation >> \\
+    <<% endif %>>
+<<% endfor %>>
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+<< abstract >>
+\end{abstract}
+
+<<% for section in sections %>>
+\section{<< section.heading >>}
+<< section.content >>
+
+<<% endfor %>>
+
+% Bibliography
+\bibliography{references}
+\bibliographystyle{aaai24}
+
+\end{document}
