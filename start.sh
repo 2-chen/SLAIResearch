@@ -83,28 +83,79 @@ fi
 # ---------------------------------------------------------------------------
 banner
 
-# 查找进行中的项目
-PROJECT_DIR=""
-TOPIC=""
-STAGE=""
-ITERATION=0
+# 收集所有项目
+declare -a PROJECT_SLUGS=()
+declare -a PROJECT_TOPICS=()
+declare -a PROJECT_STAGES=()
+declare -a PROJECT_ITERS=()
+declare -a PROJECT_WORKSPACES=()
 
 for d in state/*/; do
     sf="${d}state.json"
     if [[ -f "$sf" ]]; then
-        PROJECT_DIR="$d"
-        TOPIC=$(python -c "import json; print(json.load(open('$sf'))['topic'])" 2>/dev/null || echo "")
-        STAGE=$(python -c "import json; print(json.load(open('$sf'))['stage'])" 2>/dev/null || echo "")
-        ITERATION=$(python -c "import json; print(json.load(open('$sf'))['iteration'])" 2>/dev/null || echo "0")
-        SLUG=$(basename "$d")
-        WORKSPACE="workspace/$(echo "$TOPIC" | tr ' ' '_' | cut -c1-50)"
-        break
+        PROJECT_SLUGS+=("$(basename "$d")")
+        PROJECT_TOPICS+=("$(python -c "import json; print(json.load(open('$sf'))['topic'])" 2>/dev/null || echo "?")")
+        PROJECT_STAGES+=("$(python -c "import json; print(json.load(open('$sf'))['stage'])" 2>/dev/null || echo "?")")
+        PROJECT_ITERS+=("$(python -c "import json; print(json.load(open('$sf'))['iteration'])" 2>/dev/null || echo "0")")
+        PROJECT_WORKSPACES+=("workspace/$(echo "${PROJECT_TOPICS[-1]}" | tr ' ' '_' | cut -c1-50)")
     fi
 done
 
+# ---- 选择项目 ----
+if [[ ${#PROJECT_SLUGS[@]} -gt 0 ]]; then
+    echo -e "${CYAN}已有项目:${NC}"
+    echo ""
+    i=1
+    for idx in "${!PROJECT_SLUGS[@]}"; do
+        s="${PROJECT_STAGES[$idx]}"
+        # Translate stage to readable Chinese
+        case "$s" in
+            literature_search) s_disp="文献检索" ;;
+            experiment_design) s_disp="实验设计" ;;
+            experiment_execution) s_disp="实验执行" ;;
+            paper_writing) s_disp="论文撰写" ;;
+            submit_review) s_disp="提交审稿" ;;
+            poll_review) s_disp="等待审稿" ;;
+            revise) s_disp="修订中" ;;
+            resubmit) s_disp="重新提交" ;;
+            done) s_disp="已完成 ✓" ;;
+            failed) s_disp="失败 ✗" ;;
+            *) s_disp="$s" ;;
+        esac
+        echo "  [$i] ${PROJECT_TOPICS[$idx]:0:60}"
+        echo "      阶段: ${s_disp} | 迭代: ${PROJECT_ITERS[$idx]}"
+        echo ""
+        i=$((i + 1))
+    done
+    echo "  [N]  开始全新研究"
+    echo "  [Q]  退出"
+    echo ""
+    read -rp "请选择 [N]: " CHOICE
+    CHOICE="${CHOICE:-N}"
+
+    if [[ "$CHOICE" =~ ^[Qq]$ ]]; then
+        exit 0
+    elif [[ "$CHOICE" =~ ^[Nn]$ ]]; then
+        # 开始新项目 — 清空变量
+        PROJECT_SLUGS=()
+    elif [[ "$CHOICE" =~ ^[0-9]+$ ]] && [[ "$CHOICE" -ge 1 ]] && [[ "$CHOICE" -le ${#PROJECT_SLUGS[@]} ]]; then
+        idx=$((CHOICE - 1))
+        SLUG="${PROJECT_SLUGS[$idx]}"
+        TOPIC="${PROJECT_TOPICS[$idx]}"
+        STAGE="${PROJECT_STAGES[$idx]}"
+        ITERATION="${PROJECT_ITERS[$idx]}"
+        WORKSPACE="${PROJECT_WORKSPACES[$idx]}"
+        # 跳转到情况 B（继续已有项目）
+        _continue_project
+    else
+        echo "无效选择"
+        exit 1
+    fi
+fi
+
 # ---- 情况 A：新项目 ----
-if [[ -z "$PROJECT_DIR" ]]; then
-    echo -e "${YELLOW}没有进行中的项目。请输入研究主题。${NC}"
+if [[ ${#PROJECT_SLUGS[@]} -eq 0 ]]; then
+    echo -e "${YELLOW}开始全新研究。请输入研究主题。${NC}"
     echo ""
     read -rp "研究主题: " TOPIC
     if [[ -z "$TOPIC" ]]; then
@@ -380,36 +431,22 @@ sm.save(state)
             exit 0
         fi
     fi
+fi  # 情况 A 结束
 
-# ---- 情况 B: 已有项目 ----
-else
-    echo -e "${YELLOW}发现进行中的项目:${NC}"
-    echo -e "  主题: ${TOPIC}"
-    echo -e "  阶段: ${STAGE} (第 ${ITERATION} 轮迭代)"
+# ---- _continue_project: 继续已有项目 ----
+_continue_project() {
+    echo -e "${CYAN}继续项目: ${TOPIC}${NC}"
+    echo -e "阶段: ${STAGE} | 迭代: ${ITERATION}"
     echo ""
-    echo "  [1] 继续已有项目"
-    echo "  [2] 开始全新研究（删除旧项目）"
-    echo "  [3] 退出"
-    echo ""
-    read -rp "请选择 [1]: " CHOICE
-    CHOICE="${CHOICE:-1}"
-
-    if [[ "$CHOICE" == "2" ]]; then
-        echo "删除旧项目..."
-        rm -rf "state/${SLUG}" "${WORKSPACE}" 2>/dev/null
-        echo "已清理。请重新运行 bash start.sh"
-        exit 0
-    elif [[ "$CHOICE" == "3" ]]; then
-        exit 0
-    fi
 
     # 找到最新的审稿
     LATEST_REVIEW=$(ls -t "${WORKSPACE}/review/review_iter"*.md 2>/dev/null | head -1)
 
     if [[ -z "$LATEST_REVIEW" ]]; then
-        echo ""
-        echo -e "${YELLOW}该项目尚未提交审稿（阶段: ${STAGE}），无法继续修订。${NC}"
-        echo "请选择 [2] 开始新研究，或手动清理 state/ 目录。"
+        echo -e "${YELLOW}该项目尚未提交审稿（阶段: ${STAGE}）。${NC}"
+        echo "无法自动继续。请在 Claude Code 中手动操作："
+        echo "  cd ${WORKSPACE}"
+        echo "  查看 prompts/ 下的任务模板"
         exit 1
     fi
 
@@ -511,4 +548,4 @@ sm.complete_stage(state, Stage.POLL_REVIEW, {'verdict': '${VERDICT}'})
             echo -e "${YELLOW}审稿未通过 (${VERDICT})，请运行 bash start.sh 继续修订${NC}"
         fi
     fi
-fi
+}
