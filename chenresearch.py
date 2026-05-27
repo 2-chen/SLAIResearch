@@ -406,7 +406,8 @@ def main() -> None:
         print(__doc__)
         sys.exit(1)
 
-    cmd, *args = sys.argv[1], sys.argv[2:]
+    cmd = sys.argv[1]
+    args = sys.argv[2:]
 
     if cmd == "run":
         if not args:

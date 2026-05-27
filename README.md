@@ -67,37 +67,33 @@
 ### 安装
 
 ```bash
-# 进入项目目录
 cd /data/PaperBot/ChenResearch
-
-# 一键安装所有依赖（Python + Claude Code + LaTeX）
 bash install.sh
 ```
 
-`install.sh` 会自动完成：
-1. 安装 Python 依赖 (`requests`)
-2. 安装并配置 Claude Code CLI，写入项目级配置到 `.claude/settings.json`
-   - 模型: `deepseek-v4-pro`
-   - API Key: `sk-5d8ed00d568645efb4f6a544160b3849`
-   - Base URL: `https://api.deepseek.com/anthropic`
-3. 检查并安装 LaTeX 编译环境 (`pdflatex` 或 `tectonic`)
-4. 验证所有组件可用
-
-### 运行
+### 启动
 
 ```bash
-# 启动完整流水线
-python chenresearch.py run "Multi-Agent Reinforcement Learning for Robot Collaboration"
-
-# 查看进度
-python chenresearch.py status
-
-# 中断后恢复
-python chenresearch.py resume "multi_agent_reinforcement_learning..."
-
-# 列出所有研究项目
-python chenresearch.py list
+bash start.sh
 ```
+
+首次运行会进入配置向导，引导设置 API Key（默认 DeepSeek）。之后每次启动直接进入 Agent 交互界面。
+
+**不再需要 Python 命令行**。启动后直接和 Agent 对话即可：
+
+```
+你: 研究多智能体强化学习在机器人协作中的应用
+
+Agent: ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+         ChenResearch Pipeline
+         主题: Multi-Agent RL for Robot Collaboration
+         阶段: [1/4] 文献检索
+       ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+       正在搜索 arXiv、Semantic Scholar、OpenAlex...
+       [实时显示进度...]
+```
+
+Agent 会自动完成文献检索 → 实验设计 → SCO 云端执行 → LaTeX 论文撰写 → paperreview.ai 审稿 → 修订迭代，直到 accept。
 
 ---
 

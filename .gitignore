@@ -16,6 +16,7 @@ workspace/
 
 # Sensitive
 .env
+.chenresearch_configured
 *.key
 *.pem
 credentials.json
