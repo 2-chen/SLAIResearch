@@ -349,6 +349,7 @@ if [[ ${#PROJECT_SLUGS[@]} -gt 0 ]]; then
     done
 
     python menu.py "${MENU_ARGS[@]}"
+    stty sane 2>/dev/null || true  # 恢复终端状态，防吞字
     CHOICE=$(cat /tmp/cr_menu_result.txt 2>/dev/null || echo "__QUIT__")
 
     if [[ "$CHOICE" == "__QUIT__" ]]; then

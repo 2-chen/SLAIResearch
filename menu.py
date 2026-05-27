@@ -102,7 +102,14 @@ if __name__ == '__main__':
     if not items:
         sys.exit(1)
 
-    result = menu(items)
+    try:
+        result = menu(items)
+    finally:
+        # 确保终端不残留异常状态
+        sys.stdout.write('\n\x1b[?25h')  # 换行 + 显示光标
+        sys.stdout.flush()
+        import subprocess
+        subprocess.run(['stty', 'sane'], capture_output=True)  # 终极恢复
 
     outfile = "/tmp/cr_menu_result.txt"
     if result is None:
