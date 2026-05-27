@@ -1,62 +1,98 @@
 #!/usr/bin/env python3
-"""Interactive arrow-key menu. Items as args. Returns selection index to stdout."""
+"""Interactive arrow-key menu. Items as args. Selection to /tmp/cr_menu_result.txt."""
 
 import sys
+import tty
+import termios
+import select
 
 
-def menu_curses(items: list[str]) -> int | None:
-    """Use curses for reliable arrow-key navigation."""
-    import curses
+def read_key() -> str:
+    """Read a single keypress with escape sequence handling."""
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == '\x1b':
+            r, _, _ = select.select([sys.stdin], [], [], 0.15)
+            if r:
+                seq = sys.stdin.read(2)
+                if seq == '[A': return 'UP'
+                if seq == '[B': return 'DOWN'
+            return 'ESC'
+        if ch in ('\r', '\n'):
+            return 'ENTER'
+        if ch == '\x03':
+            raise KeyboardInterrupt
+        if ch.lower() == 'q':
+            return 'QUIT'
+        if ch == 'j':
+            return 'DOWN'
+        if ch == 'k':
+            return 'UP'
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
+
+def menu(items: list[str]) -> int | None:
+    """
+    Display a selectable menu. Returns index, None for new, -1 for quit.
+    No screen clearing — just inline selection.
+    """
     options = list(items) + ["★ 开始全新研究", "✕ 退出"]
     extra_start = len(items)
     idx = 0
+    n = len(options)
+    last_displayed = -1
 
-    def draw(stdscr):
-        nonlocal idx
-        curses.curs_set(0)
-        stdscr.clear()
-        h, w = stdscr.getmaxyx()
+    def draw():
+        nonlocal last_displayed
+        if last_displayed >= 0:
+            # Move cursor back up to overwrite previous display
+            lines = last_displayed + 2
+            sys.stdout.write(f'\x1b[{lines}A')
+        sys.stdout.write('\x1b[J')  # clear to end of screen
+        for i, opt in enumerate(options):
+            prefix = "  " if i < extra_start else ""
+            line = f"{prefix}{opt}"
+            if len(line) > 78:
+                line = line[:75] + "..."
+            if i == idx:
+                sys.stdout.write(f'\x1b[7m  ► {line}\x1b[0m\n')
+            else:
+                sys.stdout.write(f'    {line}\n')
+        sys.stdout.write('\n\x1b[90m↑↓/jk 移动  ↵/Enter 确认  q 退出\x1b[0m')
+        sys.stdout.flush()
+        last_displayed = n
 
-        while True:
-            stdscr.erase()
-            stdscr.addstr(0, 2, "ChenResearch — 选择项目", curses.A_BOLD | curses.color_pair(1))
+    # Print initial header
+    sys.stdout.write('\n\x1b[1;36m已有项目:\x1b[0m\n\n')
+    draw()
 
-            visible_start = max(0, idx - h + 8)
-            for i in range(visible_start, min(len(options), visible_start + h - 5)):
-                y = i - visible_start + 2
-                prefix = "  " if i < extra_start else ""
-                line = f"{prefix}{options[i]}"
-                if len(line) > w - 4:
-                    line = line[:w-7] + "..."
-                if i == idx:
-                    stdscr.addstr(y, 2, f"► {line}", curses.A_REVERSE)
-                else:
-                    stdscr.addstr(y, 4, line)
+    while True:
+        try:
+            key = read_key()
+        except Exception:
+            break
 
-            stdscr.addstr(h - 2, 2, "↑↓ 移动  ↵ 确认  q 退出", curses.A_DIM)
-            stdscr.refresh()
-
-            key = stdscr.getch()
-            if key == curses.KEY_UP:
-                idx = (idx - 1) % len(options)
-            elif key == curses.KEY_DOWN:
-                idx = (idx + 1) % len(options)
-            elif key == ord('k'):
-                idx = (idx - 1) % len(options)
-            elif key == ord('j'):
-                idx = (idx + 1) % len(options)
-            elif key in (10, 13, curses.KEY_ENTER):  # Enter
-                if idx < extra_start:
-                    return idx
-                elif idx == extra_start:
-                    return None
-                else:
-                    return -1
-            elif key in (ord('q'), ord('Q'), 27):  # q or ESC
+        if key == 'UP':
+            idx = (idx - 1) % n
+        elif key == 'DOWN':
+            idx = (idx + 1) % n
+        elif key == 'ENTER':
+            if idx < extra_start:
+                return idx
+            elif idx == extra_start:
+                return None
+            else:
                 return -1
-
-    return curses.wrapper(draw)
+        elif key == 'QUIT':
+            return -1
+        else:
+            continue
+        draw()
 
 
 if __name__ == '__main__':
@@ -66,9 +102,8 @@ if __name__ == '__main__':
     if not items:
         sys.exit(1)
 
-    result = menu_curses(items)
+    result = menu(items)
 
-    # 结果写入临时文件（不能 print 到 stdout，因为 $() 会破坏 curses）
     outfile = "/tmp/cr_menu_result.txt"
     if result is None:
         with open(outfile, 'w') as f: f.write("__NEW__")

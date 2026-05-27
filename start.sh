@@ -148,12 +148,15 @@ _continue_project() {
     echo ""
 
     # 找到最新的审稿
-    # 查找最新外部审稿
-    LATEST_REVIEW=$(ls -t "${WORKSPACE}/review/paperreview/iter"*.md 2>/dev/null | head -1)
+    # 查找最新外部审稿（兼容新旧路径）
+    LATEST_REVIEW=$(ls -t "${WORKSPACE}/review/paperreview/iter"*.md "${WORKSPACE}/review/review_iter"*.md 2>/dev/null | head -1)
 
     if [[ -z "$LATEST_REVIEW" ]]; then
-        echo -e "${YELLOW}该项目尚未提交审稿（阶段: ${STAGE}）。${NC}"
-        echo "项目文件完整保留在: ${WORKSPACE}"
+        echo -e "${YELLOW}该项目尚未提交审稿，或审稿文件路径不匹配。${NC}"
+        echo "项目文件保留在: ${WORKSPACE}"
+        echo ""
+        echo "如果审稿已提交但 token 过期，需要重新获取:"
+        echo "  python -c \"from paperreview_api import poll_review; ...\""
         exit 1
     fi
 
