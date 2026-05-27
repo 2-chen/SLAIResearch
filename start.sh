@@ -5,7 +5,7 @@
 # 每次启动：检查 state → 确定当前阶段 → 生成精准 prompt → claude -p 执行
 # 审稿后自动退出，下次重开继续迭代 — 保持每轮上下文干净。
 # =============================================================================
-set -euo pipefail
+set -uo pipefail  # 不用 set -e，关键节点显式错误处理
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
@@ -79,11 +79,48 @@ if ! command -v claude &>/dev/null; then
 fi
 
 # ---------------------------------------------------------------------------
-# Claude Code 调用辅助 — 通过 stdin 传 prompt，避免多行解析问题
+# Claude Code 调用辅助
 # ---------------------------------------------------------------------------
 _claude_task() {
     local prompt="$1"
     echo "$prompt" | claude -p --model "${CLAUDE_MODEL:-deepseek-v4-pro}" --output-format text 2>&1
+}
+
+# 故障接管：遇到报错时启动 Claude Code 诊断并修复
+_on_error() {
+    local stage="$1"
+    local err_msg="$2"
+    local ws="$3"
+
+    echo ""
+    echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${RED}  ${stage} 出错，启动 Claude Code 接管...${NC}"
+    echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+
+    cat > /tmp/cr_recover_prompt.txt << PROMPT_EOF
+你是 ChenResearch 科研系统的故障恢复助手。流水线在 **${stage}** 阶段出错了。
+
+**错误信息**:
+${err_msg}
+
+**工作目录**: ${ws}
+
+**你的任务**:
+1. 检查工作目录下的文件，理解当前状态
+2. 诊断错误原因
+3. 尝试修复问题（修改代码、补充缺失文件、调整配置等）
+4. 如果修复成功，明确报告 "RECOVERY_OK"
+5. 如果无法修复，报告 "RECOVERY_FAILED" 并说明原因
+
+**重要**: 只做必要的修复，不要重新执行整个阶段。修复后让流水线继续。
+PROMPT_EOF
+
+    _claude_task "$(cat /tmp/cr_recover_prompt.txt)"
+
+    echo ""
+    echo -e "${YELLOW}Claude Code 接管完成。继续流水线...${NC}"
+    echo ""
 }
 
 # ---------------------------------------------------------------------------
@@ -250,21 +287,29 @@ sm.start_stage(state, Stage.EXPERIMENT_EXECUTION)
         echo "提交 SCO 任务: ${JOB_NAME}"
 
         # 通过 sco_runner 规范提交（cp 到 AFS → cd && bash）
-        set +e  # 暂时关闭 errexit，捕获错误
         JOB_OUT=$(python -c "
 from sco_runner import submit_job
 from pathlib import Path
 job = submit_job(Path('${EXP_SCRIPT}'), '${JOB_NAME}')
 print(f'JOB_ID={job.job_id}')
-" 2>&1)
-        SCO_EXIT=$?
-        set -e
+" 2>&1) && SCO_EXIT=0 || SCO_EXIT=$?
 
         echo "${JOB_OUT}"
         JOB_ID=$(echo "$JOB_OUT" | grep -oP 'JOB_ID=\K\S+')
 
         if [[ "$SCO_EXIT" -ne 0 ]] || [[ -z "$JOB_ID" ]]; then
-            echo -e "${RED}SCO 提交失败，跳过实验执行阶段${NC}"
+            _on_error "Stage 3 (SCO 云端实验)" "${JOB_OUT}" "${WORKSPACE}"
+            # Claude Code 修复后重试一次
+            JOB_OUT=$(python -c "
+from sco_runner import submit_job
+from pathlib import Path
+job = submit_job(Path('${EXP_SCRIPT}'), '${JOB_NAME}')
+print(f'JOB_ID={job.job_id}')
+" 2>&1) || true
+            JOB_ID=$(echo "$JOB_OUT" | grep -oP 'JOB_ID=\K\S+')
+            if [[ -z "$JOB_ID" ]]; then
+                echo -e "${RED}SCO 提交仍然失败，跳过实验执行阶段${NC}"
+            fi
         else
             echo "等待任务完成..."
             for i in $(seq 1 180); do
