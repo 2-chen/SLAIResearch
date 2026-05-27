@@ -98,16 +98,27 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 4. SCO CLI（SenseCore 内部工具，仅检查）
+# 4. SCO CLI（SenseCore 云端 GPU）
 # ---------------------------------------------------------------------------
-echo "[4/5] 检查 SCO CLI …"
+echo "[4/5] 安装 SCO CLI …"
 if command -v sco &>/dev/null; then
     SCO_USER=$(sco config list 2>/dev/null | grep username | cut -d= -f2 | tr -d " '" || echo "?")
     SCO_ZONE=$(sco config list 2>/dev/null | grep zone | cut -d= -f2 | tr -d " '" || echo "?")
     echo "  SCO CLI: 已安装 (用户: ${SCO_USER}, zone: ${SCO_ZONE})"
 else
-    echo "  [WARN] SCO CLI 未安装 — 云端 GPU 实验功能不可用"
-    echo "  SCO 是 SenseCore 内部工具，需在 SenseCore 环境中使用"
+    echo "  正在安装 SCO CLI …"
+    curl -sSfL https://sco.sensecore.cn/registry/sco/install.sh | sh 2>&1 || {
+        echo "  [WARN] SCO CLI 安装失败，云端 GPU 实验功能不可用"
+    }
+    export PATH="${HOME}/.sco/bin:${PATH}"
+    if command -v sco &>/dev/null; then
+        echo "  SCO CLI: 安装成功"
+    fi
+fi
+
+# 确保 PATH 包含 sco
+if [[ ":$PATH:" != *":${HOME}/.sco/bin:"* ]]; then
+    export PATH="${HOME}/.sco/bin:${PATH}"
 fi
 
 # ---------------------------------------------------------------------------

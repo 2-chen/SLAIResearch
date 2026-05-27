@@ -9,6 +9,9 @@ set -uo pipefail  # 不用 set -e，关键节点显式错误处理
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# 确保 SCO CLI 在 PATH 中
+[[ -d "${HOME}/.sco/bin" ]] && export PATH="${HOME}/.sco/bin:${PATH}"
+
 # Ctrl-C 优雅中断
 trap 'echo -e "\n${YELLOW}收到中断信号，保存状态后退出...${NC}"; exit 130' INT TERM
 cd "${SCRIPT_DIR}"
