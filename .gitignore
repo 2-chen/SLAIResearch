@@ -29,6 +29,9 @@ credentials.json
 .DS_Store
 Thumbs.db
 
+# Virtual env / external binaries
+env/
+
 # PDFs / large outputs
 *.pdf
 *.log

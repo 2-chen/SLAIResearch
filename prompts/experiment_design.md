@@ -36,8 +36,17 @@ Design a complete experimental plan that:
 9. **Implementation Plan**:
    - Write a complete, runnable Python training script
    - Write a shell script `run_experiment.sh` that:
-     - Sets up the environment
-     - Installs dependencies
+     - Sets up the environment (conda or system Python)
+     - **Installs dependencies using the shared offline-first module**: add the following lines at the top of the script (after `set -euo pipefail`):
+       ```bash
+       PROJECT_DIR="$(dirname "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")"
+       source /data/AutoResearch/ChenResearch/workspace/.shared/install_deps.sh
+       ```
+       Then call `install_dependencies` to install all packages. This module automatically:
+       * Checks shared wheel cache at `/data/AutoResearch/ChenResearch/workspace/.shared/wheels/`
+       * Checks project-local wheel cache at `${PROJECT_DIR}/wheels/`
+       * Installs offline if wheels exist, falls back to network with auto-VPN if needed
+       * Pre-download wheels: `bash /data/AutoResearch/ChenResearch/workspace/.shared/download_wheels.sh`
      - Runs all experiments
      - Saves results to a structured output directory
 

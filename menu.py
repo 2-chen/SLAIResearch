@@ -40,30 +40,40 @@ def read_key() -> str:
 def menu(items: list[str]) -> int | None:
     """
     Display a selectable menu. Returns index, None for new, -1 for quit.
-    No screen clearing — just inline selection.
+    Uses in-place cursor movement — no full-screen clear to avoid flicker.
     """
     options = list(items) + ["★ 开始全新研究", "✕ 退出"]
     extra_start = len(items)
     idx = 0
     n = len(options)
+
+    # Count total lines we'll render
+    total_lines = n + 3  # items + header(1) + blank(1) + help(1)
+
     def draw():
-        # Clear screen + redraw — 避免滚动
-        sys.stdout.write('\x1b[2J\x1b[H')  # 清屏 + 光标归位
-        sys.stdout.write('\x1b[1;36m已有项目:\x1b[0m\n\n')
+        # Move cursor to top-left WITHOUT clearing — overwrite in-place
+        sys.stdout.write(f'\x1b[{total_lines}A')  # up to where we started
+        sys.stdout.write('\x1b[1;36m📂 已有项目:\x1b[0m')
+        sys.stdout.write('\x1b[K\n')  # clear to end of line
+        sys.stdout.write('\x1b[K\n')
         for i, opt in enumerate(options):
             prefix = "  " if i < extra_start else ""
             line = f"{prefix}{opt}"
             if len(line) > 78:
                 line = line[:75] + "..."
             if i == idx:
-                sys.stdout.write(f'\x1b[7m  ► {line}\x1b[0m\n')
+                sys.stdout.write(f'\x1b[7m  ► {line}\x1b[0m\x1b[K\n')
             else:
-                sys.stdout.write(f'    {line}\n')
-        sys.stdout.write('\n\x1b[90m↑↓/jk 移动  ↵/Enter 确认  q 退出\x1b[0m')
+                sys.stdout.write(f'    {line}\x1b[K\n')
+        sys.stdout.write('\x1b[K\n')
+        sys.stdout.write('\x1b[90m↑↓/jk 移动  ↵/Enter 确认  q 退出\x1b[0m\x1b[K')
         sys.stdout.flush()
 
-    # Print initial header
-    sys.stdout.write('\n\x1b[1;36m已有项目:\x1b[0m\n\n')
+    # Initial render: print header then draw
+    sys.stdout.write('\n\x1b[1;36m📂 已有项目:\x1b[0m\n\n')
+    for _ in range(n):
+        sys.stdout.write('\n')  # reserve space
+    sys.stdout.write('\n')
     draw()
 
     while True:

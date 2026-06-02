@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 class Stage(str, Enum):
     LITERATURE_SEARCH = "literature_search"
+    HYPOTHESIS_GENERATION = "hypothesis_generation"
     EXPERIMENT_DESIGN = "experiment_design"
     EXPERIMENT_EXECUTION = "experiment_execution"
     PAPER_WRITING = "paper_writing"
@@ -34,6 +35,24 @@ class StageStatus(str, Enum):
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
     FAILED = "failed"
+    REVIEWING = "reviewing"       # stage output is being reviewed
+    REVIEW_FAILED = "review_failed"  # review rejected, needs retry
+
+
+@dataclass
+class StageReviewRecord:
+    """Record of a single stage-level review attempt."""
+    attempt: int
+    stage: str
+    score: float = 0.0
+    passed: bool = False
+    feedback: str = ""
+    strengths: list[str] = field(default_factory=list)
+    weaknesses: list[str] = field(default_factory=list)
+    critical_issues: list[str] = field(default_factory=list)
+    suggestion: str = ""
+    reviewer_mode: str = "llm"  # "llm" or "human"
+    reviewed_at: str = ""
 
 
 @dataclass
@@ -43,6 +62,10 @@ class StageState:
     completed_at: str | None = None
     error: str | None = None
     meta: dict[str, Any] = field(default_factory=dict)
+    # Stage-level review tracking
+    review_attempts: int = 0           # how many times reviewed for this stage
+    review_history: list[dict[str, Any]] = field(default_factory=list)  # list of StageReviewRecord as dicts
+    review_passed: bool = False        # whether the most recent review passed
 
 
 @dataclass
@@ -72,6 +95,7 @@ class ResearchState:
     # Working directories
     work_dir: str = ""
     literature_dir: str = ""
+    hypothesis_dir: str = ""
     experiment_dir: str = ""
     paper_dir: str = ""
     review_dir: str = ""
@@ -82,6 +106,12 @@ class ResearchState:
     # Email / Venue
     email: str = "250010008@slai.edu.cn"
     venue: str = "AAAI"
+
+    # Stage-level review configuration
+    stage_review_enabled: bool = True
+    stage_review_max_retries: int = 10     # max retries per stage
+    stage_review_mode: str = "llm"         # "llm" or "human"
+    stage_review_model: str = ""           # model for review (empty = use default)
 
 
 class StateManager:
@@ -111,6 +141,7 @@ class StateManager:
             updated_at=now,
             work_dir=str(work_path),
             literature_dir=str(work_path / "literature"),
+            hypothesis_dir=str(work_path / "hypothesis"),
             experiment_dir=str(work_path / "experiment"),
             paper_dir=str(work_path / "paper"),
             review_dir=str(work_path / "review"),
@@ -122,6 +153,7 @@ class StateManager:
         # Create subdirectories
         for d in (
             state.literature_dir,
+            state.hypothesis_dir,
             state.experiment_dir,
             state.paper_dir,
             state.review_dir,
@@ -203,6 +235,85 @@ class StateManager:
         return state
 
     # ------------------------------------------------------------------
+    # stage-level review helpers
+    # ------------------------------------------------------------------
+
+    def start_stage_review(self, state: ResearchState, stage: Stage) -> ResearchState:
+        """Mark a stage as being reviewed."""
+        st = state.stages.setdefault(stage.value, StageState())
+        st.status = StageStatus.REVIEWING.value
+        self.save(state)
+        return state
+
+    def record_stage_review(
+        self,
+        state: ResearchState,
+        stage: Stage,
+        review_record: StageReviewRecord,
+    ) -> ResearchState:
+        """Record a stage review verdict."""
+        st = state.stages.setdefault(stage.value, StageState())
+        st.review_attempts += 1
+        st.review_passed = review_record.passed
+        st.review_history.append({
+            "attempt": review_record.attempt,
+            "score": review_record.score,
+            "passed": review_record.passed,
+            "feedback": review_record.feedback,
+            "strengths": review_record.strengths,
+            "weaknesses": review_record.weaknesses,
+            "critical_issues": review_record.critical_issues,
+            "suggestion": review_record.suggestion,
+            "reviewer_mode": review_record.reviewer_mode,
+            "reviewed_at": review_record.reviewed_at or _now(),
+        })
+        if not review_record.passed:
+            st.status = StageStatus.REVIEW_FAILED.value
+        self.save(state)
+        return state
+
+    def get_stage_review_feedback(
+        self, state: ResearchState, stage: Stage
+    ) -> str:
+        """Get accumulated review feedback for a stage (for retry context)."""
+        st = state.stages.get(stage.value)
+        if not st or not isinstance(st, StageState):
+            return ""
+        if not st.review_history:
+            return ""
+
+        parts = []
+        for i, r in enumerate(st.review_history):
+            if not r.get("passed", False):
+                parts.append(f"## Review Round {i+1} (Score: {r.get('score', '?')}/10)")
+                if r.get("critical_issues"):
+                    parts.append("\nCritical Issues:")
+                    for c in r["critical_issues"]:
+                        parts.append(f"  - {c}")
+                if r.get("weaknesses"):
+                    parts.append("\nWeaknesses:")
+                    for w in r["weaknesses"]:
+                        parts.append(f"  - {w}")
+                if r.get("suggestion"):
+                    parts.append(f"\nSuggestion: {r['suggestion']}")
+                if r.get("feedback"):
+                    parts.append(f"\nDetailed Feedback: {r['feedback']}")
+                parts.append("")
+        return "\n".join(parts)
+
+    def stage_review_retries_exhausted(
+        self, state: ResearchState, stage: Stage
+    ) -> bool:
+        """Check if max review retries have been exhausted for a stage."""
+        st = state.stages.get(stage.value)
+        if not st or not isinstance(st, StageState):
+            return False
+        failed_reviews = sum(
+            1 for r in st.review_history if not r.get("passed", False)
+        )
+        return failed_reviews >= state.stage_review_max_retries
+
+    # ------------------------------------------------------------------
     # internal
     # ------------------------------------------------------------------
 
@@ -225,7 +336,12 @@ def _now() -> str:
 
 def _slugify(text: str) -> str:
     """Short deterministic slug for a topic string."""
+    import re
     # Use first 40 chars + hash suffix to keep paths manageable
     prefix = text.strip().lower().replace(" ", "_")[:40]
+    # Strip characters not allowed in SCO job names and safe filenames
+    prefix = re.sub(r'[^a-z0-9_-]', '', prefix)
+    # Strip leading/trailing underscores and hyphens (keeps slug clean)
+    prefix = prefix.strip('_-')
     suffix = hashlib.md5(text.encode()).hexdigest()[:6]
     return f"{prefix}_{suffix}"

@@ -29,6 +29,17 @@ python search_papers.py "research query" -o workspace/<topic>/literature/
 - `sco_runner.py` — SCO CLI 封装
 - `state_manager.py` — 状态持久化
 - `config.py` — 统一配置
+- `review_tools.py` — 自动化审稿检查（AI痕迹、引用覆盖、文献对比）
+- `revision_engine.py` — 逐章节修订循环（backpressure + grounding）
+- `literature_context.py` — 文献横向对比上下文构建
+- `figure_generation.py` — 发表级图表生成（matplotlib + booktabs）
+
+## 图表标准
+
+- 使用 `python figure_generation.py bar ...` 或直接调用 `FigureGenerator` 生成图表
+- 图表输出到 `paper/figures/`，PDF 矢量格式
+- 表格使用 booktabs 风格：`\toprule`/`\midrule`/`\bottomrule`，无竖线
+- 通过 `FigureGenerator.figure_checklist()` 检查每张图是否符合标准
 
 ## 规则
 
