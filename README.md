@@ -4,7 +4,7 @@
 
 **核心设计：`start.sh` 是控制器（Bash），Claude Code 是执行工具（`claude -p`）。每次审稿迭代重开新会话，上下文不累积。**
 
-**v2.1 新特性：ReAct 假说生成阶段** — 在实验设计之前，通过多轮迭代检索+PDF深度阅读+系统对比来寻找研究空白，生成具体可验证的研究假说。详见 [假说生成引擎](#假说生成引擎-react)。
+**v2.2 新特性**：ReAct 假说生成 + **Phase A/B/C 修订管线**（含补充实验执行、SCO 断点恢复、内部审稿门控）+ 实验全失败自动终止保护。详见 [修订迭代管线](#5c-修订迭代)。
 
 ---
 
@@ -351,7 +351,9 @@ export CHENRESEARCH_HYPOTHESIS_MAX_PAPERS=50  # 每轮检索最大论文数
 2. `POST <presigned_url>` → 直接上传 PDF
 3. `POST /api/confirm-upload` → 获取 review token
 
-#### 5c. 修订迭代
+#### 5c. 修订迭代（Phase A/B/C 管线）
+
+收到外部审稿意见后，进入三阶段修订管线：
 
 ```
 外部审稿结果
@@ -359,24 +361,52 @@ export CHENRESEARCH_HYPOTHESIS_MAX_PAPERS=50  # 每轮检索最大论文数
   └─ reject / borderline / weak reject
        │
        ▼
-  ┌──────────────────────────────┐
-  │  内部审稿门控（Internal Gate） │  ← 关键质量闸门
-  │  反复修订直到：                │
-  │  • 内部 5 位审稿平均分 ≥ 6.0  │
-  │  • 外部意见解决率 ≥ 70%       │
-  │  最多迭代 5 轮                │
-  └──────────────┬───────────────┘
-                 ▼ (通过)
-          重新提交 paperreview.ai
-                 │
-                 ▼ (循环，最多 10 次迭代)
+  ┌──────────────────────────────────────────────┐
+  │  Phase A: 分析审稿意见                        │
+  │  分离 [需要实验] / [文字修改] / [理论补充]      │
+  │  输出 revision_plan.json（实验需求列表）       │
+  └──────────────────┬───────────────────────────┘
+                     ▼
+  ┌──────────────────────────────────────────────┐
+  │  Phase B1: 编写补充实验代码                    │
+  │  Claude Code 为每个实验需求写代码和运行脚本     │
+  │  输出 exp_*/run_experiment.sh + manifest      │
+  ├──────────────────────────────────────────────┤
+  │  Phase B2: 并行提交实验到 SCO                  │
+  │  force_sco=True，充分利用多 GPU 并行           │
+  │  保存 sco_job_id.txt → 支持断点恢复            │
+  │  等待完成 → 拉取日志 → experiment_log.txt     │
+  │  ★ 全部失败自动终止，不进入 Phase C            │
+  └──────────────────┬───────────────────────────┘
+                     ▼
+  ┌──────────────────────────────────────────────┐
+  │  Phase C: 用真实实验数据更新论文               │
+  │  逐条修改审稿意见 → 使用实际实验数字           │
+  │  不编造数据 → 重新编译 → 排版检查              │
+  └──────────────────┬───────────────────────────┘
+                     ▼
+  ┌──────────────────────────────────────────────┐
+  │  内部审稿门控（Internal Gate）                 │
+  │  反复修订直到：                                │
+  │  • 内部 5 位审稿平均分 ≥ 6.0                  │
+  │  • 外部意见解决率 ≥ 70%                       │
+  │  最多迭代 5 轮                                │
+  └──────────────────┬───────────────────────────┘
+                     ▼ (通过)
+              重新提交 paperreview.ai
+                     │
+                     ▼ (循环，最多 10 次迭代)
 ```
 
-**内部审稿门控**是提交外部审稿前的**强制质量检查**：
-1. 运行 5 位内部审稿人 → 获取平均分
-2. 逐条检查上一轮外部审稿意见是否已解决 → 计算解决率
-3. 两项均达标 → 放行提交；不达标 → Claude Code 根据反馈修订论文 → 重新检查
-4. 达到上限（5 轮）仍不通过 → 强制提交（带警告）
+**SCO 断点恢复**：系统重启后，Phase B2 自动检测 `logs/sco_job_id.txt`，查询 SCO 云端任务状态：
+- SUCCEEDED → 拉取日志，跳过重交
+- RUNNING → 轮询等待完成
+- FAILED → 仅重交失败的实验
+- 无 job_id → 重新提交
+
+**修订检查点系统**：每个 phase 独立保存检查点（`state/<slug>/revision_checkpoint_<iter>.json`），支持任意时刻中断和恢复：
+- `phase_a` / `phase_b1` / `phase_b2_submitted` / `phase_b2` / `phase_c`
+- 重启后自动跳过已完成的 phase
 
 ---
 
@@ -451,8 +481,8 @@ Session N: ... 直到 accept 或达到 max_iterations
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `start.sh` | ~1300 | **主控制器** — 交互菜单 → 状态检测 → 阶段路由 → claude -p 调用 → 错误恢复 → 审稿门控 |
-| `chenresearch.py` | ~700 | **Python CLI 备选** — `run / resume / status / list`，等价流水线逻辑 |
+| `start.sh` | ~2200 | **主控制器** — 交互菜单 → 状态检测 → 阶段路由 → claude -p 调用 → 错误恢复 → Phase A/B/C 修订管线 → SCO 断点恢复 |
+| `chenresearch.py` | ~900 | **Python CLI 备选** — `run / resume / status / list`，等价流水线逻辑 |
 
 ### 状态系统
 
@@ -468,6 +498,13 @@ Session N: ... 直到 accept 或达到 max_iterations
 | `search_papers.py` | 文献检索 — arXiv（XML API + 限流重试） + Semantic Scholar + OpenAlex 三方聚合，支持 `--save-json` 元数据导出和 `--download-pdfs` PDF 下载 |
 | `hypothesis_engine.py` | **ReAct 假说生成引擎** — 四阶段流程：初始分析 → 迭代检索（THOUGHT→ACT→OBSERVE）→ PDF 深度阅读 → 假说生成 |
 | `internal_review.py` | 内部审稿 — 5 位审稿人并行（ThreadPoolExecutor），每位独立调用 `claude -p` |
+| `review_synthesis.py` | 审稿合成 — 合并 5 位审稿人意见，计算平均分和 consensus verdict |
+| `review_tools.py` | 自动化审稿检查 — AI 痕迹检测、引用覆盖、文献横向对比 |
+| `revision_engine.py` | 逐章节修订循环 — backpressure + grounding，确保每轮修订有实质改进 |
+| `revision_protocol.py` | 修订协议定义 — Phase A/B/C 阶段的标准化接口 |
+| `literature_context.py` | 文献横向对比上下文构建 — 为修订提供文献支撑 |
+| `context_compressor.py` | 上下文压缩 — 长文本摘要和关键信息提取 |
+| `figure_generation.py` | 发表级图表生成 — matplotlib + booktabs，PDF 矢量输出 |
 | `paperreview_api.py` | paperreview.ai 客户端 — 3 步上传（预签名 URL → S3 → 确认） + 轮询 + verdict 解析 |
 | `stage_reviewer.py` | 阶段性评审 — LLM 模拟审稿员评审每个阶段产出，支持 `llm` / `human` 两种模式 |
 
@@ -475,8 +512,10 @@ Session N: ... 直到 accept 或达到 max_iterations
 
 | 文件 | 职责 |
 |------|------|
-| `sco_runner.py` | SCO CLI 封装 + 本地执行引擎 — GPU 检测、启发式 GPU 需求判断、`run_experiment()` 统一接口（local-first，SCO 后备） |
+| `sco_runner.py` | SCO CLI 封装 + 本地执行引擎 — GPU 检测、启发式 GPU 需求判断、`run_experiment()` 统一接口（local-first，SCO 后备）、断点恢复（sco_job_id.txt） |
 | `config.py` | 统一配置 — API Key、模型设置、SCO 集群参数、管道调参，全部可环境变量覆盖 |
+| `exceptions.py` | 统一异常定义 — 可恢复/不可恢复错误分类 |
+| `progress.py` | 进度追踪 — 实验执行、修订迭代的进度持久化 |
 
 ### Prompt 模板
 
@@ -508,15 +547,26 @@ ChenResearch/
 ├── chenresearch.py             # Python CLI 备选（run/resume/status/list）
 ├── state_manager.py            # 状态机（9 阶段枚举 + JSON 持久化）
 ├── search_papers.py            # 文献检索（arXiv + S2 + OpenAlex）
+├── hypothesis_engine.py        # ReAct 假说生成引擎
 ├── stage_reviewer.py           # 阶段评审门（LLM/human 双模式）
 ├── internal_review.py          # 内部 5 人审稿（并行 ThreadPoolExecutor）
+├── review_synthesis.py         # 审稿合成与评分
+├── review_tools.py             # 自动化审稿检查（AI痕迹/引用/文献对比）
+├── revision_engine.py          # 逐章节修订循环（backpressure + grounding）
+├── revision_protocol.py        # Phase A/B/C 修订协议
+├── literature_context.py       # 文献横向对比上下文构建
+├── context_compressor.py       # 上下文压缩
+├── figure_generation.py        # 发表级图表生成（matplotlib + booktabs）
 ├── paperreview_api.py          # paperreview.ai 客户端（3 步上传 + 轮询）
-├── sco_runner.py               # SCO GPU 集群封装
+├── sco_runner.py               # SCO GPU 集群封装 + 本地执行引擎 + 断点恢复
 ├── config.py                   # 统一配置（全部可环境变量覆盖）
+├── exceptions.py               # 统一异常定义
+├── progress.py                 # 进度持久化
 ├── menu.py                     # ↑↓ 键终端菜单
 │
-├── prompts/                    # Claude Code 提示模板（Jinja2 风格）
+├── prompts/                    # Claude Code 提示模板
 │   ├── literature_search.md
+│   ├── hypothesis_generation.md
 │   ├── experiment_design.md
 │   ├── paper_writing.md
 │   └── paper_revision.md
@@ -549,8 +599,16 @@ ChenResearch/
         │   ├── pdfs/           # 下载的 arXiv PDF
         │   └── react_state.json # ReAct 状态检查点（支持中断恢复）
         ├── experiment/         # experiment_plan.md + *.py + run_experiment.sh + sco_logs.txt
-        │   └── logs/          # local_run_NN.log（本地执行日志）
-        ├── paper/              # paper.tex + paper.pdf + response_letter_iter*.md
+        │   ├── logs/          # local_run_NN.log（本地执行日志）
+        │   └── revision_iter_*/  # 修订迭代实验（Phase B）
+        │       ├── revision_plan.json       # Phase A 产出
+        │       ├── experiment_results.json  # Phase B2 汇总
+        │       └── exp_*/     # 每个补充实验
+        │           ├── run_experiment.sh
+        │           ├── experiment_manifest.json
+        │           ├── experiment_log.txt
+        │           └── logs/sco_job_id.txt  # SCO 断点恢复
+        ├── paper/              # paper.tex + paper.pdf
         └── review/             # 审稿产物
             ├── round_000/      # 第 0 轮审稿
             │   ├── external.md    # paperreview.ai 结果
