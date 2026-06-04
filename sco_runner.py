@@ -27,6 +27,8 @@ from config import (
     SCO_WORKSPACE, SCO_AEC2, SCO_IMAGE,
     SCO_WORKER_SPEC, SCO_STORAGE_MOUNT, SCO_WORKER_NODES,
     SCO_QUOTA_TYPE, SCO_PRIORITY,
+    SCO_WORKER_SPEC_MAP, DEFAULT_GPU_COUNT,
+    MAX_COMPUTE_BUDGET_GPU_HOURS,
 )
 
 logger = logging.getLogger(__name__)
@@ -88,9 +90,25 @@ def detect_gpu() -> dict:
     return info
 
 
-def needs_gpu_heuristic(script_path: Path) -> bool:
+def needs_gpu_heuristic(script_path: Path, experiment_dir: Path | None = None) -> bool:
     """Heuristic: does this experiment script likely need a GPU?
-    Scans the script and imported Python files for GPU-related keywords."""
+
+    If experiment_dir is given, checks experiment_manifest.json first.
+    Falls back to scanning the script for GPU-related keywords.
+    """
+    # Check manifest first if available
+    exp_dir = experiment_dir or script_path.parent
+    manifest = exp_dir / "experiment_manifest.json"
+    if manifest.exists():
+        try:
+            data = json.loads(manifest.read_text())
+            gpu_count = int(data.get("gpu_count", 0))
+            if gpu_count > 0:
+                logger.info("Manifest declares %d GPU(s) -> experiment needs GPU", gpu_count)
+                return True
+        except Exception:
+            pass
+
     gpu_keywords = [
         r'\.cuda\(', r'\.to\(.*device', r'device.*cuda',
         r'torch\.cuda', r'CUDA', r'gpu',
@@ -117,6 +135,302 @@ def needs_gpu_heuristic(script_path: Path) -> bool:
 
     logger.info("Heuristic: experiment appears CPU-compatible")
     return False
+
+
+# ---------------------------------------------------------------------------
+# GPU requirement parsing + worker spec resolution
+# ---------------------------------------------------------------------------
+
+
+def parse_gpu_requirement(experiment_dir: str | Path) -> int | None:
+    """Parse GPU requirement from experiment_manifest.json.
+
+    Returns GPU count (>= 1) if manifest exists and is valid,
+    or None if no manifest is found (caller should use default).
+    """
+    manifest_path = Path(experiment_dir) / "experiment_manifest.json"
+    if not manifest_path.exists():
+        logger.warning("=" * 60)
+        logger.warning("MISSING experiment_manifest.json at %s", manifest_path)
+        logger.warning("Falling back to DEFAULT_GPU_COUNT=%d. This may UNDERUTILIZE SCO resources.", DEFAULT_GPU_COUNT)
+        logger.warning("Fix: create experiment_manifest.json with {\"gpu_count\": 4}")
+        logger.warning("=" * 60)
+        return None
+
+    try:
+        data = json.loads(manifest_path.read_text())
+        raw = data.get("gpu_count", None)
+        if raw is None:
+            logger.warning("experiment_manifest.json missing 'gpu_count' key")
+            return None
+        gpu_count = int(raw)
+        if gpu_count < 1:
+            logger.warning("Invalid gpu_count=%d in manifest, clamping to 1", gpu_count)
+            gpu_count = 1
+        logger.info("GPU requirement from manifest: %d GPU(s)", gpu_count)
+        return gpu_count
+    except (json.JSONDecodeError, ValueError, OSError) as e:
+        logger.warning("Failed to parse %s: %s", manifest_path, e)
+        return None
+
+
+def resolve_worker_spec(gpu_count: int) -> str:
+    """Map a GPU count to the best matching SCO worker spec.
+
+    Strategy:
+      1. Exact match in SCO_WORKER_SPEC_MAP.
+      2. Smallest spec with >= gpu_count GPUs.
+      3. Largest available spec if request exceeds all.
+      4. Fallback to SCO_WORKER_SPEC.
+    """
+    if not SCO_WORKER_SPEC_MAP:
+        logger.warning("SCO_WORKER_SPEC_MAP is empty, using default: %s", SCO_WORKER_SPEC)
+        return SCO_WORKER_SPEC
+
+    if gpu_count in SCO_WORKER_SPEC_MAP:
+        spec = SCO_WORKER_SPEC_MAP[gpu_count]
+        logger.info("Resolved %d GPU(s) -> exact match: %s", gpu_count, spec)
+        return spec
+
+    available = sorted(SCO_WORKER_SPEC_MAP.keys())
+    for count in available:
+        if count >= gpu_count:
+            spec = SCO_WORKER_SPEC_MAP[count]
+            logger.info("Resolved %d GPU(s) -> next available (%d GPUs): %s",
+                        gpu_count, count, spec)
+            return spec
+
+    largest = available[-1]
+    spec = SCO_WORKER_SPEC_MAP[largest]
+    logger.warning("Requested %d GPU(s) but max available is %d, using: %s",
+                   gpu_count, largest, spec)
+    return spec
+
+
+def _auto_detect_config(script_path: str | Path) -> tuple[dict[str, str], "SCOConfig"]:
+    """Auto-detect GPU requirements from experiment manifest.
+
+    Reads experiment_manifest.json in the script's parent directory.
+    Returns (extra_env, sco_config) — always non-None.
+    extra_env includes GPU_COUNT. sco_config has the resolved worker_spec.
+    """
+    exp_dir = Path(script_path).parent
+    gpu_count = parse_gpu_requirement(exp_dir) or DEFAULT_GPU_COUNT
+    extra_env = {
+        "GPU_COUNT": str(gpu_count),
+        "CHENRESEARCH": "1",
+    }
+    resolved_spec = resolve_worker_spec(gpu_count)
+    sco_config = SCOConfig(worker_spec=resolved_spec)
+    logger.info("Auto-detected config: GPU_COUNT=%d, worker_spec=%s", gpu_count, resolved_spec)
+    return extra_env, sco_config
+
+
+# ---------------------------------------------------------------------------
+# Pre-submission checks (GPU utilization + compute budget)
+# ---------------------------------------------------------------------------
+
+# Inline GPU-related keyword lists for heuristic checks.  These are used
+# both by needs_gpu_heuristic() and check_gpu_utilization().
+_GPU_TRAINING_KEYWORDS = [
+    r'nn\.DataParallel\(', r'DistributedDataParallel',
+    r'torch\.cuda\.device_count\(\)',
+    r'multigpu', r'multi_gpu', r'world_size', r'local_rank',
+    r'torchrun', r'torch\.distributed', r'deepspeed', r'FSDP',
+]
+_GPU_INFERENCE_KEYWORDS = [
+    r'multiprocessing.*spawn', r'multiprocessing.*Pool',
+    r'CUDA_VISIBLE_DEVICES', r'device.*cuda:\d+',
+    r'gpu_id', r'per_gpu',
+]
+
+
+def check_gpu_utilization(experiment_dir: str | Path, gpu_count: int) -> dict:
+    """Static analysis: does this experiment actually use multiple GPUs?
+
+    Scans Python source and shell scripts under *experiment_dir* for
+    multi-GPU patterns (DataParallel, DDP, multiprocessing, background
+    processes with wait).  Returns a dict with:
+        score:   "good" | "partial" | "poor"
+        issues:  list of concrete problems found
+    """
+    exp_dir = Path(experiment_dir)
+    issues: list[str] = []
+
+    if gpu_count <= 1:
+        return {"score": "good", "issues": []}
+
+    # ── Collect all source text ──
+    py_text = ""
+    sh_text = ""
+    for f in sorted(exp_dir.rglob("*.py")):
+        try:
+            py_text += "\n" + f.read_text()
+        except Exception:
+            pass
+    for f in sorted(exp_dir.glob("*.sh")):
+        try:
+            sh_text += "\n" + f.read_text()
+        except Exception:
+            pass
+
+    # ── Check Python patterns ──
+    has_training_parallel = any(
+        re.search(kw, py_text, re.IGNORECASE) for kw in _GPU_TRAINING_KEYWORDS
+    )
+    has_inference_parallel = any(
+        re.search(kw, py_text, re.IGNORECASE) for kw in _GPU_INFERENCE_KEYWORDS
+    )
+
+    # ── Check shell patterns ──
+    has_bg_processes = bool(
+        re.search(r'&\s*$', sh_text, re.MULTILINE) and 'wait' in sh_text
+    )
+    # Multiple CUDA_VISIBLE_DEVICES assignments (not just a single export at the top)
+    has_multi_gpu_shell = len(re.findall(r'CUDA_VISIBLE_DEVICES=', sh_text)) >= 2
+
+    # ── Detect serial training anti-patterns ──
+    # Sequential for-loop over sigma/baseline training without parallel
+    has_serial_training = False
+    serial_train_patterns = [
+        (r'for\s+sigma\s+in', 'serial sigma training loop'),
+        (r'for\s+.*\s+in\s+.*baseline', 'serial baseline loop'),
+    ]
+    for pat, desc in serial_train_patterns:
+        if re.search(pat, py_text, re.IGNORECASE):
+            if not has_training_parallel and not has_bg_processes:
+                has_serial_training = True
+                issues.append(
+                    f"Training appears to use a {desc} — all baselines will "
+                    f"run sequentially on a single GPU. With {gpu_count} GPUs, "
+                    f"each baseline should be dispatched to a different GPU in parallel."
+                )
+                break  # one is enough
+
+    # ── Score ──
+    # Priority: serial training without parallelism is always poor utilization
+    if has_serial_training:
+        score = "poor"
+    elif has_training_parallel:
+        score = "good"
+    elif has_inference_parallel and has_bg_processes:
+        score = "partial"
+    elif has_inference_parallel or has_bg_processes or has_multi_gpu_shell:
+        score = "partial"
+        issues.append(
+            f"Certification/inference uses multi-GPU but training appears serial. "
+            f"Training time will dominate with only 1/{gpu_count} GPUs active."
+        )
+    else:
+        score = "poor"
+        if not issues:
+            issues.append(
+                f"No multi-GPU patterns detected (DataParallel, DDP, multiprocessing, "
+                f"background jobs) but gpu_count={gpu_count}. "
+                f"Experiment will use only 1 of {gpu_count} allocated GPUs."
+            )
+
+    return {"score": score, "issues": issues}
+
+
+def check_compute_budget(experiment_dir: str | Path, gpu_count: int) -> dict:
+    """Check whether estimated GPU-hours exceed the per-task budget.
+
+    Reads *estimated_runtime_hours* (or *estimated_duration_minutes*) from
+    experiment_manifest.json.  If the estimate is missing the check is
+    skipped (warning, not error).
+
+    Returns:
+        ok:                  bool
+        estimated_gpu_hours: float | None
+        max_allowed:         int
+        message:             human-readable result
+    """
+    exp_dir = Path(experiment_dir)
+    manifest = exp_dir / "experiment_manifest.json"
+    estimated_hours: float | None = None
+
+    if manifest.exists():
+        try:
+            data = json.loads(manifest.read_text())
+            estimated_hours = data.get("estimated_runtime_hours")
+            if estimated_hours is None:
+                minutes = data.get("estimated_duration_minutes")
+                if minutes is not None:
+                    estimated_hours = float(minutes) / 60.0
+        except Exception:
+            pass
+
+    if estimated_hours is None:
+        return {
+            "ok": True,
+            "estimated_gpu_hours": None,
+            "max_allowed": MAX_COMPUTE_BUDGET_GPU_HOURS,
+            "message": (
+                "No estimated_runtime_hours in experiment_manifest.json — "
+                "skipping compute budget check"
+            ),
+        }
+
+    gpu_hours = gpu_count * float(estimated_hours)
+
+    if gpu_hours > MAX_COMPUTE_BUDGET_GPU_HOURS:
+        return {
+            "ok": False,
+            "estimated_gpu_hours": gpu_hours,
+            "max_allowed": MAX_COMPUTE_BUDGET_GPU_HOURS,
+            "message": (
+                f"Estimated {gpu_hours:.1f} GPU-hours exceeds "
+                f"max {MAX_COMPUTE_BUDGET_GPU_HOURS} GPU-hours "
+                f"({gpu_count} GPUs × {estimated_hours:.1f}h). "
+                f"Reduce experiment scope or add parallelism."
+            ),
+        }
+
+    return {
+        "ok": True,
+        "estimated_gpu_hours": gpu_hours,
+        "max_allowed": MAX_COMPUTE_BUDGET_GPU_HOURS,
+        "message": (
+            f"Budget OK: {gpu_hours:.1f} / {MAX_COMPUTE_BUDGET_GPU_HOURS} GPU-hours "
+            f"({gpu_count} GPUs × {estimated_hours:.1f}h)"
+        ),
+    }
+
+
+def _pre_submit_check(experiment_dir: str | Path, gpu_count: int) -> None:
+    """Run all pre-submission checks.  Raises RuntimeError on hard failures,
+    logs warnings for soft issues."""
+    exp_dir = Path(experiment_dir)
+
+    # 1. GPU utilization check (soft — warn but don't block)
+    util = check_gpu_utilization(exp_dir, gpu_count)
+    if util["score"] == "poor":
+        logger.warning("=" * 60)
+        logger.warning("GPU UTILIZATION CHECK: POOR")
+        for issue in util["issues"]:
+            logger.warning("  ✗ %s", issue)
+        logger.warning("Experiment will UNDERUTILIZE %d allocated GPU(s).", gpu_count)
+        logger.warning("=" * 60)
+    elif util["score"] == "partial":
+        logger.warning("GPU UTILIZATION CHECK: PARTIAL")
+        for issue in util["issues"]:
+            logger.warning("  ⚠ %s", issue)
+
+    # 2. Compute budget check (hard — block if exceeded)
+    budget = check_compute_budget(exp_dir, gpu_count)
+    if not budget["ok"]:
+        logger.error("=" * 60)
+        logger.error("COMPUTE BUDGET EXCEEDED")
+        logger.error(budget["message"])
+        logger.error("Reduce estimated_runtime_hours or split into smaller tasks.")
+        logger.error("Set CHENRESEARCH_MAX_GPU_HOURS to override (not recommended).")
+        logger.error("=" * 60)
+        raise RuntimeError(budget["message"])
+    if budget["estimated_gpu_hours"] is not None:
+        logger.info("Compute budget: %s", budget["message"])
+    else:
+        logger.warning("Compute budget: %s", budget["message"])
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +584,16 @@ def run_experiment(
     Returns ExperimentResult with backend and success status.
     """
     script_path = Path(script_path).resolve()
+
+    # Auto-detect GPU config from experiment manifest if not provided
+    if sco_config is None or extra_env is None:
+        auto_env, auto_cfg = _auto_detect_config(script_path)
+        if extra_env is None:
+            extra_env = auto_env
+        else:
+            extra_env = {**auto_env, **extra_env}
+        if sco_config is None:
+            sco_config = auto_cfg
     if work_dir is None:
         work_dir = script_path.parent
     work_dir = Path(work_dir)
@@ -302,7 +626,7 @@ def run_experiment(
     # ── Step 2: Decide local vs SCO ──
     use_local = True
     if not has_gpu:
-        needs_gpu = needs_gpu_heuristic(script_path)
+        needs_gpu = needs_gpu_heuristic(script_path, experiment_dir=script_path.parent)
         if needs_gpu:
             logger.info("No local GPU + experiment needs GPU → will use SCO")
             use_local = False
@@ -327,7 +651,7 @@ def run_experiment(
             )
 
         # Local failed — if GPU was needed, try SCO as last resort
-        if not has_gpu and needs_gpu_heuristic(script_path):
+        if not has_gpu and needs_gpu_heuristic(script_path, experiment_dir=script_path.parent):
             logger.warning(
                 "Local execution FAILED (attempts=%d). Experiment needs GPU → falling back to SCO.",
                 local_result.attempts,
@@ -404,6 +728,17 @@ def _run_sco_path(
 ) -> ExperimentResult:
     """Submit to SCO and wait for completion."""
     log_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Pre-submission: GPU utilization + compute budget checks ──
+    gpu_count = int((extra_env or {}).get("GPU_COUNT", DEFAULT_GPU_COUNT))
+    try:
+        _pre_submit_check(script_path.parent, gpu_count)
+    except RuntimeError as e:
+        logger.error("Pre-submit check FAILED: %s", e)
+        return ExperimentResult(
+            backend="sco", success=False,
+            error_summary=f"Pre-submit check failed: {e}",
+        )
 
     # ── Pre-submission: ensure wheels are cached ──
     _ensure_wheels()
@@ -572,7 +907,7 @@ def get_job_status(job_id: str, config: SCOConfig | None = None) -> str:
     )
     if result.returncode != 0:
         raise RuntimeError(f"sco describe failed: {result.stderr}")
-    data = json.loads(result.stdout)
+    data = json.loads(result.stdout) if result.stdout.strip() else {}
     return data.get("status", data.get("state", "UNKNOWN"))
 
 

@@ -2,11 +2,16 @@
 JSON-file state manager for the ChenResearch pipeline.
 Each research topic gets its own state file under state/<topic_slug>/state.json.
 Thread-safe enough for a single-process orchestrator.
+
+All writes use atomic file operations (tempfile + os.replace) to prevent
+corruption on process crash or power loss.
 """
 
 import json
 import hashlib
 import logging
+import os
+import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
 from dataclasses import dataclass, field, asdict
@@ -61,6 +66,7 @@ class StageState:
     started_at: str | None = None
     completed_at: str | None = None
     error: str | None = None
+    retries: int = 0                   # execution retry count (separate from review retries)
     meta: dict[str, Any] = field(default_factory=dict)
     # Stage-level review tracking
     review_attempts: int = 0           # how many times reviewed for this stage
@@ -321,9 +327,89 @@ class StateManager:
         return self._base / slug / "state.json"
 
     def _save(self, slug: str, state: ResearchState) -> None:
+        """Atomically write state to JSON file.
+
+        Uses tempfile + os.replace to prevent corruption on crash.
+        Falls back to direct write if atomic rename fails (e.g. cross-device).
+        """
         p = self._path(slug)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(asdict(state), indent=2, ensure_ascii=False))
+        content = json.dumps(asdict(state), indent=2, ensure_ascii=False)
+        try:
+            fd, tmp_path = tempfile.mkstemp(dir=str(p.parent), suffix=".tmp")
+            try:
+                os.write(fd, content.encode("utf-8"))
+            finally:
+                os.close(fd)
+            os.replace(tmp_path, p)
+        except OSError:
+            try:
+                os.unlink(tmp_path)
+            except (OSError, UnboundLocalError):
+                pass
+            p.write_text(content, encoding="utf-8")
+
+    # ------------------------------------------------------------------
+    # crash recovery
+    # ------------------------------------------------------------------
+
+    def reset_stale_running_stages(self, state: ResearchState) -> ResearchState:
+        """Reset any stages left in 'in_progress' status back to 'pending'.
+
+        Called at pipeline start / resume to recover from hard crashes
+        (OOM, power loss, SIGKILL) where a stage was mid-execution.
+        """
+        changed = False
+        for name, st in list(state.stages.items()):
+            if not isinstance(st, StageState):
+                continue
+            if st.status == StageStatus.IN_PROGRESS.value:
+                st.status = StageStatus.PENDING.value
+                st.error = None
+                st.completed_at = None
+                changed = True
+                logger.warning(
+                    "Reset stale stage '%s' from in_progress → pending (crash recovery)",
+                    name,
+                )
+        if changed:
+            state.stage = self._first_pending_stage(state)
+            self.save(state)
+        return state
+
+    def increment_retry(self, state: ResearchState, stage: Stage) -> ResearchState:
+        """Increment retry count for *stage* and reset its status to 'pending'.
+
+        Use this when a stage execution fails but you want to retry it.
+        """
+        st = state.stages.setdefault(stage.value, StageState())
+        st.retries += 1
+        st.status = StageStatus.PENDING.value
+        st.error = None
+        st.completed_at = None
+        state.stage = stage.value
+        self.save(state)
+        return state
+
+    @staticmethod
+    def _first_pending_stage(state: ResearchState) -> str:
+        """Return the name of the first stage with 'pending' status."""
+        stage_order = [
+            Stage.LITERATURE_SEARCH,
+            Stage.HYPOTHESIS_GENERATION,
+            Stage.EXPERIMENT_DESIGN,
+            Stage.EXPERIMENT_EXECUTION,
+            Stage.PAPER_WRITING,
+            Stage.SUBMIT_REVIEW,
+            Stage.POLL_REVIEW,
+            Stage.REVISE,
+            Stage.RESUBMIT,
+        ]
+        for s in stage_order:
+            st = state.stages.get(s.value)
+            if isinstance(st, StageState) and st.status == "pending":
+                return s.value
+        return Stage.LITERATURE_SEARCH.value
 
 
 # ------------------------------------------------------------------

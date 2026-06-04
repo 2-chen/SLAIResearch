@@ -81,13 +81,24 @@ class ContextCompressor:
     def detect_entry_point(self) -> EntryPointResult:
         """Auto-detect where the pipeline should start based on available materials.
 
-        Inspection order (from chen-research-skills):
-        1. pipeline_state/state.json exists → resume from saved state
-        2. review/round_*/ exists → start from REVISE with review feedback
-        3. paper/paper.tex exists → start from REVIEW
-        4. experiment/results exist → start from WRITE
-        5. literature/ exists → start from EXPERIMENT
-        6. Nothing → start from RESEARCH
+        NOTE: This is a material-based heuristic. The PRIMARY recovery mechanism
+        is StateManager.reset_stale_running_stages() + cmd_resume(), which reads
+        the authoritative state from state/<slug>/state.json.
+
+        This method is useful when:
+        - You only have a workspace directory (no state file)
+        - You want to verify what materials exist on disk
+
+        Inspection order:
+        1. Check StateManager state (state/<slug>/state.json) — authoritative
+        2. pipeline_state/state.json exists → resume from saved state
+        3. review/round_*/ exists → start from REVISE with review feedback
+        4. paper/paper.tex exists → start from PAPER_WRITING
+        5. experiment/results exist → start from PAPER_WRITING
+        6. experiment/plan exists → start from EXPERIMENT_EXECUTION
+        7. hypothesis exists → start from EXPERIMENT_DESIGN
+        8. literature exists → start from EXPERIMENT_DESIGN
+        9. Nothing → start from LITERATURE_SEARCH
         """
         materials: dict[str, bool] = {
             "pipeline_state": (self.state_dir / "state.json").exists(),
@@ -127,10 +138,10 @@ class ContextCompressor:
 
         if materials["paper_tex"] and not materials["reviews"]:
             return EntryPointResult(
-                stage="review",
+                stage="submit_review",
                 confidence="high",
                 materials_found=materials,
-                reasoning="Paper draft exists but no reviews → start at REVIEW",
+                reasoning="Paper draft exists but no reviews → start at SUBMIT_REVIEW",
             )
 
         if materials["experiment_results"]:
@@ -138,7 +149,7 @@ class ContextCompressor:
                 stage="paper_writing",
                 confidence="high",
                 materials_found=materials,
-                reasoning="Experiment results available → start at WRITE",
+                reasoning="Experiment results available → start at PAPER_WRITING",
             )
 
         if materials["experiment_plan"]:
@@ -146,7 +157,7 @@ class ContextCompressor:
                 stage="experiment_execution",
                 confidence="high",
                 materials_found=materials,
-                reasoning="Experiment plan exists → start at EXECUTION",
+                reasoning="Experiment plan exists → start at EXPERIMENT_EXECUTION",
             )
 
         if materials["hypothesis"]:
@@ -154,7 +165,7 @@ class ContextCompressor:
                 stage="experiment_design",
                 confidence="high",
                 materials_found=materials,
-                reasoning="Hypothesis generated → start at EXPERIMENT DESIGN",
+                reasoning="Hypothesis generated → start at EXPERIMENT_DESIGN",
             )
 
         if materials["literature"]:
@@ -162,7 +173,7 @@ class ContextCompressor:
                 stage="experiment_design",
                 confidence="medium",
                 materials_found=materials,
-                reasoning="Literature exists → start at EXPERIMENT DESIGN",
+                reasoning="Literature exists → start at EXPERIMENT_DESIGN",
             )
 
         return EntryPointResult(
@@ -398,7 +409,7 @@ class ContextCompressor:
         stages = [
             "literature_search", "hypothesis_generation",
             "experiment_design", "experiment_execution",
-            "paper_writing", "review",
+            "paper_writing", "submit_review",
         ]
 
         lines = [

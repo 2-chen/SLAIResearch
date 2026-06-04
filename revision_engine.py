@@ -517,6 +517,11 @@ class RevisionEngine:
             experiment_blueprint={...},
             experiment_results={...},
         )
+
+    Checkpoint support:
+        engine = RevisionEngine(checkpoint_path="state/slug/revision_engine_ckpt.json")
+        # First run: saves progress after each round
+        # Resume: call revise() again with same checkpoint_path — skips completed rounds
     """
 
     def __init__(
@@ -526,12 +531,91 @@ class RevisionEngine:
         max_rounds: int = MAX_REVISION_ROUNDS,
         min_score: int = MIN_SECTION_SCORE,
         convergence_threshold: float = CONVERGENCE_THRESHOLD,
+        checkpoint_path: str | None = None,
     ):
         self.model = model
         self.claude_cmd = claude_cmd
         self.max_rounds = max_rounds
         self.min_score = min_score
         self.convergence_threshold = convergence_threshold
+        self.checkpoint_path = Path(checkpoint_path) if checkpoint_path else None
+
+    # ------------------------------------------------------------------
+    # Checkpoint save/load
+    # ------------------------------------------------------------------
+
+    def _save_checkpoint(
+        self,
+        round_num: int,
+        sections: list[SectionInfo],
+        current_tex: str,
+        paper_tex_original: str,
+        prev_avg: float,
+        stall_count: int,
+        bp_revert_count: int,
+        report: RevisionReport,
+    ) -> None:
+        """Save revision progress to disk so we can resume after interruption."""
+        if not self.checkpoint_path:
+            return
+        import json as _json
+        from datetime import datetime as _dt, timezone as _tz
+        ckpt = {
+            "version": 1,
+            "rounds_completed": round_num,
+            "sections": [
+                {
+                    "heading": s.heading,
+                    "content": s.content,
+                    "level": s.level,
+                    "score": s.score,
+                    "issues": s.issues,
+                    "suggestions": s.suggestions,
+                    "strengths": s.strengths,
+                }
+                for s in sections
+            ],
+            "current_tex": current_tex,
+            "paper_tex_original": paper_tex_original,
+            "prev_avg_score": prev_avg,
+            "stall_count": stall_count,
+            "bp_revert_count": bp_revert_count,
+            "report": {
+                "rounds": report.rounds,
+                "initial_avg_score": report.initial_avg_score,
+                "sections_revised": report.sections_revised,
+                "backpressure_reverts": report.backpressure_reverts,
+                "meta_refine_attempts": report.meta_refine_attempts,
+                "grounding_fixes": report.grounding_fixes,
+                "convergence_reached": report.convergence_reached,
+            },
+            "saved_at": _dt.now(_tz.utc).isoformat(timespec="seconds"),
+        }
+        self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        self.checkpoint_path.write_text(
+            _json.dumps(ckpt, indent=2, ensure_ascii=False)
+        )
+        logger.info("Checkpoint saved: round %d, %d sections", round_num, len(sections))
+
+    def _load_checkpoint(self) -> dict | None:
+        """Load a checkpoint if it exists. Returns None if no checkpoint or invalid."""
+        if not self.checkpoint_path or not self.checkpoint_path.exists():
+            return None
+        import json as _json
+        try:
+            ckpt = _json.loads(self.checkpoint_path.read_text())
+            if ckpt.get("version") != 1:
+                logger.warning("Checkpoint version mismatch, ignoring")
+                return None
+            logger.info(
+                "Checkpoint loaded: %d rounds completed, %d sections",
+                ckpt.get("rounds_completed", 0),
+                len(ckpt.get("sections", [])),
+            )
+            return ckpt
+        except Exception as exc:
+            logger.warning("Failed to load checkpoint: %s", exc)
+            return None
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -607,11 +691,52 @@ class RevisionEngine:
             if sections else 0
         )
 
-        # Step 2: Revision loop
+        # Step 2: Revision loop (with checkpoint resume)
         revision_round = 0
         prev_avg = report.initial_avg_score
         stall_count = 0
         bp_revert_count = 0
+
+        # Try to resume from checkpoint
+        ckpt = self._load_checkpoint()
+        if ckpt:
+            resume_round = ckpt.get("rounds_completed", 0)
+            if resume_round > 0:
+                logger.info("Resuming revision from checkpoint (round %d)", resume_round)
+                revision_round = resume_round
+                prev_avg = ckpt.get("prev_avg_score", prev_avg)
+                stall_count = ckpt.get("stall_count", 0)
+                bp_revert_count = ckpt.get("bp_revert_count", 0)
+                # Restore sections from checkpoint
+                ckpt_sections = ckpt.get("sections", [])
+                if ckpt_sections:
+                    sections = [
+                        SectionInfo(
+                            heading=s["heading"],
+                            content=s["content"],
+                            level=s.get("level", 0),
+                            score=s.get("score", 5.0),
+                            issues=s.get("issues", []),
+                            suggestions=s.get("suggestions", []),
+                            strengths=s.get("strengths", []),
+                        )
+                        for s in ckpt_sections
+                    ]
+                    report.sections = sections
+                # Restore report summary
+                ckpt_report = ckpt.get("report", {})
+                if ckpt_report:
+                    report.rounds = ckpt_report.get("rounds", resume_round)
+                    report.sections_revised = ckpt_report.get("sections_revised", 0)
+                    report.backpressure_reverts = ckpt_report.get("backpressure_reverts", 0)
+                    report.meta_refine_attempts = ckpt_report.get("meta_refine_attempts", 0)
+                    report.grounding_fixes = ckpt_report.get("grounding_fixes", 0)
+                    report.convergence_reached = ckpt_report.get("convergence_reached", False)
+                # Restore current tex
+                ckpt_tex = ckpt.get("current_tex", "")
+                if ckpt_tex:
+                    current_tex = ckpt_tex
+                paper_tex = ckpt.get("paper_tex_original", paper_tex)
 
         while revision_round < self.max_rounds:
             low_sections = [s for s in sections if s.score < self.min_score]
@@ -787,6 +912,18 @@ class RevisionEngine:
                 stall_count = 0
 
             prev_avg = new_avg
+
+            # Save checkpoint after each round
+            self._save_checkpoint(
+                round_num=revision_round,
+                sections=sections,
+                current_tex=current_tex,
+                paper_tex_original=paper_tex,
+                prev_avg=prev_avg,
+                stall_count=stall_count,
+                bp_revert_count=bp_revert_count,
+                report=report,
+            )
 
         # Step 3: Apply grounding protection
         if experiment_results:

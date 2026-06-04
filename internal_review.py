@@ -29,6 +29,8 @@ try:
         check_claim_result_consistency,
         check_citation_coverage,
         check_latex_structure,
+        check_latex_formatting,
+        check_pdflatex_log,
         format_issues_for_llm,
     )
     _REVIEW_TOOLS_AVAILABLE = True
@@ -118,7 +120,8 @@ REVIEWER_POOL = [
             4. **Conciseness**: Is there redundant or verbose text?
             5. **Title & Abstract**: Do they accurately reflect the contribution?
             6. **Figures & Tables**: Are they well-designed, properly labeled, and informative?
-            7. **AI Writing Detection**: Any signs of LLM-generated text (hedging pileups, "delve", "leverage", "furthermore" overuse)?
+            7. **Layout & Formatting**: Do any figures, tables, or equations overflow the column? Is \\columnwidth used correctly for in-column figures? Are tables resized to fit? Check for Overfull hbox warnings.
+            8. **AI Writing Detection**: Any signs of LLM-generated text (hedging pileups, "delve", "leverage", "furthermore" overuse)?
 
             For each issue found, use format:
             [PROBLEM] specific issue → [IMPACT] why it matters → [FIX] concrete suggestion
@@ -130,6 +133,7 @@ REVIEWER_POOL = [
             ### Structural Issues
             ### Language & Clarity Issues
             ### Figure/Table Issues
+            ### Layout & Formatting Issues
             ### AI Writing Flags (if any)
             ### Score (1-10)
             ### Recommendation
@@ -252,11 +256,19 @@ def review_paper(paper_path: str, output_dir: str, model: str = CLAUDE_MODEL,
         try:
             auto_issues = detect_ai_artifacts(paper_text)
             auto_issues.extend(check_citation_coverage(paper_text))
+            # LaTeX formatting check (no compilation needed)
+            latex_fmt_issues = check_latex_formatting(paper_text)
+            auto_issues.extend(latex_fmt_issues)
+            # LaTeX compilation check (requires pdflatex)
+            latex_log_issues = check_pdflatex_log(paper_path, paper_path.parent)
+            auto_issues.extend(latex_log_issues)
             logger.info(
                 "Automated checks: %d issues found "
-                "(AI artifacts: %d, citations: check done)",
+                "(AI artifacts: %d, LaTeX formatting: %d, LaTeX compile: %d)",
                 len(auto_issues),
                 sum(1 for i in auto_issues if "ai_artifact" in i.get("issue_type", "")),
+                len(latex_fmt_issues),
+                len(latex_log_issues),
             )
             # Literature-grounded checks
             if lit_context_blocks:
@@ -306,7 +318,7 @@ def review_paper(paper_path: str, output_dir: str, model: str = CLAUDE_MODEL,
             futures = {
                 executor.submit(
                     _run_reviewer, r, paper_text, paper_path, output_dir,
-                    lit_context_blocks,
+                    lit_context_blocks, auto_checks_text,
                 ): r["name"]
                 for r in reviewers
             }
@@ -322,7 +334,7 @@ def review_paper(paper_path: str, output_dir: str, model: str = CLAUDE_MODEL,
         for r in reviewers:
             try:
                 results[r["name"]] = _run_reviewer(
-                    r, paper_text, paper_path, output_dir, lit_context_blocks,
+                    r, paper_text, paper_path, output_dir, lit_context_blocks, auto_checks_text,
                 )
                 logger.info("✓ %s completed (score: %s)", r["name"], results[r["name"]].get("score", "?"))
             except Exception as e:
@@ -330,11 +342,7 @@ def review_paper(paper_path: str, output_dir: str, model: str = CLAUDE_MODEL,
                 results[r["name"]] = {"error": str(e)}
 
     # Merge into final review document
-    merged = _merge_reviews(results, reviewers)
-
-    # Attach literature-grounded check results
-    merged["literature_grounded_checks"] = lit_auto_issues
-
+    merged = _merge_reviews(results, reviewers, auto_issues, auto_checks_text, lit_auto_issues)
     return merged
 
 
@@ -388,7 +396,8 @@ def _build_lit_context_blocks(literature_dir: str) -> dict[str, str]:
 
 
 def _run_reviewer(reviewer: dict, paper_text: str, paper_path: Path, output_dir: Path,
-                 lit_context_blocks: dict[str, str] | None = None) -> dict:
+                 lit_context_blocks: dict[str, str] | None = None,
+                 auto_checks_text: str = "") -> dict:
     """Run a single reviewer via claude -p.
 
     If lit_context_blocks is provided, role-appropriate literature context
@@ -456,6 +465,8 @@ def _extract_score(text: str) -> str:
         r'(?im)Score\s*\(1-?10\)\s*:\s*(\d+(?:\.\d+)?)',
         # "**Score**: 7.5" (markdown bold)
         r'(?im)\*\*Score\*\*\s*:\s*(\d+(?:\.\d+)?)',
+        # "**7/10**" or "**7 / 10**" (bold score without label, after ### Score heading)
+        r'(?im)\*\*(\d+(?:\.\d+)?)\s*/\s*10\*\*',
         # "Score: 7" on a line by itself (last resort, but validate range)
         r'(?im)^\s*Score\s*:\s*(\d+(?:\.\d+)?)\s*$',
     ]
@@ -480,7 +491,10 @@ def _extract_score(text: str) -> str:
     return "?"
 
 
-def _merge_reviews(results: dict, reviewer_list: list[dict]) -> dict:
+def _merge_reviews(results: dict, reviewer_list: list[dict],
+                   auto_issues: list[dict] | None = None,
+                   auto_checks_text: str = "",
+                   lit_auto_issues: list[dict] | None = None) -> dict:
     """Merge individual reviews into a comprehensive document."""
     scores = []
     sections = []
@@ -518,9 +532,8 @@ def _merge_reviews(results: dict, reviewer_list: list[dict]) -> dict:
 ---
 """
     # Append literature-grounded check results if available
-    merged_lit = merged.get("literature_grounded_checks", [])
-    if merged_lit:
-        lit_text = format_issues_for_llm(merged_lit, max_issues=20)
+    if lit_auto_issues:
+        lit_text = format_issues_for_llm(lit_auto_issues, max_issues=20)
         header += f"""## Literature-Grounded Checks (Cross-Comparison)
 
 {lit_text}

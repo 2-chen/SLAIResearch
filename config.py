@@ -58,6 +58,16 @@ SCO_WORKER_NODES = int(os.environ.get("SCO_WORKER_NODES", "1"))
 SCO_QUOTA_TYPE = os.environ.get("SCO_QUOTA_TYPE", "reserved")
 SCO_PRIORITY = os.environ.get("SCO_PRIORITY", "normal")
 
+# GPU count -> worker spec mapping. Each entry overridable via env.
+# Spec format: {machine}.{type}.{variant}.{gpus}.{cpu}c{ram}g
+SCO_WORKER_SPEC_MAP = {
+    1: os.environ.get("SCO_WORKER_SPEC_1GPU", "n6ls.iu.i40.1.8c128g"),
+    2: os.environ.get("SCO_WORKER_SPEC_2GPU", "n6ls.iu.i40.2.16c256g"),
+    4: os.environ.get("SCO_WORKER_SPEC_4GPU", "n6ls.iu.i40.4.32c512g"),
+}
+# GPU count used when experiment_manifest.json is missing (backward compat).
+DEFAULT_GPU_COUNT = int(os.environ.get("CHENRESEARCH_DEFAULT_GPU_COUNT", "4"))
+
 # ---------------------------------------------------------------------------
 # Pipeline tuning
 # ---------------------------------------------------------------------------
@@ -114,6 +124,11 @@ STAGE_REVIEW_THRESHOLDS = {
     "paper_writing": float(os.environ.get("CHENRESEARCH_THRESHOLD_WRITING", "6.0")),
     "paper_revision": float(os.environ.get("CHENRESEARCH_THRESHOLD_REVISION", "6.0")),
 }
+
+# GPU hours budget per single SCO task. Tasks exceeding this are rejected at
+# submission time with a clear error message.
+# Can be overridden via CHENRESEARCH_MAX_GPU_HOURS env var.
+MAX_COMPUTE_BUDGET_GPU_HOURS = int(os.environ.get("CHENRESEARCH_MAX_GPU_HOURS", "32"))
 
 # ---------------------------------------------------------------------------
 # Revision engine (per-section revision loop with backpressure)

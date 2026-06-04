@@ -55,5 +55,26 @@ Design a complete experimental plan that:
 Save all experiment code to: {{OUTPUT_DIR}}/
 Save the experiment plan to: {{OUTPUT_DIR}}/experiment_plan.md
 
+11. **GPU Requirements**:
+   - Create a file `experiment_manifest.json` in the output directory:
+     ```json
+     {"gpu_count": 1}
+     ```
+     Set `gpu_count` to the number of GPUs your experiment actually needs:
+     * 1 for most single-GPU training/evaluation experiments
+     * 2-4 for large-scale distributed training
+   - **IMPORTANT**: Your `run_experiment.sh` MUST read the `GPU_COUNT` environment variable and adapt:
+     * If `GPU_COUNT` >= 2, wrap the model with `torch.nn.DataParallel` to utilize all GPUs
+     * Set `CUDA_VISIBLE_DEVICES` to `0,1,...,GPU_COUNT-1`
+     * Example snippet for your Python training script:
+       ```python
+       import os, torch
+       gpu_count = int(os.environ.get("GPU_COUNT", "1"))
+       device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+       model = model.to(device)
+       if gpu_count > 1 and torch.cuda.device_count() >= gpu_count:
+           model = torch.nn.DataParallel(model, device_ids=list(range(gpu_count)))
+       ```
+
 IMPORTANT: The shell script must be self-contained and runnable with `bash run_experiment.sh`.
 The Python code should be well-structured, include error handling, and save all results.

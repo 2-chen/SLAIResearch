@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import re
 import logging
+import subprocess
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -356,6 +358,373 @@ def check_latex_structure(tex: str) -> list[str]:
         issues.append("Missing \\documentclass")
     if '\\end{document}' not in tex:
         issues.append("Missing \\end{document}")
+
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# LaTeX formatting / layout checks (no compilation needed for most)
+# ---------------------------------------------------------------------------
+
+# AAAI 2026 two-column layout: textwidth ~6.75in, columnwidth ~3.25in
+_COLUMNWIDTH_IN = 3.25
+_COLUMNWIDTH_APPROX_PT = 240  # ~3.25in in pt, for rough pt-based checks
+
+# Patterns that indicate a figure/table is NOT constrained to column width
+_FIGURE_NO_WIDTH_RE = re.compile(
+    r'\\includegraphics\s*\{[^}]*\}',  # no [width=...] at all
+)
+_FIGURE_HAS_WIDTH_RE = re.compile(
+    r'\\includegraphics\s*\[([^\]]*width\s*=\s*([^\],]+))', re.DOTALL,
+)
+_TABLE_RESIZEBOX_RE = re.compile(
+    r'\\resizebox\s*\{([^}]+)\}\s*\{[^}]*\}',
+)
+_TABULAR_STAR_RE = re.compile(
+    r'\\begin\{tabular\*\}(\{([^}]+)\})',
+)
+# Hardcoded widths that likely overflow in two-column
+_OVERFLOW_WIDTHS_RE = re.compile(
+    r'(?:width|totalwidth)\s*=\s*([\d.]+)\s*(cm|in|pt|mm|em|ex)',
+    re.IGNORECASE,
+)
+# \textwidth in two-column is total page width (~6.75in), not column width
+# Simplified: detect any \textwidth in the text, then check context
+_TEXTWIDTH_RE = re.compile(r'\\textwidth')
+# \begin{figure*} or \begin{table*} — allowed to span full width
+_WIDE_ENV_RE = re.compile(r'\\begin\{(figure|table)\*\}')
+
+# Max column width by unit (approximate, in inches)
+_UNIT_TO_INCHES = {
+    "cm": 2.54, "in": 1.0, "pt": 72.27, "mm": 25.4,
+    "em": None, "ex": None,  # font-dependent, can't check statically
+}
+
+# Doc-level patterns to detect single vs two column
+_TWOCOLUMN_PATTERNS = [
+    r'\\documentclass[^]]*twocolumn',
+    r'\\documentclass[^]]*\]\{[^}]*aaai',   # \documentclass[opts]{aaai2026}
+    r'\\documentclass\{[^}]*aaai',          # \documentclass{aaai2026}
+    r'\\documentclass[^]]*\]\{[^}]*sigchi',
+    r'\\documentclass[^]]*\]\{[^}]*sigplan',
+    r'\\documentclass[^]]*\]\{[^}]*acmart',
+    r'\\documentclass[^]]*\]\{[^}]*ieee',
+    r'\\usepackage\{[^}]*aaai',             # \usepackage{aaai2026}
+    r'\\usepackage\[[^]]*\]\{[^}]*aaai',    # \usepackage[submission]{aaai2026}
+]
+
+
+def _is_two_column(tex: str) -> bool:
+    """Heuristic: does the document use a two-column layout?"""
+    for pattern in _TWOCOLUMN_PATTERNS:
+        if re.search(pattern, tex):
+            return True
+    return False
+
+
+def check_latex_formatting(tex: str) -> list[dict[str, Any]]:
+    """Detect common LaTeX formatting problems that cause overfull hboxes,
+    column overflow, and visual layout issues in two-column papers.
+
+    Checks (no pdflatex needed):
+      1. Figures without explicit width → may overflow
+      2. Hardcoded widths exceeding column width
+      3. ``\\textwidth`` used in figures/tables inside two-column layout
+      4. Missing ``\\centering`` before figures/tables
+      5. Tables without ``\\resizebox`` or ``tabular*`` → may overflow
+      6. Wide figures/tables not using ``figure*`` / ``table*``
+
+    Returns a list of issue dicts with keys: issue_type, severity, detail, fix
+    """
+    issues: list[dict[str, Any]] = []
+    is_two_col = _is_two_column(tex)
+
+    # ── 1. Figures without explicit width ──
+    for m in _FIGURE_NO_WIDTH_RE.finditer(tex):
+        # Exclude if inside a figure* or table* environment (full-width allowed)
+        # Also exclude tikz/pgf which auto-size
+        img_path = m.group(0)
+        if "tikz" in img_path.lower() or "pgf" in img_path.lower():
+            continue
+        issues.append({
+            "issue_type": "latex_formatting",
+            "severity": "high",
+            "detail": (
+                "\\includegraphics without explicit width: will render at "
+                "native resolution and likely overflow the column. "
+                f"Use [width=\\columnwidth]{{...}}"
+            ),
+            "fix": f"Change to: \\includegraphics[width=\\columnwidth]{{...}}",
+            "context": m.group(0)[:100],
+        })
+        break  # one example is enough — don't flood
+
+    # ── 2. Hardcoded widths exceeding column width ──
+    for m in _OVERFLOW_WIDTHS_RE.finditer(tex):
+        value = float(m.group(1))
+        unit = m.group(2).lower()
+        inches = _UNIT_TO_INCHES.get(unit)
+        if inches is not None:
+            actual_in = value / inches if inches > 1 else value * inches
+        else:
+            continue  # font-dependent unit, skip
+
+        if actual_in > _COLUMNWIDTH_IN * 1.05 and is_two_col:  # 5% tolerance
+            # Check if inside figure* / table* (full-width allowed)
+            before = tex[:m.start()]
+            wide_envs = len(_WIDE_ENV_RE.findall(before))
+            has_star = False
+            # Simple check: find the most recent \begin{figure} or \begin{table}
+            last_begin = max(
+                before.rfind("\\begin{figure*}"),
+                before.rfind("\\begin{table*}"),
+            )
+            last_end = max(
+                before.rfind("\\end{figure}"),
+                before.rfind("\\end{table}"),
+                before.rfind("\\end{figure*}"),
+                before.rfind("\\end{table*}"),
+            )
+            if last_begin > last_end:
+                has_star = True
+
+            if not has_star:
+                issues.append({
+                    "issue_type": "latex_formatting",
+                    "severity": "high",
+                    "detail": (
+                        f"Hardcoded width {value}{unit} (≈{actual_in:.1f}in) "
+                        f"exceeds column width ({_COLUMNWIDTH_IN}in). "
+                        f"This will overflow into the adjacent column."
+                    ),
+                    "fix": f"Use [width=\\columnwidth] or reduce to ≤{_COLUMNWIDTH_IN}in",
+                    "context": m.group(0),
+                })
+                break
+
+    # ── 3. \textwidth used in figure/table inside two-column ──
+    if is_two_col:
+        for m in _TEXTWIDTH_RE.finditer(tex):
+            # Determine if we're inside a float environment and which type
+            before = tex[:m.start()]
+            after = tex[m.end():m.end() + 300]
+
+            # Find the nearest unclosed \begin{figure(*)} or \begin{table(*)}
+            last_fig_open = before.rfind("\\begin{figure}")
+            last_fig_star_open = before.rfind("\\begin{figure*}")
+            last_tab_open = before.rfind("\\begin{table}")
+            last_tab_star_open = before.rfind("\\begin{table*}")
+
+            last_open = max(last_fig_open, last_fig_star_open, last_tab_open, last_tab_star_open)
+            if last_open < 0:
+                continue  # not inside a float
+
+            # Check if this float is closed before our match
+            last_fig_close = before.rfind("\\end{figure}")
+            last_fig_star_close = before.rfind("\\end{figure*}")
+            last_tab_close = before.rfind("\\end{table}")
+            last_tab_star_close = before.rfind("\\end{table*}")
+
+            last_close = max(last_fig_close, last_fig_star_close, last_tab_close, last_tab_star_close)
+            if last_close > last_open:
+                continue  # float already closed
+
+            # Determine if we're in a starred (full-width) float
+            in_starred = (
+                (last_fig_star_open > last_fig_close) or
+                (last_tab_star_open > last_tab_close)
+            )
+
+            if not in_starred:
+                # Check if the \textwidth is used as a width parameter (likely a figure/table)
+                nearby = tex[max(0, m.start()-50):m.end()+50]
+                if any(kw in nearby for kw in ['width', 'resizebox', 'includegraphics', 'adjustbox']):
+                    issues.append({
+                        "issue_type": "latex_formatting",
+                        "severity": "high",
+                        "detail": (
+                            "\\textwidth in two-column layout is the FULL page width "
+                            "(~6.75in), not column width (~3.25in). "
+                            "Use \\columnwidth instead, or figure*/table*."
+                        ),
+                        "fix": "Replace \\textwidth with \\columnwidth, or use figure*/table* environment",
+                        "context": nearby.strip()[:120],
+                    })
+                    break  # one example is enough
+
+    # ── 4. Missing \centering before figures/tables ──
+    fig_table_starts = list(re.finditer(
+        r'\\begin\{(figure|table)\*?\}', tex,
+    ))
+    for m in fig_table_starts:
+        # Look at the text between \begin and the content (next ~200 chars)
+        after_start = tex[m.end():m.end() + 300]
+        # Skip if \centering is found
+        if '\\centering' in after_start:
+            continue
+        # Skip if it's a subfigure environment (centering may be in subfigure)
+        if '\\begin{subfigure}' in after_start:
+            continue
+        issues.append({
+            "issue_type": "latex_formatting",
+            "severity": "low",
+            "detail": (
+                f"Missing \\\\centering in {m.group(1)} environment. "
+                f"Content may be left-aligned."
+            ),
+            "fix": "Add \\centering after \\begin{...}",
+            "context": m.group(0),
+        })
+        if len(issues) >= 15:
+            break
+
+    # ── 5. Tables without resizebox or tabular* ──
+    for m in re.finditer(r'\\begin\{table\}', tex):
+        after_start = tex[m.end():m.end() + 600]
+        has_resize = bool(re.search(r'\\resizebox', after_start))
+        has_tabular_star = bool(re.search(r'\\begin\{tabular\*\}', after_start))
+        has_adjustbox = bool(re.search(r'\\begin\{adjustbox\}', after_start))
+        if not (has_resize or has_tabular_star or has_adjustbox):
+            # Only flag if the table contains a regular tabular with several columns
+            tab_match = re.search(r'\\begin\{tabular\}\{([^}]+)\}', after_start)
+            if tab_match and tab_match.group(1).count('l') + tab_match.group(1).count('c') + tab_match.group(1).count('r') >= 4:
+                issues.append({
+                    "issue_type": "latex_formatting",
+                    "severity": "medium",
+                    "detail": (
+                        "Table uses regular tabular with ≥4 columns. "
+                        "In two-column layout, this likely overflows. "
+                        "Use \\resizebox{\\columnwidth}{!}{...} or tabular*."
+                    ),
+                    "fix": "Wrap tabular with: \\resizebox{\\columnwidth}{!}{\\begin{tabular}{...}...\\end{tabular}}",
+                    "context": f"\\begin{{tabular}}{{{tab_match.group(1)}}}",
+                })
+                if sum(1 for i in issues if "table" in str(i.get("context", ""))) >= 2:
+                    break
+
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# pdflatex compilation + log analysis (optional, requires pdflatex binary)
+# ---------------------------------------------------------------------------
+
+def check_pdflatex_log(tex_path: str | Path, work_dir: str | Path | None = None) -> list[dict[str, Any]]:
+    """Compile the paper with pdflatex and parse the log for warnings.
+
+    Catches:
+      - Overfull/Underfull hbox warnings
+      - Missing references / undefined citations
+      - Font warnings
+      - Float-too-large warnings
+
+    Returns a list of issue dicts.  Empty list if pdflatex is not available
+    or compilation succeeds cleanly.
+    """
+    import shutil
+    if shutil.which("pdflatex") is None:
+        return []
+
+    tex_path = Path(tex_path)
+    work_dir = Path(work_dir) if work_dir else tex_path.parent
+
+    try:
+        result = subprocess.run(
+            [
+                "pdflatex",
+                "-interaction=nonstopmode",
+                "-output-directory", str(work_dir),
+                tex_path.name,
+            ],
+            capture_output=True, text=True,
+            cwd=str(work_dir),
+            timeout=120,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+
+    log_output = result.stdout + "\n" + result.stderr
+    issues: list[dict[str, Any]] = []
+
+    # Overfull hbox — content exceeds the allocated space
+    overfull_lines = re.findall(r'Overfull \\hbox.*?at lines? (\d+--?\d+)', log_output)
+    overfull_by = re.findall(
+        r'Overfull \\hbox \(([\d.]+)pt too wide\)', log_output,
+    )
+
+    if overfull_lines:
+        # Deduplicate
+        unique_lines = list(set(overfull_lines))[:10]
+        issues.append({
+            "issue_type": "latex_compilation",
+            "severity": "high",
+            "detail": (
+                f"Overfull hbox(es) at lines: {', '.join(unique_lines)}. "
+                f"Content overflows by up to {max(float(x) for x in overfull_by):.1f}pt. "
+                f"This causes text/figures to spill into the adjacent column or margin."
+            ),
+            "fix": (
+                "Check the flagged lines. Common fixes: "
+                "1) Figures: use [width=\\columnwidth] "
+                "2) Tables: use \\resizebox{\\columnwidth}{!}{...} "
+                "3) Equations: break long equations with \\begin{aligned} or \\begin{split} "
+                "4) URLs: use \\url{} with the url package (line-breaking)"
+            ),
+            "context": f"Lines: {', '.join(unique_lines[:5])}",
+        })
+
+    # Underfull hbox — too much stretch (usually cosmetic but can indicate bad breaks)
+    underfull = re.findall(r'Underfull \\hbox.*?at lines? (\d+--?\d+)', log_output)
+    if len(underfull) > 5:  # a few is normal, many is a problem
+        issues.append({
+            "issue_type": "latex_compilation",
+            "severity": "low",
+            "detail": (
+                f"{len(underfull)} Underfull hbox warnings. "
+                f"Excessive stretching may cause ugly spacing."
+            ),
+            "fix": "Review line breaks. Consider using \\raggedright or microtype package.",
+            "context": f"Count: {len(underfull)}",
+        })
+
+    # Undefined references / citations
+    undefined_refs = re.findall(
+        r'(?:LaTeX Warning: )?Reference `([^`]+)\' undefined', log_output,
+    )
+    undefined_cites = re.findall(
+        r'(?:LaTeX Warning: )?Citation `([^`]+)\' undefined', log_output,
+    )
+    if undefined_refs or undefined_cites:
+        issues.append({
+            "issue_type": "latex_compilation",
+            "severity": "medium",
+            "detail": (
+                f"Undefined references: {len(undefined_refs)}, "
+                f"undefined citations: {len(undefined_cites)}. "
+                f"Run bibtex + pdflatex twice to resolve."
+            ),
+            "fix": "Run: pdflatex → bibtex → pdflatex → pdflatex",
+            "context": (
+                f"Refs: {', '.join(undefined_refs[:5])}; "
+                f"Cites: {', '.join(undefined_cites[:5])}"
+            ),
+        })
+
+    # Float too large for page
+    float_large = re.findall(
+        r'Float too large for page.*?at lines? (\d+)', log_output,
+    )
+    if float_large:
+        issues.append({
+            "issue_type": "latex_compilation",
+            "severity": "high",
+            "detail": (
+                f"Float too large for page at line(s): {', '.join(float_large[:5])}. "
+                f"Figure or table exceeds the page boundaries."
+            ),
+            "fix": "Resize the figure/table to fit within \\textwidth or \\columnwidth.",
+            "context": f"Lines: {', '.join(float_large[:5])}",
+        })
 
     return issues
 

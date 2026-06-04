@@ -12,7 +12,9 @@ Usage:
 """
 
 import sys
+import json
 import re
+import time
 import subprocess
 import logging
 from pathlib import Path
@@ -32,7 +34,7 @@ from config import (
     GROUNDING_PROTECTION_ENABLED,
 )
 from state_manager import (
-    StateManager, Stage, ResearchState, ReviewRecord,
+    StateManager, Stage, StageStatus, ResearchState, ReviewRecord,
     StageReviewRecord, StageState,
 )
 from paperreview_api import (
@@ -47,6 +49,8 @@ from revision_engine import RevisionEngine, RevisionReport, apply_grounding_prot
 from revision_protocol import RevisionProtocol, TODOList, should_reiterate_pipeline
 from context_compressor import ContextCompressor, PipelineState as CompressorState
 from review_synthesis import ReviewSynthesizer, SynthesisResult
+from exceptions import CheckpointError
+from progress import ProgressEmitter
 
 try:
     from review_tools import detect_ai_artifacts, run_automated_checks, format_issues_for_llm
@@ -60,6 +64,32 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     datefmt="%H:%M:%S",
 )
+
+# ── Stage output file mapping (where each stage writes its result) ──
+# Used for resume: if a stage is marked "completed", we load its output from here.
+_OUTPUT_FILE_MAP: dict[Stage, str] = {
+    Stage.LITERATURE_SEARCH: "literature/literature_review.md",
+    Stage.HYPOTHESIS_GENERATION: "hypothesis/hypothesis_output.json",
+    Stage.EXPERIMENT_DESIGN: "experiment/experiment_plan.md",
+    Stage.EXPERIMENT_EXECUTION: "experiment/experiment_results.json",
+    Stage.PAPER_WRITING: "paper",
+}
+
+# ── Processing stage order (for progress tracking & resume) ──
+_PROCESSING_STAGES = [
+    Stage.LITERATURE_SEARCH,
+    Stage.HYPOTHESIS_GENERATION,
+    Stage.EXPERIMENT_DESIGN,
+    Stage.EXPERIMENT_EXECUTION,
+    Stage.PAPER_WRITING,
+]
+
+# ── Retry configuration for _call_claude ──
+_CLAUDE_MAX_RETRIES = 3
+_CLAUDE_RETRY_BASE_DELAY = 10       # seconds
+_CLAUDE_RETRY_BACKOFF_FACTOR = 2    # exponential multiplier
+_CLAUDE_RETRY_MAX_DELAY = 120       # seconds cap
+_CLAUDE_TIMEOUT = 600               # seconds per call
 
 
 # ======================================================================
@@ -116,13 +146,78 @@ def cmd_run(topic: str, force: bool = False) -> None:
 
 
 def cmd_resume(topic_or_slug: str) -> None:
-    """Resume pipeline from last saved state."""
+    """Resume pipeline from last saved state with full crash recovery.
+
+    Crash recovery steps:
+    1. Load saved state
+    2. Reset any stages stuck in "in_progress" (from hard crash / SIGKILL)
+    3. If current_stage is "done", report and exit
+    4. If current_stage is "failed", find the first failed stage, reset it to "pending"
+    5. Run pipeline — completed stages are skipped automatically
+    """
     sm = StateManager(PROJECT_ROOT / "state")
     if not sm.exists(topic_or_slug):
         print(f"No saved state found for '{topic_or_slug}'.")
         return
+
     state = sm.load(topic_or_slug)
-    print(f"Resuming '{state.topic}' from stage '{state.stage}' (iteration {state.iteration})")
+
+    # ── Step 1: Crash recovery — reset stale "in_progress" stages ──
+    state = sm.reset_stale_running_stages(state)
+
+    # ── Step 2: Handle terminal states ──
+    if state.stage == Stage.DONE.value:
+        print(f"Pipeline already completed for '{state.topic}'.")
+        print(f"  Iterations: {state.iteration}/{state.max_iterations}")
+        return
+
+    if state.stage == Stage.FAILED.value:
+        # Find the first failed stage and reset it to "pending" for retry
+        fixed = False
+        for s in _PROCESSING_STAGES:
+            st = state.stages.get(s.value)
+            if isinstance(st, StageState) and st.status == StageStatus.FAILED.value:
+                st.status = StageStatus.PENDING.value
+                st.error = None
+                state.stage = s.value
+                fixed = True
+                print(f"Recovering failed stage '{s.value}' → reset to pending")
+                break
+        if not fixed:
+            # Check if there are any failed stages outside the core processing list
+            for name, st in state.stages.items():
+                if isinstance(st, StageState) and st.status == StageStatus.FAILED.value:
+                    st.status = StageStatus.PENDING.value
+                    st.error = None
+                    state.stage = name
+                    fixed = True
+                    print(f"Recovering failed stage '{name}' → reset to pending")
+                    break
+        if not fixed:
+            print("No failed stage found. Starting from the first pending stage.")
+            state.stage = sm._first_pending_stage(state)
+        sm.save(state)
+
+    # ── Step 3: Show what we're resuming ──
+    completed = [
+        k for k, v in state.stages.items()
+        if isinstance(v, StageState) and v.status == "completed" and v.review_passed
+    ]
+    pending = [
+        k for k, v in state.stages.items()
+        if isinstance(v, StageState) and v.status == "pending"
+    ]
+
+    print(f"\n{'='*60}")
+    print(f"  Resuming: {state.topic}")
+    print(f"  Stage:    {state.stage}")
+    print(f"  Iter:     {state.iteration}/{state.max_iterations}")
+    if completed:
+        print(f"  Completed stages: {', '.join(completed)}")
+    if pending:
+        print(f"  Pending stages:   {', '.join(pending)}")
+    print(f"{'='*60}\n")
+
     _run_pipeline(sm, state)
 
 
@@ -154,132 +249,169 @@ def cmd_list() -> None:
 
 
 def _run_pipeline(sm: StateManager, state: ResearchState) -> None:
-    """Execute the full pipeline with per-stage review gates.
+    """Execute the full pipeline with per-stage review gates and progress tracking.
 
     Each stage: run → review → pass → next; fail → retry with feedback.
     After all stages, the paperreview.ai iteration loop handles external review.
+
+    Resume-safe: completed + reviewed stages are skipped and their outputs
+    are loaded from disk for downstream stages.
     """
-    # ── Phase 1: Core research stages (with per-stage review) ──
-    first_run_stages = [
-        (Stage.LITERATURE_SEARCH, STAGE_HANDLERS[Stage.LITERATURE_SEARCH],
-         f"{state.literature_dir}/literature_review.md"),
-        (Stage.HYPOTHESIS_GENERATION, STAGE_HANDLERS[Stage.HYPOTHESIS_GENERATION],
-         f"{state.hypothesis_dir}/hypothesis_output.json"),
-        (Stage.EXPERIMENT_DESIGN, STAGE_HANDLERS[Stage.EXPERIMENT_DESIGN],
-         f"{state.experiment_dir}/experiment_plan.md"),
-        (Stage.EXPERIMENT_EXECUTION, STAGE_HANDLERS[Stage.EXPERIMENT_EXECUTION], None),
-        (Stage.PAPER_WRITING, STAGE_HANDLERS[Stage.PAPER_WRITING],
-         f"{state.paper_dir}/*.tex"),
-    ]
+    # ── Progress tracking ──
+    progress = ProgressEmitter(Path(state.work_dir) / "progress.json")
+    total_stages = len(_PROCESSING_STAGES)
 
-    for stage, handler, output_glob in first_run_stages:
-        st = state.stages.get(stage.value)
-        if isinstance(st, StageState) and st.status == "completed" and st.review_passed:
-            logger.info("Stage %s already completed + reviewed — skipping", stage.value)
-            continue
-
-        try:
-            state = _run_stage_with_review(
-                sm, state, stage, handler, output_glob=output_glob,
-            )
-        except Exception as exc:
-            logger.exception("Stage %s failed irrecoverably: %s", stage.value, exc)
-            sm.fail_stage(state, stage, str(exc))
-            return
-
-    # ── Grounding protection after paper writing ──
     try:
-        gp_fixes = _run_grounding_protection(state)
-        if gp_fixes > 0:
-            print(f"  [green]✓[/green] Grounding protection: {gp_fixes} fix(es) applied")
+        # ── Phase 1: Core research stages (with per-stage review) ──
+        first_run_stages = [
+            (Stage.LITERATURE_SEARCH, STAGE_HANDLERS[Stage.LITERATURE_SEARCH],
+             f"{state.literature_dir}/literature_review.md"),
+            (Stage.HYPOTHESIS_GENERATION, STAGE_HANDLERS[Stage.HYPOTHESIS_GENERATION],
+             f"{state.hypothesis_dir}/hypothesis_output.json"),
+            (Stage.EXPERIMENT_DESIGN, STAGE_HANDLERS[Stage.EXPERIMENT_DESIGN],
+             f"{state.experiment_dir}/experiment_plan.md"),
+            (Stage.EXPERIMENT_EXECUTION, STAGE_HANDLERS[Stage.EXPERIMENT_EXECUTION], None),
+            (Stage.PAPER_WRITING, STAGE_HANDLERS[Stage.PAPER_WRITING],
+             f"{state.paper_dir}/*.tex"),
+        ]
+
+        for stage_idx, (stage, handler, output_glob) in enumerate(first_run_stages):
+            st = state.stages.get(stage.value)
+
+            # ── Skip already completed + reviewed stages ──
+            if isinstance(st, StageState) and st.status == "completed" and st.review_passed:
+                logger.info("Stage %s already completed + reviewed — skipping", stage.value)
+                progress.stage_complete(
+                    stage.value, total_stages, stage_idx,
+                    message="(skipped — already completed)"
+                )
+                # Load the stage output so downstream stages can use it
+                _load_stage_output_on_resume(state, stage)
+                continue
+
+            progress.stage_start(stage.value, total_stages, stage_idx)
+
+            try:
+                state = _run_stage_with_review(
+                    sm, state, stage, handler, output_glob=output_glob,
+                )
+                progress.stage_complete(stage.value, total_stages, stage_idx)
+            except Exception as exc:
+                logger.exception("Stage %s failed irrecoverably: %s", stage.value, exc)
+                progress.error(stage.value, str(exc))
+                sm.fail_stage(state, stage, str(exc))
+                progress.pipeline_complete(False, f"Failed at {stage.value}: {exc}")
+                return
+
+        # ── Grounding protection after paper writing ──
+        try:
+            gp_fixes = _run_grounding_protection(state)
+            if gp_fixes > 0:
+                print(f"  [green]✓[/green] Grounding protection: {gp_fixes} fix(es) applied")
+                progress.substep(Stage.PAPER_WRITING.value, f"Grounding protection: {gp_fixes} fixes")
+        except Exception as exc:
+            logger.warning("Grounding protection failed: %s", exc)
+
+        # ── Phase 2: PaperReview.ai iteration loop ──
+        while state.iteration < state.max_iterations:
+            submit_stage = Stage.SUBMIT_REVIEW if state.iteration == 0 else Stage.RESUBMIT
+            state = sm.start_stage(state, submit_stage)
+
+            try:
+                state = _do_submit(sm, state)
+            except Exception as exc:
+                logger.exception("Submit failed: %s", exc)
+                sm.fail_stage(state, submit_stage, str(exc))
+                progress.error(submit_stage.value, str(exc))
+                progress.pipeline_complete(False, f"Failed at submit: {exc}")
+                return
+
+            state = sm.start_stage(state, Stage.POLL_REVIEW)
+            try:
+                state, verdict = _do_poll(sm, state)
+            except TimeoutError:
+                tok = state.reviews[-1].get("token", "N/A") if state.reviews else "N/A"
+                print(f"\n[!] Review timed out. Token: {tok}")
+                print(f"[!] Check manually: https://paperreview.ai/review?token={tok}")
+                progress.substep(Stage.POLL_REVIEW.value, f"Review timed out. Token: {tok}")
+                sm.save(state)
+                progress.pipeline_complete(False, "Review timed out")
+                return
+            except Exception as exc:
+                logger.exception("Poll failed: %s", exc)
+                sm.fail_stage(state, Stage.POLL_REVIEW, str(exc))
+                progress.error(Stage.POLL_REVIEW.value, str(exc))
+                progress.pipeline_complete(False, f"Failed at poll: {exc}")
+                return
+
+            if verdict in ("accept", "weak accept"):
+                print(f"\n{'='*60}")
+                print(f"  TARGET VERDICT REACHED: {verdict}")
+                print(f"  Total iterations: {state.iteration + 1}")
+                print(f"{'='*60}")
+                state.stage = Stage.DONE.value
+                sm.save(state)
+                progress.pipeline_complete(True, verdict)
+                return
+
+            state.iteration += 1
+
+            # ── Context Compression (mandatory between iterations) ──
+            cc = ContextCompressor(state.work_dir)
+            try:
+                ext_issues = []
+                int_issues = []
+                review_dir = Path(state.review_dir)
+                for rd in sorted(review_dir.rglob("round_*")):
+                    ext = rd / "external.md"
+                    if ext.exists():
+                        ext_text = ext.read_text()
+                        ext_issues = [l.strip("-* ") for l in ext_text.split("\n")
+                                      if "missing" in l.lower() or "should" in l.lower()][:3]
+            except Exception:
+                pass
+
+            if state.iteration >= 6:
+                cc.compress_hard(
+                    topic=state.topic,
+                    iteration=state.iteration,
+                    paper_path=f"{state.paper_dir}/paper.tex",
+                )
+                print(f"  [cyan]↻ Context compressed (Level 2: hard reset)[/cyan]")
+            else:
+                cc.compress_soft(
+                    state.iteration,
+                    verdict=verdict,
+                    external_issues=ext_issues,
+                    internal_issues=int_issues,
+                )
+                print(f"  [cyan]↻ Context compressed (Level 1: soft)[/cyan]")
+
+            # Revise stage also gets its own review gate
+            try:
+                state = _run_stage_with_review(
+                    sm, state, Stage.REVISE, _do_revise,
+                    output_glob=f"{state.paper_dir}/*.tex",
+                )
+            except Exception as exc:
+                logger.exception("Revise failed: %s", exc)
+                sm.fail_stage(state, Stage.REVISE, str(exc))
+                progress.error(Stage.REVISE.value, str(exc))
+                progress.pipeline_complete(False, f"Failed at revise: {exc}")
+                return
+
+        print(f"\n[!] Reached max iterations ({state.max_iterations}) without target verdict.")
+        state.stage = Stage.DONE.value
+        sm.save(state)
+        progress.pipeline_complete(True, "Max iterations reached")
+
     except Exception as exc:
-        logger.warning("Grounding protection failed: %s", exc)
-
-    # ── Phase 2: PaperReview.ai iteration loop ──
-    while state.iteration < state.max_iterations:
-        submit_stage = Stage.SUBMIT_REVIEW if state.iteration == 0 else Stage.RESUBMIT
-        state = sm.start_stage(state, submit_stage)
-
+        logger.exception("Pipeline crashed: %s", exc)
         try:
-            state = _do_submit(sm, state)
-        except Exception as exc:
-            logger.exception("Submit failed: %s", exc)
-            sm.fail_stage(state, submit_stage, str(exc))
-            return
-
-        state = sm.start_stage(state, Stage.POLL_REVIEW)
-        try:
-            state, verdict = _do_poll(sm, state)
-        except TimeoutError:
-            tok = state.reviews[-1].get("token", "N/A") if state.reviews else "N/A"
-            print(f"\n[!] Review timed out. Token: {tok}")
-            print(f"[!] Check manually: https://paperreview.ai/review?token={tok}")
-            sm.save(state)
-            return
-        except Exception as exc:
-            logger.exception("Poll failed: %s", exc)
-            sm.fail_stage(state, Stage.POLL_REVIEW, str(exc))
-            return
-
-        if verdict in ("accept", "weak accept"):
-            print(f"\n{'='*60}")
-            print(f"  TARGET VERDICT REACHED: {verdict}")
-            print(f"  Total iterations: {state.iteration + 1}")
-            print(f"{'='*60}")
-            state.stage = Stage.DONE.value
-            sm.save(state)
-            return
-
-        state.iteration += 1
-
-        # ── Context Compression (mandatory between iterations) ──
-        cc = ContextCompressor(state.work_dir)
-        try:
-            # Collect top issues for compression
-            ext_issues = []
-            int_issues = []
-            review_dir = Path(state.review_dir)
-            for rd in sorted(review_dir.rglob("round_*")):
-                ext = rd / "external.md"
-                if ext.exists():
-                    ext_text = ext.read_text()
-                    ext_issues = [l.strip("-* ") for l in ext_text.split("\n")
-                                  if "missing" in l.lower() or "should" in l.lower()][:3]
+            progress.pipeline_complete(False, str(exc))
         except Exception:
             pass
-
-        if state.iteration >= 6:
-            # Level 2: Hard Reset
-            cc.compress_hard(
-                topic=state.topic,
-                iteration=state.iteration,
-                paper_path=f"{state.paper_dir}/paper.tex",
-            )
-            print(f"  [cyan]↻ Context compressed (Level 2: hard reset)[/cyan]")
-        else:
-            # Level 1: Soft Compression
-            cc.compress_soft(
-                state.iteration,
-                verdict=verdict,
-                external_issues=ext_issues,
-                internal_issues=int_issues,
-            )
-            print(f"  [cyan]↻ Context compressed (Level 1: soft)[/cyan]")
-
-        # Revise stage also gets its own review gate
-        try:
-            state = _run_stage_with_review(
-                sm, state, Stage.REVISE, _do_revise,
-                output_glob=f"{state.paper_dir}/*.tex",
-            )
-        except Exception as exc:
-            logger.exception("Revise failed: %s", exc)
-            sm.fail_stage(state, Stage.REVISE, str(exc))
-            return
-
-    print(f"\n[!] Reached max iterations ({state.max_iterations}) without target verdict.")
-    state.stage = Stage.DONE.value
-    sm.save(state)
+        raise
 
 
 # ======================================================================
@@ -577,7 +709,6 @@ def _do_experiment_execution(sm: StateManager, state: ResearchState, retry_feedb
         job_name=f"cr-{state.topic_slug}",
         local_timeout=LOCAL_EXECUTION_TIMEOUT,
         max_local_retries=LOCAL_EXECUTION_MAX_RETRIES,
-        extra_env={"CHENRESEARCH": "1"},
         force_sco=FORCE_SCO,
     )
 
@@ -892,6 +1023,7 @@ def _do_revise(sm: StateManager, state: ResearchState, retry_feedback: str = "")
             max_rounds=REVISION_MAX_ROUNDS,
             min_score=REVISION_MIN_SECTION_SCORE,
             convergence_threshold=REVISION_CONVERGENCE_THRESHOLD,
+            checkpoint_path=f"state/{state.topic_slug}/revision_engine_ckpt.json",
         )
         revised_tex, report = engine.revise(
             paper_tex=paper_tex,
@@ -948,21 +1080,54 @@ STAGE_HANDLERS = {
 
 
 # ======================================================================
+# Resume helpers
+# ======================================================================
+
+
+def _load_stage_output_on_resume(state: ResearchState, stage: Stage) -> None:
+    """Verify that a completed stage's output file exists on disk.
+
+    Called when skipping already-completed stages during resume.
+    Logs a warning if the expected output is missing (may have been deleted).
+    """
+    rel_path = _OUTPUT_FILE_MAP.get(stage)
+    if not rel_path:
+        return
+    full_path = Path(state.work_dir) / rel_path
+    if stage == Stage.PAPER_WRITING:
+        # Paper writing output is a directory with .tex files
+        if full_path.is_dir() and list(full_path.rglob("*.tex")):
+            logger.info("Paper output verified: %s", full_path)
+        else:
+            logger.warning(
+                "Stage '%s' marked completed but no .tex files found in %s",
+                stage.value, full_path,
+            )
+    elif full_path.exists():
+        logger.info("Stage '%s' output verified: %s", stage.value, full_path)
+    else:
+        logger.warning(
+            "Stage '%s' marked completed but expected output not found: %s",
+            stage.value, full_path,
+        )
+
+
+# ======================================================================
 # Claude Code tool integration
 # ======================================================================
 
 
 def _call_claude(sm: StateManager, state: ResearchState, stage: Stage,
-                 prompt: str, retry_feedback: str = "") -> ResearchState:
+                 prompt: str, retry_feedback: str = "",
+                 max_retries: int = _CLAUDE_MAX_RETRIES) -> ResearchState:
     """
     Invoke Claude Code as an EXECUTION TOOL of this project.
-    Claude Code runs headless (`claude -p`) to perform the assigned task,
-    then returns.  The project orchestrator remains in control.
 
-    If retry_feedback is provided, it is appended to the prompt so the
-    model can incorporate previous review feedback into the retry.
+    Includes retry with exponential backoff for transient failures
+    (network errors, timeouts, rate limits).
+
+    If retry_feedback is provided, it is appended to the prompt.
     """
-    # Append retry feedback to the prompt if this is a re-execution
     if retry_feedback:
         feedback_block = f"""
 
@@ -986,27 +1151,69 @@ Please explicitly acknowledge how you've addressed each issue above.
 
     cmd = [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL, prompt]
 
-    logger.info("Executing: %s ...", " ".join(cmd[:4]))
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
-                                cwd=str(state.work_dir))
-        output = result.stdout or ""
-        if result.returncode != 0:
-            logger.warning("claude -p exit=%d stderr=%s", result.returncode, result.stderr[:300])
-        output_file.write_text(output)
-        logger.info("Claude output → %s (%d chars)", output_file, len(output))
-    except FileNotFoundError:
-        logger.warning(
-            "`%s` CLI not found. Prompt saved to %s — run manually.",
-            CLAUDE_CMD, prompt_file,
+    last_error = ""
+    for attempt in range(max_retries + 1):
+        logger.info(
+            "Executing: %s (attempt %d/%d) ...",
+            " ".join(cmd[:4]), attempt + 1, max_retries + 1,
         )
-        raise
 
-    return sm.complete_stage(state, stage, {
-        "prompt_file": str(prompt_file),
-        "output_file": str(output_file),
-    })
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=_CLAUDE_TIMEOUT,
+                cwd=str(state.work_dir),
+            )
+            output = result.stdout or ""
+            if result.returncode != 0:
+                error_msg = result.stderr[:300] if result.stderr else f"exit code {result.returncode}"
+                raise subprocess.CalledProcessError(
+                    result.returncode, cmd, output=output, stderr=result.stderr,
+                )
+
+            output_file.write_text(output)
+            logger.info("Claude output → %s (%d chars)", output_file, len(output))
+            return sm.complete_stage(state, stage, {
+                "prompt_file": str(prompt_file),
+                "output_file": str(output_file),
+            })
+
+        except FileNotFoundError:
+            logger.warning(
+                "`%s` CLI not found. Prompt saved to %s — run manually.",
+                CLAUDE_CMD, prompt_file,
+            )
+            raise
+
+        except subprocess.TimeoutExpired as exc:
+            last_error = f"Timeout after {_CLAUDE_TIMEOUT}s"
+            logger.warning("Claude call timed out (attempt %d/%d)", attempt + 1, max_retries + 1)
+
+        except subprocess.CalledProcessError as exc:
+            last_error = f"Exit {exc.returncode}: {exc.stderr[:200] if exc.stderr else 'no stderr'}"
+            logger.warning("Claude call failed (attempt %d/%d): %s", attempt + 1, max_retries + 1, last_error)
+
+        except Exception as exc:
+            last_error = str(exc)
+            logger.warning("Claude call error (attempt %d/%d): %s", attempt + 1, max_retries + 1, exc)
+
+        # ── Retry with backoff ──
+        if attempt < max_retries:
+            delay = min(
+                _CLAUDE_RETRY_BASE_DELAY * (_CLAUDE_RETRY_BACKOFF_FACTOR ** attempt),
+                _CLAUDE_RETRY_MAX_DELAY,
+            )
+            logger.info("Retrying in %.0fs ...", delay)
+            time.sleep(delay)
+            sm.increment_retry(state, stage)
+            state = sm.load(state.topic_slug)
+        else:
+            raise RuntimeError(
+                f"Claude call for stage '{stage.value}' failed after "
+                f"{max_retries + 1} attempts: {last_error}"
+            )
+
+    raise RuntimeError(f"Unexpected: all retries exhausted for stage '{stage.value}'")
 
 
 # ======================================================================
