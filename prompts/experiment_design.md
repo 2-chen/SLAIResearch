@@ -36,19 +36,25 @@ Design a complete experimental plan that:
 9. **Implementation Plan**:
    - Write a complete, runnable Python training script
    - Write a shell script `run_experiment.sh` that:
-     - Sets up the environment (conda or system Python)
-     - **Installs dependencies using the shared offline-first module**: add the following lines at the top of the script (after `set -euo pipefail`):
+     - Uses the shared dependency module (works in local and SCO mode):
        ```bash
        PROJECT_DIR="$(dirname "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")"
        source /data/AutoResearch/ChenResearch/workspace/.shared/install_deps.sh
+       install_dependencies
        ```
-       Then call `install_dependencies` to install all packages. This module automatically:
-       * Checks shared wheel cache at `/data/AutoResearch/ChenResearch/workspace/.shared/wheels/`
-       * Checks project-local wheel cache at `${PROJECT_DIR}/wheels/`
-       * Installs offline if wheels exist, falls back to network with auto-VPN if needed
-       * Pre-download wheels: `bash /data/AutoResearch/ChenResearch/workspace/.shared/download_wheels.sh`
-     - Runs all experiments
-     - Saves results to a structured output directory
+       This module automatically:
+       * **SCO mode (CHENRESEARCH=1)**: Skips all pip install, only sets PYTHONPATH
+         to pre-configured site-packages. Zero network, zero install in container.
+       * **Local mode**: Installs offline from shared/project wheel caches,
+         falls back to network with auto-VPN if needed.
+     - **Environment separation rule**: Before submitting to SCO, pre-install missing
+       packages locally:
+       ```bash
+       bash /data/AutoResearch/ChenResearch/workspace/.shared/prepare_env.sh --from-imports experiment.py
+       ```
+       This installs to `/data/AutoResearch/ChenResearch/env/site-packages/` which
+       is mounted into the SCO container. No pip/conda/network in the SCO task itself.
+     - Runs all experiments and saves results to a structured output directory
 
 10. **Expected Outcomes**: What results would support/reject the hypothesis?
 

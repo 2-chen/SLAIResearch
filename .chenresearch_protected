@@ -1,0 +1,9 @@
+# ChenResearch — 受保护的基础设施文件
+# 自动修复循环 (SCO debug loop) 绝对不允许修改这些文件。
+# 每个路径相对于 /data/AutoResearch/ChenResearch/
+# 空行和 # 开头的行被忽略。
+
+sco_runner.py
+config.py
+workspace/.shared/install_deps.sh
+workspace/.shared/prepare_env.sh

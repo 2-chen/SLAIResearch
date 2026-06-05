@@ -39,3 +39,4 @@ env/
 *.out
 *.bbl
 *.blg
+*.cr_backup

@@ -136,13 +136,33 @@ fi
 
 # ---------------------------------------------------------------------------
 # 终端日志记录 — 将全部输出同时写入 run.log（追加模式，不覆盖历史）
+# 原理：
+#   1. 先用 >> 直接写入 session 分隔标记（OS 级别追加，绕过任何外部重定向）
+#   2. 再 exec > >(tee -a)  接管当前 shell 的 stdout/stderr
+#   3. 后续所有 echo 同时出现在终端和 run.log
+# 注意：调用方切勿使用 ./start.sh > run.log（> 会截断），如需外部重定向请用 >>。
 # ---------------------------------------------------------------------------
 _setup_logging() {
     local ws="$1"
     mkdir -p "$ws"
     local log_file="${ws}/run.log"
-    # 重定向所有 stdout+stderr → 同时输出到终端和日志文件
+
+    # 如果文件已存在，直接追加 session 分隔标记（exec 重定向之前，保证写入）
+    if [[ -f "$log_file" ]]; then
+        {
+            echo ""
+            echo "───────────────────────────────────────────────"
+            echo "  ▶ 续跑 — $(date '+%Y-%m-%d %H:%M:%S')"
+            echo "  项目: ${TOPIC}"
+            echo "  阶段: ${STAGE:-未知}  迭代: ${ITERATION:-0}"
+            echo "───────────────────────────────────────────────"
+            echo ""
+        } >> "$log_file"
+    fi
+
+    # 接管 stdout+stderr → 终端 + 日志文件（append）
     exec > >(tee -a "$log_file") 2>&1
+
     echo ""
     echo "═══════════════════════════════════════════════"
     echo "  ChenResearch Session — $(date '+%Y-%m-%d %H:%M:%S')"
@@ -158,12 +178,18 @@ _setup_logging() {
 _claude_task() {
     local prompt="$1"
     local log="${2:-/tmp/cr_claude_output.txt}"
+    local sys_prompt_file="${3:-}"
 
     echo -e "${CYAN}  Claude Code 正在工作中...${NC}"
     echo "  (输出实时显示，可能需要几分钟)"
 
+    local _sys_flag=()
+    if [[ -n "$sys_prompt_file" && -f "$sys_prompt_file" ]]; then
+        _sys_flag=("--append-system-prompt" "$(cat "$sys_prompt_file")")
+    fi
+
     # 实时输出到终端 + 同时保存到日志
-    echo "$prompt" | claude -p --model "${CLAUDE_MODEL:-deepseek-v4-pro}" --output-format text 2>&1 | tee "$log"
+    echo "$prompt" | claude -p --model "${CLAUDE_MODEL:-deepseek-v4-pro}" --output-format text --verbose "${_sys_flag[@]}" 2>&1 | tee "$log"
 
     local rc=${PIPESTATUS[0]}
     echo ""
@@ -417,18 +443,18 @@ print(f'LOG_PATH={result.log_path}')
             echo -e "${GREEN}实验已完成！${NC}"
             sco acp jobs stream-logs --workspace-name share-space "$JOB_ID" > "${WORKSPACE}/experiment/sco_logs.txt" 2>/dev/null || true
         elif [[ "$STATUS" == "RUNNING" || "$STATUS" == "PENDING" ]]; then
-            echo "等待任务完成..."
-            for i in $(seq 1 180); do
+            echo "等待任务完成 (最长 12 小时)..."
+            for i in $(seq 1 1440); do
                 STATUS=$(sco acp jobs describe --workspace-name share-space -o json "$JOB_ID" 2>/dev/null | python -c "import json,sys; print(json.load(sys.stdin).get('state','UNKNOWN'))" 2>/dev/null || echo "UNKNOWN")
-                echo "  状态: ${STATUS} (${i}/180)"
-                if [[ "$STATUS" == "SUCCEEDED" || "$STATUS" == "FAILED" || "$STATUS" == "STOPPED" || "$STATUS" == "UNKNOWN" ]]; then
+                echo "  状态: ${STATUS} (${i}/1440)"
+                if [[ "$STATUS" == "SUCCEEDED" || "$STATUS" == "FAILED" || "$STATUS" == "STOPPED" || "$STATUS" == "SUSPENDED" || "$STATUS" == "CANCELLED" || "$STATUS" == "UNKNOWN" ]]; then
                     break
                 fi
                 sleep 30
             done
             sco acp jobs stream-logs --workspace-name share-space "$JOB_ID" > "${WORKSPACE}/experiment/sco_logs.txt" 2>/dev/null || true
-        elif [[ "$STATUS" == "STOPPED" ]]; then
-            echo -e "${YELLOW}SCO 任务被手动停止 (${JOB_ID})，按失败处理，进入自动修复流程${NC}"
+        elif [[ "$STATUS" == "STOPPED" || "$STATUS" == "SUSPENDED" || "$STATUS" == "CANCELLED" ]]; then
+            echo -e "${YELLOW}SCO 任务已终止 (${STATUS}, ${JOB_ID})，按失败处理，进入自动修复流程${NC}"
             STATUS="FAILED"
         fi
         if [[ "$STATUS" == "FAILED" ]]; then
@@ -457,9 +483,47 @@ print(f'LOG_PATH={result.log_path}')
 
             JOB_NAME="cr-${SLUG:0:30}"
 
+            # ── 加载受保护的基础设施文件（修复循环禁止修改）──
+            PROTECTED_FILES=()
+            PROTECTED_FILE="${SCRIPT_DIR}/.chenresearch_protected"
+            if [[ -f "$PROTECTED_FILE" ]]; then
+                while IFS= read -r line; do
+                    [[ -z "$line" || "$line" == \#* ]] && continue
+                    local _pf="${SCRIPT_DIR}/${line}"
+                    [[ -f "$_pf" ]] && PROTECTED_FILES+=("$_pf")
+                done < "$PROTECTED_FILE"
+            fi
+            # 兜底保护核心文件（即使 .chenresearch_protected 不存在）
+            for _pf in "${SCRIPT_DIR}/sco_runner.py" "${SCRIPT_DIR}/config.py" \
+                       "${SCRIPT_DIR}/workspace/.shared/install_deps.sh" \
+                       "${SCRIPT_DIR}/workspace/.shared/prepare_env.sh"; do
+                [[ -f "$_pf" ]] || continue
+                local _already=0
+                for _existing in "${PROTECTED_FILES[@]}"; do
+                    [[ "$_existing" == "$_pf" ]] && _already=1 && break
+                done
+                [[ $_already -eq 0 ]] && PROTECTED_FILES+=("$_pf")
+            done
+
+            # ── 备份受保护文件的哈希（用于电路断路器）──
+            declare -A PROTECTED_HASHES
+            for _pf in "${PROTECTED_FILES[@]}"; do
+                PROTECTED_HASHES["$_pf"]=$(md5sum "$_pf" 2>/dev/null | awk '{print $1}')
+                cp "$_pf" "${_pf}.cr_backup" 2>/dev/null || true
+            done
+
+            # ── 修复轮次历史（传递给后续轮次，避免重复修复）──
+            ROUND_HISTORY=""
+
             for ((sco_round=1; sco_round<=SCO_DEBUG_ROUNDS; sco_round++)); do
                 echo ""
                 echo -e "${CYAN}━━━ SCO 修复轮次 ${sco_round}/${SCO_DEBUG_ROUNDS} ━━━${NC}"
+
+                # ── 构建受保护文件列表（展示在 prompt 中）──
+                PROTECTED_LIST=""
+                for _pf in "${PROTECTED_FILES[@]}"; do
+                    PROTECTED_LIST+="  - ${_pf}"$'\n'
+                done
 
                 # 用 Claude Code 诊断 SCO 日志并修复脚本
                 cat > /tmp/cr_sco_debug_prompt.txt << PROMPT_EOF
@@ -476,22 +540,51 @@ ${SCO_ERROR_TAIL}
 **实验脚本** ($(wc -l < "${EXP_SCRIPT}" 2>/dev/null) 行): ${EXP_SCRIPT}
 **工作目录**: ${WORKSPACE}/experiment/
 
+**★★★ 绝对禁止修改的共享基础设施文件 ★★★**:
+${PROTECTED_LIST}
+这些文件被所有项目共享，修改它们会引发级联故障。你只能修改实验项目内的文件
+(${WORKSPACE}/experiment/ 目录下)。如果怀疑是基础设施问题（worker spec 格式、
+SCO 配置等），在 FIX_READY 前报告具体发现，由人工处理。
+
+${ROUND_HISTORY}
+
 你的任务:
 1. 仔细分析 SCO 错误日志，找出失败根因
-2. 注意之前轮次的修复尝试（如果有重复错误）
-3. 修改实验脚本或项目代码来修复问题
+2. 参考之前轮次的修复历史（上面已列出），避免重复无效修复
+3. 只修改 ${WORKSPACE}/experiment/ 下的实验代码
 4. 保存修改后的文件
 5. 报告 "FIX_READY" 表示已修复
 
 常见 SCO 失败及修复:
 - OOM / CUDA out of memory → 减小 batch_size, 减小模型, 加 gradient_accumulation
-- ModuleNotFoundError / ImportError → 在脚本中添加 pip install
-- CUDA / driver 不兼容 → 调整 CUDA_VISIBLE_DEVICES 或安装兼容版本
+- ModuleNotFoundError / ImportError → 检查 import，确认包在容器镜像或 site-packages 中
+- CUDA / driver 不兼容 → 调整 CUDA_VISIBLE_DEVICES
 - 数据路径不存在 → 修正路径或先下载数据
 - 脚本超时 (12h) → 减小数据量或增加 checkpoint 续跑
 - 权限问题 → 修正文件权限或路径
+- 容器启动失败 (零输出) → 可能是 worker spec 格式问题，报告但不修改基础设施
 PROMPT_EOF
-                _claude_task "$(cat /tmp/cr_sco_debug_prompt.txt)" 2>&1
+                _claude_task "$(cat /tmp/cr_sco_debug_prompt.txt)" "/tmp/cr_claude_output.txt" "${SCRIPT_DIR}/prompts/sco_debugger_system.md" 2>&1
+
+                # ── 电路断路器：检查受保护文件是否被意外修改 ──
+                local _violations=0
+                for _pf in "${PROTECTED_FILES[@]}"; do
+                    if [[ -f "$_pf" ]]; then
+                        local _new_hash=$(md5sum "$_pf" 2>/dev/null | awk '{print $1}')
+                        if [[ "${_new_hash}" != "${PROTECTED_HASHES["$_pf"]}" ]]; then
+                            echo -e "${RED}[断路器] 受保护文件被修改: ${_pf}${NC}"
+                            # 从备份恢复
+                            if [[ -f "${_pf}.cr_backup" ]]; then
+                                cp "${_pf}.cr_backup" "$_pf"
+                                echo -e "${YELLOW}  → 已从备份恢复${NC}"
+                            fi
+                            _violations=$((_violations + 1))
+                        fi
+                    fi
+                done
+                if [[ $_violations -gt 0 ]]; then
+                    ROUND_HISTORY+="[轮次 ${sco_round}] 断路器触发 — ${_violations} 个受保护文件被修改并恢复。"$'\n'
+                fi
 
                 # ── 修复后重新提交 SCO（不强制本地！）──
                 echo ""
@@ -533,6 +626,9 @@ print(f'LOG_PATH={result.log_path}')
                     break
                 else
                     echo -e "${YELLOW}第 ${sco_round} 轮修复后仍失败 (后端: ${BACKEND})${NC}"
+                    # 记录本轮失败的关键信息，传递给下一轮
+                    local _round_err=$(echo "$ERROR_KEY_LINES" | head -3 | tr '\n' ' ')
+                    ROUND_HISTORY+="[轮次 ${sco_round}] 失败, 后端=${BACKEND}, 错误: ${_round_err:-无日志}"$'\n'
                     if [[ $sco_round -lt $SCO_DEBUG_ROUNDS ]]; then
                         echo -e "${YELLOW}继续下一轮 SCO 诊断...${NC}"
                     else
@@ -540,6 +636,11 @@ print(f'LOG_PATH={result.log_path}')
                         STATUS="FAILED"
                     fi
                 fi
+            done
+
+            # 清理备份文件
+            for _pf in "${PROTECTED_FILES[@]}"; do
+                rm -f "${_pf}.cr_backup" 2>/dev/null || true
             done
 
             # ── 最终兜底：SCO 修复全部失败 → 尝试本地执行 ──
@@ -610,11 +711,11 @@ except: pass
                 REUSE_JOB=1
                 JOB_ID="$FOUND_JOB"
             elif [[ "$STATUS" == "RUNNING" || "$STATUS" == "PENDING" ]]; then
-                echo "等待任务完成..."
-                for i in $(seq 1 180); do
+                echo "等待任务完成 (最长 12 小时)..."
+                for i in $(seq 1 1440); do
                     STATUS=$(sco acp jobs describe --workspace-name share-space -o json "$FOUND_JOB" 2>/dev/null | python -c "import json,sys; print(json.load(sys.stdin).get('state','UNKNOWN'))" 2>/dev/null || echo "UNKNOWN")
-                    echo "  状态: ${STATUS} (${i}/180)"
-                    if [[ "$STATUS" == "SUCCEEDED" || "$STATUS" == "FAILED" || "$STATUS" == "STOPPED" || "$STATUS" == "UNKNOWN" ]]; then
+                    echo "  状态: ${STATUS} (${i}/1440)"
+                    if [[ "$STATUS" == "SUCCEEDED" || "$STATUS" == "FAILED" || "$STATUS" == "STOPPED" || "$STATUS" == "SUSPENDED" || "$STATUS" == "CANCELLED" || "$STATUS" == "UNKNOWN" ]]; then
                         break
                     fi
                     sleep 30
@@ -1536,9 +1637,9 @@ CODE_EOF
             local exp_script="${exp_subdir}/run_experiment.sh"
             [[ -f "$exp_script" ]] || continue
 
-            # 确保 manifest 存在
+            # 确保 manifest 存在 — 继承主实验的 GPU 数量
             if [[ ! -f "${exp_subdir}/experiment_manifest.json" ]]; then
-                echo '{"gpu_count": 1, "estimated_runtime_hours": 2.0}' > "${exp_subdir}/experiment_manifest.json"
+                echo "{\"gpu_count\": ${TOTAL_GPU}, \"estimated_runtime_hours\": 2.0}" > "${exp_subdir}/experiment_manifest.json"
             fi
 
             exp_idx=$((exp_idx + 1))
@@ -1588,7 +1689,15 @@ json.dump(exps, open(rev_dir / 'experiment_results.json', 'w'), indent=2)
             local all_ready=true
             local recovered=0
             local still_running=0
-            local failed_jobs=()
+            local failed_count=0
+            local repaired_count=0
+            local bg_pids=()
+
+            # ── Pass 1: quick status check on ALL experiments (no blocking) ──
+            # Collect jobs that need waiting or repair, then launch in parallel.
+            local _wait_list=()   # "exp_name|exp_subdir|job_id" for RUNNING jobs
+            local _repair_list=() # "exp_name|exp_subdir" for FAILED jobs
+
             for exp_subdir in "${REVISION_EXP_DIR}"/exp_*/; do
                 [[ -d "$exp_subdir" ]] || continue
                 [[ -f "${exp_subdir}/run_experiment.sh" ]] || continue
@@ -1616,50 +1725,141 @@ json.dump(exps, open(rev_dir / 'experiment_results.json', 'w'), indent=2)
                                 recovered=$((recovered + 1))
                                 ;;
                             RUNNING|PENDING|QUEUED)
-                                echo -e "  ${YELLOW}  ${exp_name}: 仍在运行，等待完成...${NC}"
+                                echo -e "  ${CYAN}  ${exp_name}: 仍在运行 (${sco_status})，后台等待...${NC}"
                                 still_running=$((still_running + 1))
                                 all_ready=false
-                                # 等待直到完成
-                                for _ in $(seq 1 120); do
-                                    sleep 30
-                                    sco_status=$(sco acp jobs describe --workspace-name share-space -o json "$job_id" 2>/dev/null | python3 -c "import json,sys; d=sys.stdin.read().strip(); print(json.loads(d).get('status', json.loads(d).get('state', 'UNKNOWN')) if d else 'UNKNOWN')" 2>/dev/null || echo "UNKNOWN")
-                                    if [[ "$sco_status" == "SUCCEEDED" || "$sco_status" == "FAILED" || "$sco_status" == "STOPPED" ]]; then
-                                        break
-                                    fi
-                                    echo -ne "    ... $(date +%H:%M:%S) ${sco_status} ...\r"
-                                done
-                                if [[ "$sco_status" == "SUCCEEDED" ]]; then
-                                    sco acp jobs stream-logs --workspace-name share-space "$job_id" > "${exp_subdir}/experiment_log.txt" 2>/dev/null || true
-                                    echo -e "  ${GREEN}✓ ${exp_name}: 完成，日志已获取${NC}"
-                                    all_ready=true  # reset after loop
-                                    # re-check all_ready
-                                else
-                                    echo -e "  ${RED}✗ ${exp_name}: 最终状态 ${sco_status}${NC}"
-                                    failed_jobs+=("$exp_name")
-                                fi
+                                _wait_list+=("${exp_name}|${exp_subdir}|${job_id}")
                                 ;;
                             *)
-                                echo -e "  ${YELLOW}  ${exp_name}: 状态 ${sco_status}，将重新提交${NC}"
-                                failed_jobs+=("$exp_name")
+                                echo -e "  ${RED}  ${exp_name}: 状态 ${sco_status}，立即后台修复...${NC}"
+                                failed_count=$((failed_count + 1))
+                                all_ready=false
+                                _repair_list+=("${exp_name}|${exp_subdir}")
                                 ;;
                         esac
                     else
                         all_ready=false
-                        failed_jobs+=("$exp_name")
+                        failed_count=$((failed_count + 1))
                     fi
                 else
                     echo -e "  ${YELLOW}  ${exp_name}: 无 job_id 文件，将重新提交${NC}"
                     all_ready=false
-                    failed_jobs+=("$exp_name")
+                    failed_count=$((failed_count + 1))
+                    _repair_list+=("${exp_name}|${exp_subdir}")
                 fi
             done
 
-            echo ""
+            # ── Pass 2: launch background waiters + repairs IN PARALLEL ──
+            # Each background process is independent; they all run concurrently.
+
+            # 2a: background waiters for RUNNING jobs
+            # If the job eventually fails, the waiter immediately triggers a
+            # repair (resubmit to SCO) so we don't need to wait for the next
+            # iteration.  Results are written to the same tmp-file convention
+            # as 2b so Pass 3 can display them uniformly.
+            for entry in "${_wait_list[@]}"; do
+                IFS='|' read -r _w_name _w_dir _w_jobid <<< "$entry"
+                (
+                    _s="RUNNING"
+                    for _i in $(seq 1 120); do
+                        sleep 30
+                        _s=$(sco acp jobs describe --workspace-name share-space -o json "${_w_jobid}" 2>/dev/null | python3 -c "import json,sys; d=sys.stdin.read().strip(); print(json.loads(d).get('status', json.loads(d).get('state', 'UNKNOWN')) if d else 'UNKNOWN')" 2>/dev/null || echo "UNKNOWN")
+                        case "$_s" in
+                            SUCCEEDED|FAILED|STOPPED|SUSPENDED|CANCELLED) break ;;
+                        esac
+                    done
+                    if [[ "$_s" == "SUCCEEDED" ]]; then
+                        sco acp jobs stream-logs --workspace-name share-space "${_w_jobid}" > "${_w_dir}/experiment_log.txt" 2>/dev/null || true
+                        echo -e "  ${GREEN}✓ ${_w_name}: 完成，日志已获取${NC}"
+                    else
+                        echo -e "  ${RED}✗ ${_w_name}: 最终状态 ${_s}，立即触发修复...${NC}"
+                        # Immediately resubmit — same logic as the repairer in 2b
+                        python3 -c "
+import sys; sys.path.insert(0, '${SCRIPT_DIR}')
+from sco_runner import run_experiment
+from pathlib import Path
+result = run_experiment(Path('${_w_dir}/run_experiment.sh'), '${_w_name}', force_sco=True)
+print(f'BACKEND={result.backend}')
+print(f'SUCCESS={result.success}')
+print(f'JOB_ID={result.job_id}')
+print(f'LOG_PATH={result.log_path}')
+print(f'ERROR={result.error_summary}')
+" > "/tmp/cr_rev_repair_${NEXT_ITER}_${_w_name}.txt" 2>&1
+                        _r_ok=$(grep -oP 'SUCCESS=\K\S+' "/tmp/cr_rev_repair_${NEXT_ITER}_${_w_name}.txt" 2>/dev/null || echo "False")
+                        _r_jid=$(grep -oP 'JOB_ID=\K\S+' "/tmp/cr_rev_repair_${NEXT_ITER}_${_w_name}.txt" 2>/dev/null || echo "?")
+                        if [[ "$_r_ok" == "True" ]]; then
+                            echo -e "  ${GREEN}✓ ${_w_name}: 已重新提交 (JOB_ID=${_r_jid})${NC}"
+                        else
+                            echo -e "  ${RED}✗ ${_w_name}: 重新提交失败${NC}"
+                        fi
+                    fi
+                ) &
+                bg_pids+=($!)
+            done
+
+            # 2b: background repairs for FAILED/STOPPED/SUSPENDED/CANCELLED jobs
+            # Each repair writes results to a tmp file (no stdout echo — avoids
+            # interleaving with main-script output).  Results are displayed in
+            # Pass 3 after all backgrounds complete.
+            for entry in "${_repair_list[@]}"; do
+                IFS='|' read -r _r_name _r_dir <<< "$entry"
+                local _repair_tmp="/tmp/cr_rev_repair_${NEXT_ITER}_${_r_name}.txt"
+                echo -ne "  🔧 ${_r_name}: 正在重新提交到 SCO...\r"
+                (
+                    python3 -c "
+import sys; sys.path.insert(0, '${SCRIPT_DIR}')
+from sco_runner import run_experiment
+from pathlib import Path
+result = run_experiment(Path('${_r_dir}/run_experiment.sh'), '${_r_name}', force_sco=True)
+print(f'BACKEND={result.backend}')
+print(f'SUCCESS={result.success}')
+print(f'JOB_ID={result.job_id}')
+print(f'LOG_PATH={result.log_path}')
+print(f'ERROR={result.error_summary}')
+" > "${_repair_tmp}" 2>&1
+                    echo $? > "${_repair_tmp}.exit"
+                ) &
+                bg_pids+=($!)
+                repaired_count=$((repaired_count + 1))
+            done
+
+            # ── Pass 3: wait for ALL background processes, then show coordinated results ──
+            if [[ ${#bg_pids[@]} -gt 0 ]]; then
+                echo ""
+                echo -e "  ${CYAN}后台任务: ${#bg_pids[@]} 个 (等待=${#_wait_list[@]} 修复=${#_repair_list[@]})${NC}"
+                for pid in "${bg_pids[@]}"; do
+                    wait "$pid" 2>/dev/null || true
+                done
+                echo -e "  ${GREEN}所有后台任务已完成${NC}"
+                echo ""
+
+                # Show repair results from ALL sources (direct repairs + waiter-triggered repairs)
+                local _actual_repair_count=0
+                for _repair_tmp in /tmp/cr_rev_repair_${NEXT_ITER}_*.txt; do
+                    [[ -f "$_repair_tmp" ]] || continue
+                    local _rf_name=$(basename "$_repair_tmp" .txt)
+                    # Extract experiment name from filename pattern: cr_rev_repair_ITER_EXPNAME.txt
+                    local _rf_exp="${_rf_name#cr_rev_repair_${NEXT_ITER}_}"
+                    local _r_jobid=$(grep -oP 'JOB_ID=\K\S+' "$_repair_tmp" 2>/dev/null || echo "?")
+                    local _r_ok=$(grep -oP 'SUCCESS=\K\S+' "$_repair_tmp" 2>/dev/null || echo "False")
+                    if [[ "$_r_ok" == "True" ]]; then
+                        echo -e "  ${GREEN}✓ ${_rf_exp}: 已重新提交 (JOB_ID=${_r_jobid})${NC}"
+                    else
+                        local _r_err=$(grep -oP 'ERROR=\K.*' "$_repair_tmp" 2>/dev/null || echo "未知错误")
+                        echo -e "  ${RED}✗ ${_rf_exp}: 重新提交失败 — ${_r_err}${NC}"
+                    fi
+                    rm -f "$_repair_tmp" "${_repair_tmp}.exit" 2>/dev/null || true
+                    _actual_repair_count=$((_actual_repair_count + 1))
+                done
+                if [[ $_actual_repair_count -gt 0 ]]; then
+                    echo ""
+                fi
+                # Update repaired_count to include waiter-triggered repairs
+                repaired_count=$_actual_repair_count
+            fi
+
             if [[ $recovered -gt 0 ]]; then
                 echo -e "  ${GREEN}从 SCO 恢复了 ${recovered} 个实验的日志${NC}"
-            fi
-            if [[ ${#failed_jobs[@]} -gt 0 ]]; then
-                echo -e "  ${YELLOW}需要重新提交 ${#failed_jobs[@]} 个实验: ${failed_jobs[*]}${NC}"
             fi
 
             # 重新检查 all_ready
@@ -1675,7 +1875,12 @@ json.dump(exps, open(rev_dir / 'experiment_results.json', 'w'), indent=2)
 
             if [[ "$all_ready" == "true" ]]; then
                 echo -e "  ${GREEN}所有实验日志已就绪，跳过重新提交${NC}"
-                PHASE_B2_SUBMITTED=true  # 保持 true，跳到等待/收集
+                PHASE_B2_SUBMITTED=true
+            elif [[ $repaired_count -gt 0 || $still_running -gt 0 ]]; then
+                # 已修复的实验需要等待 SCO 执行；仍在运行的实验需要等待完成。
+                # 两种情况都应保持 submitted 状态，让下一轮检查点来收割结果。
+                echo -e "  ${CYAN}[检查点] 保持等待 (已修复=${repaired_count} 运行中=${still_running})，下一轮检查点继续${NC}"
+                PHASE_B2_SUBMITTED=true
             else
                 echo -e "  ${YELLOW}[检查点] 部分实验需要重新提交${NC}"
                 PHASE_B2_SUBMITTED=false

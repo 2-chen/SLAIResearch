@@ -49,24 +49,29 @@ SCO_IMAGE = os.environ.get(
     "SCO_IMAGE",
     "registry.cn-sh-01.sensecore.cn/ccr-zhicheng-02/chen-mirror2:2chen-mini-20260410132739",
 )
-SCO_WORKER_SPEC = os.environ.get("SCO_WORKER_SPEC", "n6ls.iu.i40.4.32c512g")
+SCO_WORKER_SPEC = os.environ.get("SCO_WORKER_SPEC", "n6ls.iu.i40.2.16c256g")
 SCO_STORAGE_MOUNT = os.environ.get(
     "SCO_STORAGE_MOUNT",
     "01995892-d478-76d8-aec7-13fd8284477e:/data:/250010008",
 )
 SCO_WORKER_NODES = int(os.environ.get("SCO_WORKER_NODES", "1"))
-SCO_QUOTA_TYPE = os.environ.get("SCO_QUOTA_TYPE", "reserved")
+SCO_QUOTA_TYPE = os.environ.get("SCO_QUOTA_TYPE", "")
+# NOTE: Empty string ("") means the platform uses its default quota type.
+# "reserved" caused member_default fallthrough and 4-GPU quota miscounting.
 SCO_PRIORITY = os.environ.get("SCO_PRIORITY", "normal")
 
 # GPU count -> worker spec mapping. Each entry overridable via env.
 # Spec format: {machine}.{type}.{variant}.{gpus}.{cpu}c{ram}g
+# All specs verified working on share-cluster (2026-06-05).
+# NOTE: The .XcYg suffix is REQUIRED — truncated specs cause silent container failures.
 SCO_WORKER_SPEC_MAP = {
     1: os.environ.get("SCO_WORKER_SPEC_1GPU", "n6ls.iu.i40.1.8c128g"),
     2: os.environ.get("SCO_WORKER_SPEC_2GPU", "n6ls.iu.i40.2.16c256g"),
+    3: os.environ.get("SCO_WORKER_SPEC_3GPU", "n6ls.iu.i40.2.16c256g"),
     4: os.environ.get("SCO_WORKER_SPEC_4GPU", "n6ls.iu.i40.4.32c512g"),
 }
 # GPU count used when experiment_manifest.json is missing (backward compat).
-DEFAULT_GPU_COUNT = int(os.environ.get("CHENRESEARCH_DEFAULT_GPU_COUNT", "4"))
+DEFAULT_GPU_COUNT = int(os.environ.get("CHENRESEARCH_DEFAULT_GPU_COUNT", "1"))
 
 # ---------------------------------------------------------------------------
 # Pipeline tuning

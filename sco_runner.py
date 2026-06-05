@@ -19,6 +19,7 @@ import shutil
 import os
 import re
 import sys
+import threading
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any
@@ -33,7 +34,7 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
-JOB_STATE_TERMINAL = {"SUCCEEDED", "FAILED", "STOPPED", "CANCELLED"}
+JOB_STATE_TERMINAL = {"SUCCEEDED", "FAILED", "STOPPED", "CANCELLED", "SUSPENDED"}
 
 # ---------------------------------------------------------------------------
 # GPU detection
@@ -174,6 +175,43 @@ def parse_gpu_requirement(experiment_dir: str | Path) -> int | None:
         return None
 
 
+def _gpu_count_from_spec(spec: str) -> int:
+    """Extract the GPU count encoded in a worker spec string.
+
+    Spec format: {machine}.{type}.{variant}.{gpus}.{cpu}c{ram}g
+    Example: n6ls.iu.i40.2.16c256g → 2
+    """
+    m = re.search(r'\.(\d+)\.\d+c\d+g$', spec)
+    if m:
+        return int(m.group(1))
+    logger.warning("Cannot parse GPU count from spec: %s — assuming 1", spec)
+    return 1
+
+
+# Valid spec format: {machine}.{type}.{variant}.{gpus}.{cpu}c{ram}g
+_VALID_SPEC_RE = re.compile(r'\.(\d+)\.\d+c\d+g$')
+
+
+def _validate_worker_spec(spec: str, source: str = "") -> None:
+    """Validate worker spec format. Raises RuntimeError on invalid format.
+
+    Valid format: {machine}.{type}.{variant}.{gpus}.{cpu}c{ram}g
+    Example: n6ls.iu.i40.1.8c128g
+
+    Truncated specs (e.g. n6ls.iu.i40.1 — missing .XcYg suffix) cause
+    silent SCO container failures with zero output.  This validator catches
+    them before submission so the error message is clear and actionable.
+    """
+    if not _VALID_SPEC_RE.search(spec):
+        label = f" ({source})" if source else ""
+        raise RuntimeError(
+            f"Invalid SCO worker spec format{label}: '{spec}'. "
+            f"Expected format: {{machine}}.{{type}}.{{variant}}.{{gpus}}.{{cpu}}c{{ram}}g. "
+            f"Examples: n6ls.iu.i40.1.8c128g, n6ls.iu.i40.2.16c256g, n6ls.iu.i40.4.32c512g. "
+            f"Check SCO_WORKER_SPEC or SCO_WORKER_SPEC_MAP in config.py."
+        )
+
+
 def resolve_worker_spec(gpu_count: int) -> str:
     """Map a GPU count to the best matching SCO worker spec.
 
@@ -182,29 +220,53 @@ def resolve_worker_spec(gpu_count: int) -> str:
       2. Smallest spec with >= gpu_count GPUs.
       3. Largest available spec if request exceeds all.
       4. Fallback to SCO_WORKER_SPEC.
+
+    The returned spec is validated to ensure correct format.
     """
+    resolved: str | None = None
+
     if not SCO_WORKER_SPEC_MAP:
-        logger.warning("SCO_WORKER_SPEC_MAP is empty, using default: %s", SCO_WORKER_SPEC)
-        return SCO_WORKER_SPEC
-
-    if gpu_count in SCO_WORKER_SPEC_MAP:
+        resolved = SCO_WORKER_SPEC
+    elif gpu_count in SCO_WORKER_SPEC_MAP:
         spec = SCO_WORKER_SPEC_MAP[gpu_count]
-        logger.info("Resolved %d GPU(s) -> exact match: %s", gpu_count, spec)
-        return spec
+        spec_gpus = _gpu_count_from_spec(spec)
+        if spec_gpus <= gpu_count:
+            logger.info("Resolved %d GPU(s) -> exact match: %s (%d GPUs in spec)",
+                        gpu_count, spec, spec_gpus)
+            resolved = spec
+        else:
+            logger.warning("Exact-match spec %s encodes %d GPUs > requested %d — will search alternatives",
+                           spec, spec_gpus, gpu_count)
 
-    available = sorted(SCO_WORKER_SPEC_MAP.keys())
-    for count in available:
-        if count >= gpu_count:
+    if resolved is None:
+        available = sorted(SCO_WORKER_SPEC_MAP.keys())
+        for count in available:
+            if count >= gpu_count:
+                spec = SCO_WORKER_SPEC_MAP[count]
+                spec_gpus = _gpu_count_from_spec(spec)
+                if spec_gpus <= gpu_count:
+                    logger.info("Resolved %d GPU(s) -> next available slot %d: %s (%d GPUs in spec)",
+                                gpu_count, count, spec, spec_gpus)
+                    resolved = spec
+                    break
+
+    if resolved is None:
+        available = sorted(SCO_WORKER_SPEC_MAP.keys())
+        for count in reversed(available):
             spec = SCO_WORKER_SPEC_MAP[count]
-            logger.info("Resolved %d GPU(s) -> next available (%d GPUs): %s",
-                        gpu_count, count, spec)
-            return spec
+            spec_gpus = _gpu_count_from_spec(spec)
+            if spec_gpus <= gpu_count:
+                logger.info("Resolved %d GPU(s) -> fallback slot %d: %s (%d GPUs in spec)",
+                            gpu_count, count, spec, spec_gpus)
+                resolved = spec
+                break
 
-    largest = available[-1]
-    spec = SCO_WORKER_SPEC_MAP[largest]
-    logger.warning("Requested %d GPU(s) but max available is %d, using: %s",
-                   gpu_count, largest, spec)
-    return spec
+    if resolved is None:
+        resolved = SCO_WORKER_SPEC_MAP.get(1, SCO_WORKER_SPEC)
+        logger.warning("No spec fits %d GPU(s), using fallback: %s", gpu_count, resolved)
+
+    _validate_worker_spec(resolved, f"resolve_worker_spec(gpu_count={gpu_count})")
+    return resolved
 
 
 def _auto_detect_config(script_path: str | Path) -> tuple[dict[str, str], "SCOConfig"]:
@@ -216,13 +278,18 @@ def _auto_detect_config(script_path: str | Path) -> tuple[dict[str, str], "SCOCo
     """
     exp_dir = Path(script_path).parent
     gpu_count = parse_gpu_requirement(exp_dir) or DEFAULT_GPU_COUNT
+    resolved_spec = resolve_worker_spec(gpu_count)
+    # Resolved spec may encode more GPUs than requested (e.g. 1 → 2
+    # because SCO has no 1-GPU machine type).  Propagate the actual count
+    # so the experiment script parallelizes correctly.
+    actual_gpu_count = _gpu_count_from_spec(resolved_spec)
     extra_env = {
-        "GPU_COUNT": str(gpu_count),
+        "GPU_COUNT": str(actual_gpu_count),
         "CHENRESEARCH": "1",
     }
-    resolved_spec = resolve_worker_spec(gpu_count)
     sco_config = SCOConfig(worker_spec=resolved_spec)
-    logger.info("Auto-detected config: GPU_COUNT=%d, worker_spec=%s", gpu_count, resolved_spec)
+    logger.info("Auto-detected config: manifest_gpu=%d actual_gpu=%d worker_spec=%s",
+                gpu_count, actual_gpu_count, resolved_spec)
     return extra_env, sco_config
 
 
@@ -288,6 +355,8 @@ def check_gpu_utilization(experiment_dir: str | Path, gpu_count: int) -> dict:
     )
     # Multiple CUDA_VISIBLE_DEVICES assignments (not just a single export at the top)
     has_multi_gpu_shell = len(re.findall(r'CUDA_VISIBLE_DEVICES=', sh_text)) >= 2
+    # Script reads $GPU_COUNT / ${GPU_COUNT} to dynamically adapt to available GPUs
+    reads_gpu_count_env = bool(re.search(r'\$\{?GPU_COUNT\}?', sh_text))
 
     # ── Detect serial training anti-patterns ──
     # Sequential for-loop over sigma/baseline training without parallel
@@ -313,14 +382,20 @@ def check_gpu_utilization(experiment_dir: str | Path, gpu_count: int) -> dict:
         score = "poor"
     elif has_training_parallel:
         score = "good"
+    elif reads_gpu_count_env and has_bg_processes and has_multi_gpu_shell:
+        # Shell-level multi-GPU orchestration: script reads GPU_COUNT,
+        # sets CUDA_VISIBLE_DEVICES per process, and runs jobs in parallel.
+        # This is a fully valid multi-GPU pattern (e.g. run_experiment.sh).
+        score = "good"
     elif has_inference_parallel and has_bg_processes:
         score = "partial"
     elif has_inference_parallel or has_bg_processes or has_multi_gpu_shell:
         score = "partial"
-        issues.append(
-            f"Certification/inference uses multi-GPU but training appears serial. "
-            f"Training time will dominate with only 1/{gpu_count} GPUs active."
-        )
+        if not reads_gpu_count_env and gpu_count >= 2:
+            issues.append(
+                f"Shell uses multi-GPU patterns but does NOT read \$GPU_COUNT. "
+                f"GPU_COUNT={gpu_count} will be ignored — experiment may use only 1 GPU."
+            )
     else:
         score = "poor"
         if not issues:
@@ -403,9 +478,26 @@ def _pre_submit_check(experiment_dir: str | Path, gpu_count: int) -> None:
     logs warnings for soft issues."""
     exp_dir = Path(experiment_dir)
 
-    # 1. GPU utilization check (soft — warn but don't block)
+    # 1. GPU utilization check
     util = check_gpu_utilization(exp_dir, gpu_count)
     if util["score"] == "poor":
+        if gpu_count >= 3:
+            # Hard block: 3+ GPUs requested but zero multi-GPU awareness detected.
+            # This would waste expensive GPU resources with no benefit.
+            msg = (
+                f"GPU utilization check FAILED: {gpu_count} GPUs requested but no "
+                f"multi-GPU patterns detected (no DataParallel/DDP, no GPU_COUNT "
+                f"reading, no CUDA_VISIBLE_DEVICES distribution). "
+                f"Experiment will only use 1 of {gpu_count} GPUs. "
+                f"Fix: either set gpu_count=1 in experiment_manifest.json, or add "
+                f"GPU_COUNT-based parallelism to run_experiment.sh."
+            )
+            logger.error("=" * 60)
+            logger.error(msg)
+            for issue in util["issues"]:
+                logger.error("  ✗ %s", issue)
+            logger.error("=" * 60)
+            raise RuntimeError(msg)
         logger.warning("=" * 60)
         logger.warning("GPU UTILIZATION CHECK: POOR")
         for issue in util["issues"]:
@@ -719,6 +811,121 @@ def _ensure_wheels() -> bool:
         return False
 
 
+def _cleanup_stale_jobs(job_name_prefix: str) -> int:
+    """Delete FAILED/CANCELLED/STOPPED/SUSPENDED SCO jobs matching a name prefix.
+
+    Returns number of jobs cleaned up.  Failure to clean up is logged but
+    never raised — stale jobs are a best-effort optimization, not a hard
+    requirement.
+
+    Strips -fixN and -local-fallback suffixes from the prefix so that
+    fix-round-N can match stale jobs from fix rounds N-1, N-2, etc.
+    """
+    import re as _re
+    cleaned = 0
+    terminal_states = {"FAILED", "CANCELLED", "STOPPED", "SUSPENDED"}
+
+    # Build a list of prefixes to match against.  The caller passes the
+    # full job name (e.g. "cr-topic-fix18") but stale jobs are named with
+    # earlier fix numbers ("cr-topic-fix17").  Strip the variable suffix
+    # so we match across fix / fallback rounds.
+    base = _re.sub(r'-(fix|local-fallback)\d*$', '', job_name_prefix)
+    prefixes = [job_name_prefix]
+    if base != job_name_prefix:
+        prefixes.append(base)
+
+    try:
+        result = subprocess.run(
+            ["sco", "acp", "jobs", "list", "--workspace-name", SCO_WORKSPACE,
+             "--page-size", "50", "-o", "json"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            logger.warning("Failed to list jobs for pre-submit cleanup")
+            return 0
+        jobs = json.loads(result.stdout) if result.stdout.strip() else []
+    except Exception as e:
+        logger.warning("Failed to list jobs during cleanup: %s", e)
+        return 0
+
+    stale_ids = []
+    for job in jobs:
+        jid = job.get("name", "")
+        dname = job.get("display_name", "")
+        status = job.get("status", job.get("state", ""))
+        # Match any of our prefixes against display_name or job id
+        if status in terminal_states and any(p in dname or p in jid for p in prefixes):
+            stale_ids.append(jid)
+
+    if stale_ids:
+        logger.info("Cleaning up %d stale terminal job(s): %s", len(stale_ids), stale_ids)
+        try:
+            del_cmd = ["sco", "acp", "jobs", "delete", "--workspace-name", SCO_WORKSPACE] + stale_ids
+            del_result = subprocess.run(del_cmd, capture_output=True, text=True, timeout=60)
+            if del_result.returncode == 0:
+                cleaned = len(stale_ids)
+                logger.info("Deleted %d stale job(s) to free quota", cleaned)
+            else:
+                logger.warning("Failed to delete stale jobs: %s", (del_result.stderr or del_result.stdout)[:500])
+        except Exception as e:
+            logger.warning("Exception during stale job deletion: %s", e)
+    else:
+        logger.info("No stale terminal jobs found for prefixes %s", prefixes)
+
+    return cleaned
+
+
+def _prepare_env_for_sco(experiment_dir: Path) -> bool:
+    """Pre-install missing Python packages to shared site-packages.
+
+    Scans the experiment's Python files for third-party imports and runs
+    prepare_env.sh to install anything not already in the SCO container image
+    or shared site-packages.  This MUST happen before SCO submission so the
+    container can run with CHENRESEARCH=1 (zero pip install).
+    """
+    prepare_env_sh = Path("/data/AutoResearch/ChenResearch/workspace/.shared/prepare_env.sh")
+    if not prepare_env_sh.exists():
+        logger.warning("prepare_env.sh not found at %s — skipping env prep", prepare_env_sh)
+        return False
+
+    # Collect all .py files in the experiment directory
+    py_files = sorted(experiment_dir.glob("*.py"))
+    if not py_files:
+        logger.warning("No .py files found in %s — skipping env prep", experiment_dir)
+        return False
+
+    # Run prepare_env.sh --from-imports on the main experiment file.
+    # The main file typically imports everything needed; scanning all .py
+    # files would be redundant for most experiment layouts.
+    main_py = experiment_dir / "experiment.py"
+    target = main_py if main_py.exists() else py_files[0]
+
+    logger.info("Pre-installing packages from imports in %s ...", target.name)
+    try:
+        result = subprocess.run(
+            ["bash", str(prepare_env_sh), "--from-imports", str(target)],
+            capture_output=True, text=True, timeout=300,
+        )
+        if result.returncode == 0:
+            logger.info("Environment pre-configuration complete for %s", experiment_dir.name)
+            return True
+        else:
+            # Non-zero exit — log but don't block (container may still work
+            # if packages are already available or not actually needed).
+            logger.warning(
+                "prepare_env.sh exited %d for %s: %s",
+                result.returncode, experiment_dir.name,
+                (result.stderr or result.stdout)[:500],
+            )
+            return False
+    except subprocess.TimeoutExpired:
+        logger.warning("prepare_env.sh timed out for %s", experiment_dir.name)
+        return False
+    except Exception as e:
+        logger.warning("prepare_env.sh failed for %s: %s", experiment_dir.name, e)
+        return False
+
+
 def _run_sco_path(
     script_path: Path,
     job_name: str,
@@ -740,39 +947,297 @@ def _run_sco_path(
             error_summary=f"Pre-submit check failed: {e}",
         )
 
-    # ── Pre-submission: ensure wheels are cached ──
-    _ensure_wheels()
-
-    try:
-        job = submit_job(script_path, job_name, extra_env=extra_env or {}, config=sco_config)
-        logger.info("SCO job submitted: %s", job.job_id)
-
-        # Save job_id immediately
-        id_file = log_dir / "sco_job_id.txt"
-        id_file.write_text(job.job_id)
-
-        # Wait (longer timeout for SCO)
-        job = wait_for_job(job.job_id, poll_interval=120, max_wait=43200, config=sco_config)
-        sco_log = log_dir / "sco_logs.txt"
-        stream_logs(job.job_id, sco_log, config=sco_config)
-
-        if job.status == "SUCCEEDED":
-            return ExperimentResult(
-                backend="sco", success=True,
-                job_id=job.job_id, log_path=str(sco_log),
-            )
-        else:
+    # ── Pre-submission: worker spec validation (hard — block if invalid) ──
+    if sco_config is not None:
+        try:
+            _validate_worker_spec(sco_config.worker_spec, "sco_config.worker_spec")
+        except RuntimeError as e:
+            logger.error("Worker spec validation FAILED: %s", e)
             return ExperimentResult(
                 backend="sco", success=False,
-                job_id=job.job_id, log_path=str(sco_log),
-                error_summary=f"SCO job ended with status: {job.status}",
+                error_summary=f"Worker spec validation failed: {e}",
             )
-    except Exception as e:
-        logger.exception("SCO execution failed")
-        return ExperimentResult(
-            backend="sco", success=False,
-            error_summary=f"SCO error: {e}",
+    _ensure_wheels()
+
+    # ── Pre-submission: pre-install missing packages to shared site-packages ──
+    _prepare_env_for_sco(script_path.parent)
+
+    # ── Pre-submission: clean up stale terminal jobs from previous attempts ──
+    _cleanup_stale_jobs(job_name)
+
+    # ── Submit with quota-exceeded fallback ──
+    quota_attempts = 0
+    max_quota_attempts = 12
+    current_gpu_count = gpu_count
+    current_config = sco_config
+    _spot_tried = (current_config.quota_type or "default") == "spot"  # don't retry spot if already spot
+
+    def _try_spot_quota(config: SCOConfig) -> ExperimentResult | None:
+        """Try submitting with spot quota type (separate quota pool).
+
+        Returns ExperimentResult on terminal result, None if spot also
+        failed with quota error (caller should continue retrying default).
+        """
+        logger.warning(
+            "Default quota saturated (spec=%s, %d GPUs). "
+            "Trying quota_type='spot' (separate pool)...",
+            config.worker_spec, _gpu_count_from_spec(config.worker_spec),
         )
+        spot_config = SCOConfig(
+            workspace=config.workspace,
+            aec2=config.aec2,
+            image=config.image,
+            worker_spec=config.worker_spec,
+            storage_mount=config.storage_mount,
+            worker_nodes=config.worker_nodes,
+            quota_type="spot",
+            priority=config.priority,
+            training_framework=config.training_framework,
+            fault_tolerant=config.fault_tolerant,
+            retry_times=config.retry_times,
+        )
+        _cleanup_stale_jobs(job_name)
+        try:
+            job = submit_job(script_path, job_name,
+                             extra_env=extra_env or {}, config=spot_config)
+            logger.info("Spot quota job submitted: %s", job.job_id)
+            id_file = log_dir / "sco_job_id.txt"
+            id_file.write_text(job.job_id)
+
+            # Concurrent log capture (same rationale as main path)
+            sco_log = log_dir / "sco_logs.txt"
+            stream_output_s: dict[str, str] = {"logs": ""}
+
+            def _capture_spot_logs():
+                try:
+                    stream_output_s["logs"] = stream_logs(job.job_id, None, config=spot_config)
+                except Exception as e:
+                    stream_output_s["logs"] = f"[stream_logs exception: {e}]"
+
+            log_thread_s = threading.Thread(target=_capture_spot_logs, daemon=True)
+            log_thread_s.start()
+            time.sleep(5)
+
+            job = wait_for_job(job.job_id, poll_interval=120,
+                               max_wait=43200, config=spot_config)
+            log_thread_s.join(timeout=30)
+
+            final_log_s = stream_output_s.get("logs", "")
+            persistent_log_s = log_dir / "run_output.log"
+            if persistent_log_s.exists():
+                ps = persistent_log_s.read_text()
+                if ps.strip():
+                    if final_log_s.strip():
+                        final_log_s += "\n\n=== PERSISTENT LOG (AFS) ===\n" + ps
+                    else:
+                        final_log_s = ps
+            sco_log.write_text(final_log_s)
+
+            if job.status == "SUCCEEDED":
+                return ExperimentResult(
+                    backend="sco", success=True,
+                    job_id=job.job_id, log_path=str(sco_log),
+                )
+            else:
+                return ExperimentResult(
+                    backend="sco", success=False,
+                    job_id=job.job_id, log_path=str(sco_log),
+                    error_summary=f"SCO spot job ended with status: {job.status}",
+                )
+        except RuntimeError as e:
+            error_msg = str(e)
+            if "MEMBER_QUOTA_EXCEEDED" in error_msg:
+                logger.warning("Spot quota also exhausted: %s", error_msg[:200])
+            else:
+                logger.warning("Spot quota submission failed: %s", e)
+        except Exception as e:
+            logger.warning("Spot quota exception: %s", e)
+        return None
+
+    while quota_attempts < max_quota_attempts:
+        try:
+            logger.info("Submitting SCO job: spec=%s nodes=%d quota_type=%s",
+                        current_config.worker_spec, current_config.worker_nodes,
+                        current_config.quota_type or "default")
+            job = submit_job(script_path, job_name,
+                             extra_env=extra_env or {}, config=current_config)
+            logger.info("SCO job submitted: %s (GPU_COUNT=%d)", job.job_id, current_gpu_count)
+
+            # Save job_id immediately
+            id_file = log_dir / "sco_job_id.txt"
+            id_file.write_text(job.job_id)
+
+            # Start log streaming concurrently BEFORE waiting — pods are
+            # cleaned up quickly after reaching terminal state, so
+            # stream-logs must connect while the pod is still alive.
+            sco_log = log_dir / "sco_logs.txt"
+            stream_output: dict[str, str] = {"logs": ""}
+
+            def _capture_logs():
+                try:
+                    stream_output["logs"] = stream_logs(job.job_id, None, config=current_config)
+                except Exception as e:
+                    stream_output["logs"] = f"[stream_logs exception: {e}]"
+
+            log_thread = threading.Thread(target=_capture_logs, daemon=True)
+            log_thread.start()
+            time.sleep(5)  # Give stream-logs a head-start on the pod
+
+            # Wait for job to reach terminal state
+            job = wait_for_job(job.job_id, poll_interval=120, max_wait=43200, config=current_config)
+
+            # Give log thread time to flush remaining output
+            log_thread.join(timeout=30)
+
+            # Build the final log: stream-logs output + persistent fallback
+            final_log = stream_output.get("logs", "")
+            persistent_log = log_dir / "run_output.log"
+            if persistent_log.exists():
+                pfx = persistent_log.read_text()
+                if pfx.strip():
+                    if final_log.strip():
+                        final_log += "\n\n=== PERSISTENT LOG (AFS) ===\n" + pfx
+                    else:
+                        final_log = pfx
+            sco_log.write_text(final_log)
+
+            if job.status == "SUCCEEDED":
+                return ExperimentResult(
+                    backend="sco", success=True,
+                    job_id=job.job_id, log_path=str(sco_log),
+                )
+            else:
+                return ExperimentResult(
+                    backend="sco", success=False,
+                    job_id=job.job_id, log_path=str(sco_log),
+                    error_summary=f"SCO job ended with status: {job.status}",
+                )
+
+        except RuntimeError as e:
+            error_msg = str(e)
+            if "MEMBER_QUOTA_EXCEEDED" in error_msg:
+                # Extract GPU counts from the quota error
+                remaining_match = re.search(r'Remaining:\s*GPU:\s*(\d+)\s*card', error_msg)
+                requested_match = re.search(r'Requested additional:\s*GPU:\s*(\d+)\s*card', error_msg)
+                quota_remaining = int(remaining_match.group(1)) if remaining_match else 0
+                quota_requested = int(requested_match.group(1)) if requested_match else 0
+
+                effective_gpus = quota_requested if quota_requested > 0 else current_gpu_count * current_config.worker_nodes
+                logger.warning(
+                    "Quota exceeded: requested=%d remaining=%d effective=%d current_gpu=%d worker_nodes=%d spec=%s",
+                    quota_requested, quota_remaining, effective_gpus, current_gpu_count,
+                    current_config.worker_nodes, current_config.worker_spec,
+                )
+
+                # First tactic: reduce worker_nodes to 1 (kills the multiplier)
+                if current_config.worker_nodes > 1:
+                    old_wn = current_config.worker_nodes
+                    current_config = SCOConfig(
+                        worker_spec=current_config.worker_spec,
+                        worker_nodes=1,
+                    )
+                    logger.warning("Reducing worker_nodes from %d to 1", old_wn)
+                    quota_attempts += 1
+                    continue
+
+                # Second tactic: reduce GPU count per spec to fit remaining quota
+                prev_spec_gpus = _gpu_count_from_spec(current_config.worker_spec)
+                if current_gpu_count > 1:
+                    prev_gpu = current_gpu_count
+                    if quota_remaining > 0:
+                        current_gpu_count = max(1, min(current_gpu_count - 1, quota_remaining))
+                    else:
+                        current_gpu_count = max(1, current_gpu_count - 1)
+                    quota_attempts += 1
+                    resolved_spec = resolve_worker_spec(current_gpu_count)
+                    new_spec_gpus = _gpu_count_from_spec(resolved_spec)
+                    if new_spec_gpus >= prev_spec_gpus:
+                        logger.warning(
+                            "Cannot reduce spec GPUs: %d → %d (resolved spec=%s still has %d GPUs).",
+                            prev_spec_gpus, current_gpu_count, resolved_spec, new_spec_gpus,
+                        )
+                        current_gpu_count = 1
+                    else:
+                        current_config = SCOConfig(worker_spec=resolved_spec, worker_nodes=1)
+                        actual_gpus = _gpu_count_from_spec(resolved_spec)
+                        if extra_env:
+                            extra_env["GPU_COUNT"] = str(actual_gpus)
+                        logger.warning(
+                            "Quota exceeded at GPU_COUNT=%d — retrying with spec=%s (%d GPUs) worker_nodes=1 (attempt %d/%d)",
+                            prev_gpu, resolved_spec, actual_gpus, quota_attempts, max_quota_attempts,
+                        )
+                        continue
+
+                # At minimum spec — workspace_member_default charges 4 GPU units
+                # per job regardless of actual spec.  If remaining < 4, the default
+                # quota pool is exhausted.  Try spot quota IMMEDIATELY (separate pool).
+                if not _spot_tried and quota_attempts < max_quota_attempts - 1:
+                    _spot_tried = True
+                    spot_result = _try_spot_quota(current_config)
+                    if spot_result is not None:
+                        return spot_result
+                    # Spot also failed — fall through to backoff retries for default quota
+                    quota_attempts += 1
+                    logger.warning(
+                        "Spot quota also exhausted. Falling back to default quota "
+                        "with backoff (attempt %d/%d).",
+                        quota_attempts, max_quota_attempts,
+                    )
+                    backoff = min(30 * (2 ** max(quota_attempts - 1, 0)), 600)
+                    _cleanup_stale_jobs(job_name)
+                    time.sleep(backoff)
+                    continue
+
+                # Backoff: wait for other jobs to release shared quota
+                if quota_attempts < max_quota_attempts - 1:
+                    quota_attempts += 1
+                    backoff = min(30 * (2 ** max(quota_attempts - 1, 0)), 600)
+                    logger.warning(
+                        "Quota exceeded at minimum config (spec=%s, %d GPUs, worker_nodes=%d, "
+                        "platform remaining=%d). Cleaning up stale jobs, waiting %ds "
+                        "(retry %d/%d)...",
+                        current_config.worker_spec, prev_spec_gpus, current_config.worker_nodes,
+                        quota_remaining, backoff, quota_attempts, max_quota_attempts,
+                    )
+                    _cleanup_stale_jobs(job_name)
+                    time.sleep(backoff)
+                    continue
+                logger.error("Quota exceeded after %d retries: spec=%s (%d GPUs), "
+                             "platform remaining=%d",
+                             quota_attempts, current_config.worker_spec, prev_spec_gpus,
+                             quota_remaining)
+                return ExperimentResult(
+                    backend="sco", success=False,
+                    error_summary=(
+                        f"GPU quota exceeded after {quota_attempts} retries — "
+                        f"requested {prev_spec_gpus} GPU(s) but "
+                        f"only {quota_remaining} available. "
+                        f"Wait for other jobs to complete or release quota and retry later."
+                    ),
+                )
+            else:
+                logger.exception("SCO execution failed")
+                return ExperimentResult(
+                    backend="sco", success=False,
+                    error_summary=f"SCO error: {e}",
+                )
+
+        except Exception as e:
+            logger.exception("SCO execution failed")
+            return ExperimentResult(
+                backend="sco", success=False,
+                error_summary=f"SCO error: {e}",
+            )
+
+    # Exhausted all retries
+    return ExperimentResult(
+        backend="sco", success=False,
+        error_summary=(
+            f"Member quota exceeded after {quota_attempts} retries "
+            f"(final GPU_COUNT={current_gpu_count}). "
+            f"Please release quota or wait for other jobs to complete."
+        ),
+    )
 
 
 @dataclass
@@ -876,10 +1341,13 @@ def submit_job(
         "--worker-nodes", str(cfg.worker_nodes),
         "--worker-spec", cfg.worker_spec,
         "--priority", cfg.priority,
-        "--quota-type", cfg.quota_type,
         "--storage-mount", cfg.storage_mount,
         "--command", command,
     ]
+    # Only include --quota-type if non-empty (platform uses default otherwise)
+    if cfg.quota_type:
+        cmd.insert(cmd.index("--priority") + 2, "--quota-type")
+        cmd.insert(cmd.index("--priority") + 3, cfg.quota_type)
 
     if cfg.fault_tolerant:
         cmd[-2:-2] = ["--enable-fault-tolerance", "--retry-times", str(cfg.retry_times)]
@@ -934,11 +1402,22 @@ def stream_logs(
     config: SCOConfig | None = None,
 ) -> str:
     cfg = config or SCOConfig()
-    result = subprocess.run(
-        ["sco", "acp", "jobs", "stream-logs", "--workspace-name", cfg.workspace, job_id],
-        capture_output=True, text=True, timeout=120,
-    )
-    logs = result.stdout
+    try:
+        result = subprocess.run(
+            ["sco", "acp", "jobs", "stream-logs", "--workspace-name", cfg.workspace, job_id],
+            capture_output=True, text=True, timeout=120,
+        )
+        logs = result.stdout or ""
+        # Include stderr if stdout is empty (some SCO versions use stderr for logs)
+        if not logs and result.stderr:
+            logs = f"[stderr] {result.stderr}"
+        # Log exit code if non-zero (signal platform issues)
+        if result.returncode != 0:
+            logs = (logs or "") + f"\n[sco stream-logs exit code: {result.returncode}]"
+    except subprocess.TimeoutExpired:
+        logs = "[stream_logs timed out after 120s — job may still be initializing]"
+    except Exception as e:
+        logs = f"[stream_logs error: {e}]"
     if output_path:
         Path(output_path).write_text(logs)
     return logs
@@ -967,13 +1446,81 @@ def _build_remote_command(work_dir: str, script_name: str, extra_env: dict[str, 
     """
     规范格式（参考 sco-skill）：cd 到工作目录，执行指定脚本。
     不硬编码文件名 — 由调用方传入。
+
+    Persistence: all output is tee'd to run_output.log on the AFS mount.
+    This ensures logs survive pod termination — stream-logs often can't
+    connect because the pod is gone by the time wait_for_job returns.
     """
     import shlex
-    lines = ["set -euo pipefail"]
-    lines.append(f"cd {shlex.quote(work_dir)}")
+    persistent_log = f"{work_dir}/logs/run_output.log"
+    lines = []
+    # pipefail is critical: without it, the pipeline exit code is tee's (always 0),
+    # masking script failures from the SCO platform.
+    lines.append("set -o pipefail")
+    # Ensure logs directory exists on persistent storage BEFORE any output
+    lines.append(f"mkdir -p {shlex.quote(work_dir + '/logs')}")
+    # Wrap everything in a group command so tee captures ALL output,
+    # including early diagnostics and cd failures.
+    lines.append("{")
+    # Early diagnostics BEFORE cd — ensures we see output even if storage
+    # mount is missing or the work dir doesn't exist.
+    lines.append("echo '=== SCO container started at' $(date 2>/dev/null || echo unknown) '==='")
+    lines.append("echo 'Host:' $(hostname 2>/dev/null || echo unknown)")
+    lines.append("echo 'Kernel:' $(uname -r 2>/dev/null || echo unknown)")
+    lines.append("echo 'Shell:' $(readlink /proc/$$/exe 2>/dev/null || echo $SHELL)")
+    lines.append("echo 'PWD:' $(pwd 2>/dev/null || echo unknown)")
+    lines.append("echo 'Python:' $(python3 --version 2>&1 || python --version 2>&1 || echo 'NOT FOUND')")
+    lines.append("echo 'CUDA:' $(nvidia-smi -L 2>/dev/null | head -1 || echo 'NOT DETECTED')")
+    lines.append("echo 'GPU_COUNT env:' ${GPU_COUNT:-NOT SET}")
+    # Handle cd failure explicitly so set -e doesn't hide the error
+    lines.append(f"if cd {shlex.quote(work_dir)} 2>/dev/null; then")
+    lines.append("    echo 'Work dir OK:' $(pwd)")
+    lines.append("else")
+    lines.append(f"    echo 'FATAL: cd to {shlex.quote(work_dir)} failed!'")
+    lines.append("    echo 'Checking /data/ mount...'")
+    lines.append("    ls -la /data/ 2>/dev/null || echo '/data/ NOT accessible'")
+    lines.append("    echo 'Checking /data/AutoResearch/...'")
+    lines.append("    ls -la /data/AutoResearch/ 2>/dev/null || echo '/data/AutoResearch/ NOT accessible'")
+    lines.append("    exit 1")
+    lines.append("fi")
     for k, v in (extra_env or {}).items():
         lines.append(f"export {shlex.quote(k)}={shlex.quote(v)}")
+    # Safety net: auto-detect GPU count if not explicitly set.
+    # This prevents 4-GPU containers from running single-GPU experiments
+    # when GPU_COUNT propagation is broken.
+    lines.append(
+        "if [ -z \"${GPU_COUNT}\" ] || [ \"${GPU_COUNT}\" -le 0 ]; then"
+    )
+    lines.append(
+        "  _DETECTED_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l || echo 0)"
+    )
+    lines.append(
+        "  if [ \"${_DETECTED_GPUS}\" -gt 0 ]; then"
+    )
+    lines.append(
+        "    export GPU_COUNT=\"${_DETECTED_GPUS}\""
+    )
+    lines.append(
+        "    echo '[sco_runner] GPU_COUNT not set — auto-detected:' ${GPU_COUNT} 'GPU(s)'"
+    )
+    lines.append(
+        "  else"
+    )
+    lines.append(
+        "    export GPU_COUNT=1"
+    )
+    lines.append(
+        "    echo '[sco_runner] GPU_COUNT not set, no GPUs detected — defaulting to 1'"
+    )
+    lines.append(
+        "  fi"
+    )
+    lines.append(
+        "fi"
+    )
+    lines.append("echo 'Running experiment script...'")
     lines.append(f"bash {shlex.quote(script_name)}")
+    lines.append("} 2>&1 | tee " + shlex.quote(persistent_log))
     return "\n".join(lines)
 
 
