@@ -49,6 +49,7 @@ class PaperEntry:
     source: str = ""
     abstract: str = ""
     relevance: str = "medium"  # high/medium/low for the review topic
+    code_url: str = ""  # GitHub / code repository URL
 
 
 @dataclass
@@ -61,6 +62,7 @@ class LiteratureLandscape:
     key_metrics: list[str] = field(default_factory=list)
     standard_baselines: list[str] = field(default_factory=list)
     top_cited: list[PaperEntry] = field(default_factory=list)  # top 5 by citations
+    code_papers: list[PaperEntry] = field(default_factory=list)  # papers with code URLs
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +150,9 @@ class LiteratureContext:
             reverse=True,
         )[:5]
 
+        # Papers with code URLs
+        landscape.code_papers = [p for p in landscape.papers if p.code_url]
+
         return landscape
 
     def _parse_paper_block(self, block: str) -> PaperEntry | None:
@@ -224,6 +229,25 @@ class LiteratureContext:
                     abstract_lines.append(line.strip())
         abstract = " ".join(abstract_lines)[:500]
 
+        # Extract code URL (GitHub, GitLab, Bitbucket)
+        code_url = ""
+        code_url_match = re.search(
+            r'(?:github\.com|gitlab\.com|bitbucket\.org)/[\w.-]+/[\w.-]+',
+            block, re.IGNORECASE,
+        )
+        if code_url_match:
+            code_url = "https://" + code_url_match.group(0)
+        else:
+            # Also check for explicit code links
+            for line in lines:
+                m = re.search(
+                    r'https?://(?:github|gitlab|bitbucket)\.(?:com|org)/[\w.-]+/[\w.-]+',
+                    line, re.IGNORECASE,
+                )
+                if m:
+                    code_url = m.group(0)
+                    break
+
         return PaperEntry(
             title=title,
             authors=authors,
@@ -232,6 +256,7 @@ class LiteratureContext:
             citations=citations,
             source=source,
             abstract=abstract,
+            code_url=code_url,
         )
 
     def _extract_key_entities(self, text: str, entity_type: str) -> list[str]:

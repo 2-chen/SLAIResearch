@@ -30,7 +30,9 @@ from config import (
     SCO_QUOTA_TYPE, SCO_PRIORITY,
     SCO_WORKER_SPEC_MAP, DEFAULT_GPU_COUNT,
     MAX_COMPUTE_BUDGET_GPU_HOURS,
+    DOWNLOAD_CACHE_DIR, DOWNLOAD_WHEELS_DIR, DOWNLOAD_DATASETS_DIR,
 )
+from fix_db import FixDatabase
 
 logger = logging.getLogger(__name__)
 
@@ -768,14 +770,334 @@ def run_experiment(
     return _run_sco_path(script_path, job_name, log_dir, extra_env, sco_config)
 
 
+def run_with_debug_loop(
+    script_path: str | Path,
+    job_name: str = "chenresearch",
+    work_dir: str | Path | None = None,
+    log_dir: str | Path | None = None,
+    local_timeout: int = 7200,
+    max_local_retries: int = 20,
+    extra_env: dict[str, str] | None = None,
+    sco_config: "SCOConfig | None" = None,
+    force_sco: bool = False,
+    force_local: bool = False,
+    max_debug_rounds: int = 5,
+    project_slug: str = "",
+) -> ExperimentResult:
+    """Run an experiment with automatic diagnosis-fix-retry loop.
+
+    Wraps run_experiment() with a multi-round debug cycle:
+      1. Run the experiment via run_experiment().
+      2. If success: return immediately.
+      3. If failure:
+         a. Read the error log.
+         b. Query debug memory for similar past errors.
+         c. Match against the known fix database (fix_db.py).
+         d. If match found: apply fix to the shell script, resubmit with
+            '-fixN' suffix on job_name.
+         e. Save a DebugRecord to persistent debug memory.
+         f. If no match: save an unresolved record, then return failure.
+      4. Loop up to max_debug_rounds.
+      5. Return the final ExperimentResult.
+
+    The -fixN suffix convention is already handled by _cleanup_stale_jobs().
+    Debug records are saved to workspace/<project>/debug_memory/records.jsonl.
+    """
+    script_path = Path(script_path).resolve()
+    log_dir = Path(log_dir) if log_dir else (Path(work_dir) if work_dir else script_path.parent) / "logs"
+
+    # Resolve workspace root for debug memory (walk up to find workspace dir)
+    _ws_root = script_path
+    while _ws_root.parent != _ws_root:
+        if (_ws_root / "experiment").is_dir() and _ws_root.name != "experiment":
+            break
+        _ws_root = _ws_root.parent
+    workspace_root = _ws_root if _ws_root.parent != _ws_root else script_path.parent.parent
+
+    # Lazy-init debug memory store
+    _memory: Any = None
+    _memory_ready = False
+
+    def _get_memory() -> Any | None:
+        nonlocal _memory, _memory_ready
+        if _memory_ready:
+            return _memory
+        _memory_ready = True
+        try:
+            from debug_memory import DebugMemoryStore
+            _memory = DebugMemoryStore(workspace_root)
+            return _memory
+        except Exception:
+            return None
+
+    def _save_record(
+        error_text: str,
+        root_cause: str,
+        fix_summary: str,
+        files_modified: list[str],
+        success: bool,
+        fix_round: int,
+        job_id: str,
+        backend: str,
+        error_type_override: str = "",
+    ) -> None:
+        """Save a debug record to persistent memory. Best-effort — never raises."""
+        try:
+            store = _get_memory()
+            if store is None:
+                return
+            from debug_memory import DebugRecord, classify_error, compute_signature
+            error_type = error_type_override or classify_error(error_text)
+            record = DebugRecord(
+                error_signature=compute_signature(error_text, "experiment_execution"),
+                project_slug=project_slug or workspace_root.name,
+                stage="experiment_execution",
+                error_type=error_type,
+                error_message=error_text[:500],
+                error_key_lines=_extract_key_lines(error_text),
+                root_cause=root_cause,
+                fix_summary=fix_summary,
+                files_modified=files_modified,
+                fix_round=fix_round,
+                total_rounds_attempted=max_debug_rounds,
+                success=success,
+                job_id=job_id,
+                backend=backend,
+            )
+            store.save(record)
+            logger.info("Debug record saved: %s | success=%s", error_type, success)
+        except Exception:
+            pass
+
+    def _query_memory(error_text: str) -> str:
+        """Return formatted context from past similar debug records, or ''."""
+        try:
+            store = _get_memory()
+            if store is None:
+                return ""
+            slug = project_slug or workspace_root.name
+            context = store.format_context_for_prompt(
+                error_text, "experiment_execution", slug, limit=3,
+            )
+            return context
+        except Exception:
+            return ""
+
+    applied_fixes: set[str] = set()
+    total_attempts = 0
+    final_result: ExperimentResult | None = None
+    fix_db = FixDatabase()
+
+    for debug_round in range(max_debug_rounds + 1):
+        current_job_name = job_name
+        if debug_round > 0:
+            current_job_name = f"{job_name}-fix{debug_round}"
+
+        logger.info(
+            "Debug round %d/%d: %s (job=%s)",
+            debug_round, max_debug_rounds, script_path.name, current_job_name,
+        )
+        result = run_experiment(
+            script_path=script_path,
+            job_name=current_job_name,
+            work_dir=work_dir,
+            log_dir=log_dir,
+            local_timeout=local_timeout,
+            max_local_retries=max_local_retries,
+            extra_env=extra_env,
+            sco_config=sco_config,
+            force_sco=force_sco,
+            force_local=force_local,
+        )
+        total_attempts += 1
+        final_result = result
+
+        if result.success:
+            logger.info("Experiment succeeded on debug round %d", debug_round)
+            # Save success record if a fix was applied in a prior round
+            if applied_fixes and debug_round > 0:
+                _save_record(
+                    error_text="",
+                    root_cause="Fixed via debug loop",
+                    fix_summary=f"Applied {len(applied_fixes)} fix(es): {', '.join(applied_fixes)}",
+                    files_modified=[str(script_path)],
+                    success=True,
+                    fix_round=debug_round,
+                    job_id=result.job_id,
+                    backend=result.backend,
+                )
+            return ExperimentResult(
+                backend=result.backend,
+                success=True,
+                job_id=result.job_id,
+                log_path=result.log_path,
+                attempts=total_attempts,
+                error_summary="",
+            )
+
+        logger.warning(
+            "Debug round %d FAILED: %s",
+            debug_round, result.error_summary or "(no summary)",
+        )
+
+        # Read error log for diagnosis
+        error_text = ""
+        if result.log_path:
+            log_file = Path(result.log_path)
+            if log_file.exists():
+                try:
+                    error_text = log_file.read_text(encoding="utf-8", errors="replace")[-5000:]
+                except Exception as e:
+                    logger.warning("Could not read error log %s: %s", log_file, e)
+
+        if not error_text:
+            logger.warning("No error log available — cannot diagnose")
+            _save_record(
+                error_text="(no log available)",
+                root_cause="Unknown — no error log",
+                fix_summary="",
+                files_modified=[],
+                success=False,
+                fix_round=debug_round,
+                job_id=result.job_id,
+                backend=result.backend,
+            )
+            break
+
+        if debug_round >= max_debug_rounds:
+            logger.error("Max debug rounds (%d) reached. Giving up.", max_debug_rounds)
+            _save_record(
+                error_text=error_text,
+                root_cause="Max debug rounds exhausted",
+                fix_summary=f"Applied {len(applied_fixes)} fix(es): {', '.join(applied_fixes) or 'none'}",
+                files_modified=[str(script_path)],
+                success=False,
+                fix_round=debug_round,
+                job_id=result.job_id,
+                backend=result.backend,
+            )
+            break
+
+        # Query debug memory for context on similar past errors
+        memory_ctx = _query_memory(error_text)
+        if memory_ctx:
+            logger.info("Debug memory context:\n%s", memory_ctx)
+
+        # Match against known fix database
+        fix = fix_db.match_fix(error_text)
+        if fix is None:
+            logger.warning("No known fix matches the error — cannot auto-fix")
+            _save_record(
+                error_text=error_text,
+                root_cause="Unknown — no matching fix in fix_db",
+                fix_summary="",
+                files_modified=[],
+                success=False,
+                fix_round=debug_round,
+                job_id=result.job_id,
+                backend=result.backend,
+            )
+            break
+
+        if fix.name in applied_fixes:
+            logger.warning("Fix '%s' already applied — not re-applying", fix.name)
+            _save_record(
+                error_text=error_text,
+                root_cause=fix.fix_description,
+                fix_summary=f"Fix '{fix.name}' already applied in round {debug_round}",
+                files_modified=[],
+                success=False,
+                fix_round=debug_round,
+                job_id=result.job_id,
+                backend=result.backend,
+            )
+            break
+
+        logger.info("Matched fix '%s': %s", fix.name, fix.fix_description)
+
+        # Apply fix to the shell script
+        try:
+            modified = fix_db.apply_fix_to_script(script_path, fix)
+        except Exception as e:
+            logger.error("Failed to apply fix '%s': %s", fix.name, e)
+            _save_record(
+                error_text=error_text,
+                root_cause=fix.fix_description,
+                fix_summary=f"Fix application FAILED: {e}",
+                files_modified=[],
+                success=False,
+                fix_round=debug_round,
+                job_id=result.job_id,
+                backend=result.backend,
+            )
+            break
+
+        if not modified:
+            logger.info("Fix '%s' was already applied or could not be injected", fix.name)
+
+        applied_fixes.add(fix.name)
+
+        # Save a debug record for this round
+        _save_record(
+            error_text=error_text,
+            root_cause=fix.fix_description,
+            fix_summary=f"Applied fix '{fix.name}' to {script_path.name}",
+            files_modified=[str(script_path)] if modified else [],
+            success=False,  # Unknown yet — next round will tell
+            fix_round=debug_round + 1,
+            job_id=result.job_id,
+            backend=result.backend,
+        )
+
+    # All rounds exhausted or unrecoverable error
+    if final_result is None:
+        final_result = ExperimentResult(
+            backend="sco", success=False,
+            error_summary="Debug loop ended without any experiment run",
+            attempts=total_attempts,
+        )
+
+    return ExperimentResult(
+        backend=final_result.backend,
+        success=False,
+        job_id=final_result.job_id,
+        log_path=final_result.log_path,
+        attempts=total_attempts,
+        error_summary=(
+            f"Debug loop exhausted after {total_attempts} attempt(s) "
+            f"({len(applied_fixes)} fix(es) applied: {', '.join(applied_fixes) or 'none'}). "
+            f"Last error: {final_result.error_summary}"
+        ),
+    )
+
+
+def _extract_key_lines(error_text: str, max_lines: int = 5) -> list[str]:
+    """Extract the most informative lines from an error traceback."""
+    lines: list[str] = []
+    for line in error_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Prioritize: Error lines, traceback file references
+        if any(kw in stripped for kw in (
+            "Error:", "Error ", "Traceback", "File \"",
+            "ModuleNotFoundError", "ImportError",
+        )):
+            lines.append(stripped[:200])
+    if not lines:
+        # Fallback: last few non-empty lines
+        lines = [l.strip()[:200] for l in error_text.splitlines() if l.strip()][-max_lines:]
+    return lines[:max_lines]
+
+
 def _ensure_wheels() -> bool:
     """Ensure shared wheel cache is populated. Returns True if wheels are ready.
 
-    Checks /data/AutoResearch/ChenResearch/workspace/.shared/wheels/ —
+    Checks /data/AutoResearch/ChenResearch/workspace/.shared/cache/wheels/ —
     if empty, runs the download script (which auto-detects VPN if needed).
     This is called before SCO submission so containers install offline.
     """
-    shared_wheels = Path("/data/AutoResearch/ChenResearch/workspace/.shared/wheels")
+    shared_wheels = Path(DOWNLOAD_WHEELS_DIR) if DOWNLOAD_WHEELS_DIR else Path("/data/AutoResearch/ChenResearch/workspace/.shared/cache/wheels")
     download_script = Path("/data/AutoResearch/ChenResearch/workspace/.shared/download_wheels.sh")
 
     # Already populated?
@@ -809,6 +1131,132 @@ def _ensure_wheels() -> bool:
     except Exception as e:
         logger.warning("Wheel download error: %s", e)
         return False
+
+
+def _ensure_model_cache(script_path: Path) -> bool:
+    """Pre-download models referenced in an experiment script before SCO submission.
+
+    Scans the script for download_hf_model / download_model.sh calls and
+    pre-caches model weights into shared storage so the SCO container can
+    access them without network.
+    """
+    try:
+        from model_downloader import ThreeLayerDownloader
+
+        dl = ThreeLayerDownloader()
+        results = dl.pre_cache_from_script(str(script_path))
+
+        succeeded = sum(1 for r in results if r.success)
+        failed = sum(1 for r in results if not r.success)
+
+        if results:
+            logger.info("Model cache pre-check: %d succeeded, %d failed", succeeded, failed)
+            for r in results:
+                if not r.success:
+                    logger.warning("Model pre-cache FAILED: %s (%s)", r.model_id, r.error)
+        else:
+            logger.info("Model cache pre-check: no models found in script")
+
+        return failed == 0
+    except ImportError:
+        logger.info("model_downloader not available — skipping model pre-cache")
+        return True
+    except Exception as e:
+        logger.warning("Model cache pre-check error (non-fatal): %s", e)
+        return True
+
+
+def _ast_str_value(node) -> str | None:
+    """Extract a string literal value from an AST node."""
+    import ast as _ast
+    if isinstance(node, _ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _parse_datasets_from_data_utils(data_utils_path: Path) -> list[tuple[str, str | None]]:
+    """Extract (dataset_path, subset) tuples from TaskConfig definitions.
+
+    Uses AST parsing so it works without importing data_utils (which has
+    heavy torch/transformers deps that may not be installed).
+    """
+    import ast as _ast
+
+    try:
+        tree = _ast.parse(data_utils_path.read_text())
+    except SyntaxError as e:
+        logger.warning("Cannot parse %s: %s", data_utils_path, e)
+        return []
+
+    datasets: set[tuple[str, str | None]] = set()
+
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Call):
+            func = node.func
+            if isinstance(func, _ast.Name) and func.id == "TaskConfig":
+                args = node.args
+                if len(args) >= 2:
+                    path = _ast_str_value(args[1])
+                    subset = _ast_str_value(args[2]) if len(args) >= 3 else None
+                    if path:
+                        datasets.add((path, subset))
+
+    return list(datasets)
+
+
+def _ensure_dataset_cache(script_path: Path) -> bool:
+    """Ensure datasets are available for offline SCO execution.
+
+    First checks if the pre-built tarball exists in shared cache (fast path).
+    Only falls back to network download if the tarball is missing.
+    The tarball is extracted to ~/.cache/huggingface/ at experiment startup
+    because AFS doesn't support flock() used by the datasets library.
+    """
+    script_dir = script_path if script_path.is_dir() else script_path.parent
+    data_utils_path = script_dir / "data_utils.py"
+    if not data_utils_path.exists():
+        logger.info("No data_utils.py in %s — skipping dataset pre-cache", script_dir)
+        return True
+
+    # ── Fast path: pre-built tarball exists ──
+    from config import DOWNLOAD_CACHE_DIR
+    tarball = Path(DOWNLOAD_CACHE_DIR) / "datasets_cache.tar.gz"
+    if tarball.exists():
+        import stat as _stat
+        size_mb = round(tarball.stat().st_size / (1024 * 1024), 1)
+        logger.info("Dataset tarball found: %s (%d MB) — skipping network download", tarball, size_mb)
+        # Verify the tarball contains the expected datasets by checking configs
+        datasets = _parse_datasets_from_data_utils(data_utils_path)
+        logger.info("  %d datasets covered by tarball (extract at experiment startup)", len(datasets))
+        return True
+
+    # ── Slow path: tarball missing, try network download ──
+    datasets = _parse_datasets_from_data_utils(data_utils_path)
+    if not datasets:
+        logger.info("No dataset references found in %s", data_utils_path.name)
+        return True
+
+    logger.warning("Dataset tarball NOT found at %s — falling back to network download", tarball)
+    try:
+        from model_downloader import ThreeLayerDownloader
+        dl = ThreeLayerDownloader()
+    except ImportError as e:
+        logger.warning("model_downloader not available — skipping dataset cache: %s", e)
+        return True
+
+    succeeded = 0
+    for dataset_path, subset in datasets:
+        logger.info("Pre-caching dataset: %s (subset=%s)", dataset_path, subset or "none")
+        result = dl.download_dataset(dataset_path, subset)
+        if result.success:
+            succeeded += 1
+            logger.info("  Dataset %s cached via %s", dataset_path, result.layer_used)
+        else:
+            logger.warning("  Dataset %s FAILED: %s", dataset_path, result.error)
+
+    total = len(datasets)
+    logger.info("Dataset pre-cache: %d/%d succeeded, %d failed", succeeded, total, total - succeeded)
+    return succeeded == total
 
 
 def _cleanup_stale_jobs(job_name_prefix: str) -> int:
@@ -876,54 +1324,148 @@ def _cleanup_stale_jobs(job_name_prefix: str) -> int:
 
 
 def _prepare_env_for_sco(experiment_dir: Path) -> bool:
-    """Pre-install missing Python packages to shared site-packages.
+    """Pre-install ALL missing Python packages to shared site-packages.
 
-    Scans the experiment's Python files for third-party imports and runs
-    prepare_env.sh to install anything not already in the SCO container image
-    or shared site-packages.  This MUST happen before SCO submission so the
-    container can run with CHENRESEARCH=1 (zero pip install).
+    Scans ALL experiment .py files AND requirements.txt for dependencies,
+    pre-installs anything not already in the SCO container image or shared
+    site-packages.  This MUST succeed before SCO submission so the container
+    can run with CHENRESEARCH=1 (zero pip install at runtime).
     """
     prepare_env_sh = Path("/data/AutoResearch/ChenResearch/workspace/.shared/prepare_env.sh")
     if not prepare_env_sh.exists():
         logger.warning("prepare_env.sh not found at %s — skipping env prep", prepare_env_sh)
         return False
 
-    # Collect all .py files in the experiment directory
+    # ── 1. Run from-imports on ALL .py files (not just the first one) ──
     py_files = sorted(experiment_dir.glob("*.py"))
     if not py_files:
         logger.warning("No .py files found in %s — skipping env prep", experiment_dir)
         return False
 
-    # Run prepare_env.sh --from-imports on the main experiment file.
-    # The main file typically imports everything needed; scanning all .py
-    # files would be redundant for most experiment layouts.
-    main_py = experiment_dir / "experiment.py"
-    target = main_py if main_py.exists() else py_files[0]
-
-    logger.info("Pre-installing packages from imports in %s ...", target.name)
-    try:
-        result = subprocess.run(
-            ["bash", str(prepare_env_sh), "--from-imports", str(target)],
-            capture_output=True, text=True, timeout=300,
-        )
-        if result.returncode == 0:
-            logger.info("Environment pre-configuration complete for %s", experiment_dir.name)
-            return True
-        else:
-            # Non-zero exit — log but don't block (container may still work
-            # if packages are already available or not actually needed).
-            logger.warning(
-                "prepare_env.sh exited %d for %s: %s",
-                result.returncode, experiment_dir.name,
-                (result.stderr or result.stdout)[:500],
+    all_imports: set[str] = set()
+    for py_file in py_files:
+        logger.info("Scanning imports from %s ...", py_file.name)
+        try:
+            result = subprocess.run(
+                ["bash", str(prepare_env_sh), "--from-imports", str(py_file)],
+                capture_output=True, text=True, timeout=300,
             )
-            return False
-    except subprocess.TimeoutExpired:
-        logger.warning("prepare_env.sh timed out for %s", experiment_dir.name)
+            output = (result.stdout or "") + (result.stderr or "")
+            # Extract missing packages from prepare_env.sh output
+            for line in output.split("\n"):
+                if "Installing" in line or "Missing" in line:
+                    logger.info("  %s", line.strip()[:120])
+        except Exception as e:
+            logger.warning("prepare_env.sh error for %s: %s", py_file.name, e)
+
+    # ── 2. Offline-first install from requirements.txt ──
+    req_file = experiment_dir / "requirements.txt"
+    if req_file.exists():
+        site_packages = "/data/AutoResearch/ChenResearch/env/site-packages"
+        wheels_dir = str(Path(DOWNLOAD_CACHE_DIR) / "wheels")
+        find_links = f"--find-links={wheels_dir}" if Path(wheels_dir).exists() else ""
+        logger.info("Pre-installing from requirements.txt (offline-first)...")
+
+        # Try offline first (no network, use cached wheels)
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-r", str(req_file),
+                 "--target", site_packages, "-q", "--no-index", find_links,
+                 "--no-deps"],
+                capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode == 0:
+                logger.info("requirements.txt installed (offline/from cache)")
+            else:
+                logger.info("requirements.txt offline incomplete — %d packages still needed, trying online...",
+                           len([l for l in (result.stderr+result.stdout).split('\n') if 'ERROR' in l]))
+        except subprocess.TimeoutExpired:
+            pass  # offline timed out, try online
+        except Exception:
+            pass
+
+        # Only try online if needed (with short timeout, non-fatal)
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-r", str(req_file),
+                 "--target", site_packages, "-q", "--no-deps"],
+                capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode == 0:
+                logger.info("requirements.txt installed (online)")
+        except subprocess.TimeoutExpired:
+            logger.info("requirements.txt online timed out — skipping (critical packages handled separately)")
+        except Exception as e:
+            pass
+
+    # ── 3. Auto-install missing critical packages ──
+    _ensure_critical_packages()
+
+    # ── 4. Hard verification: are packages actually in site-packages? ──
+    # Use directory check (NOT import — triggers torch CUDA loading).
+    site_packages = "/data/AutoResearch/ChenResearch/env/site-packages"
+    missing = []
+    for pkg, import_name in [("datasets", "datasets"), ("accelerate", "accelerate"),
+                               ("scikit-learn", "sklearn")]:
+        if not (Path(site_packages) / import_name).exists() and \
+           not list(Path(site_packages).glob(f"{import_name}-*.dist-info")):
+            missing.append(pkg)
+
+    if missing:
+        logger.error("CRITICAL packages still missing from site-packages: %s", missing)
+        logger.error("SCO container will fail. Run env prep locally with network first.")
         return False
-    except Exception as e:
-        logger.warning("prepare_env.sh failed for %s: %s", experiment_dir.name, e)
-        return False
+
+    logger.info("Environment verified: all critical packages in %s", site_packages)
+    logger.info("Environment pre-configuration complete for %s", experiment_dir.name)
+    return True
+
+
+def _ensure_critical_packages() -> None:
+    """Ensure critical Python packages are available in shared site-packages.
+
+    Uses directory-based detection (NOT import) because importing packages
+    like accelerate triggers torch CUDA loading which takes 60+ seconds
+    on CPU-only machines and causes subprocess timeouts.
+    """
+    site_packages = "/data/AutoResearch/ChenResearch/env/site-packages"
+    critical = ["datasets", "accelerate", "sentence-transformers", "scikit-learn"]
+
+    for pkg in critical:
+        pkg_import = pkg.replace("-", "_")
+        sp_dir = Path(site_packages)
+
+        # Fast check: does package directory or dist-info exist?
+        pkg_dir = sp_dir / pkg_import
+        dist_matches = list(sp_dir.glob(f"{pkg_import}-*.dist-info"))
+        if pkg_dir.exists() or dist_matches:
+            continue  # Already installed to site-packages
+
+        # Also check if importable from default python (lazy, avoid if possible)
+        try:
+            # Use a quick python -c that exits fast if pkg isn't there
+            r = subprocess.run(
+                [sys.executable, "-c",
+                 f"import importlib.util; print('ok' if importlib.util.find_spec('{pkg_import}') else 'no')"],
+                capture_output=True, timeout=5,
+            )
+            if r.returncode == 0 and b"ok" in r.stdout:
+                continue  # Already in system python path
+        except subprocess.TimeoutExpired:
+            pass  # fall through to install
+        except Exception:
+            pass
+
+        logger.info("Pre-installing critical package: %s", pkg)
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", pkg,
+                 "--target", site_packages, "-q"],
+                capture_output=True, text=True, timeout=120,
+            )
+            logger.info("  %s installed", pkg)
+        except Exception as e:
+            logger.warning("  %s install failed: %s", pkg, e)
 
 
 def _run_sco_path(
@@ -960,7 +1502,29 @@ def _run_sco_path(
     _ensure_wheels()
 
     # ── Pre-submission: pre-install missing packages to shared site-packages ──
-    _prepare_env_for_sco(script_path.parent)
+    if not _prepare_env_for_sco(script_path.parent):
+        logger.error("ENVIRONMENT PREP FAILED — critical packages missing from site-packages.")
+        logger.error("Run env prep locally first: bash start.sh → select project → env prep.")
+        return ExperimentResult(
+            backend="sco", success=False,
+            error_summary="Environment preparation failed: critical packages missing. "
+                          "Run env prep locally with network access, then re-submit.",
+        )
+
+    # ── Pre-submission: pre-download models referenced in experiment script ──
+    _ensure_model_cache(script_path)
+
+    # ── Pre-submission: pre-download datasets to shared cache ──
+    _ensure_dataset_cache(script_path)
+
+    # ── Set offline mode for SCO containers (no network in cloud nodes) ──
+    if extra_env is None:
+        extra_env = {}
+    extra_env.setdefault("HF_DATASETS_OFFLINE", "1")
+    extra_env.setdefault(
+        "HF_DATASETS_CACHE",
+        str(Path(DOWNLOAD_DATASETS_DIR)),
+    )
 
     # ── Pre-submission: clean up stale terminal jobs from previous attempts ──
     _cleanup_stale_jobs(job_name)
@@ -1472,6 +2036,7 @@ def _build_remote_command(work_dir: str, script_name: str, extra_env: dict[str, 
     lines.append("echo 'Python:' $(python3 --version 2>&1 || python --version 2>&1 || echo 'NOT FOUND')")
     lines.append("echo 'CUDA:' $(nvidia-smi -L 2>/dev/null | head -1 || echo 'NOT DETECTED')")
     lines.append("echo 'GPU_COUNT env:' ${GPU_COUNT:-NOT SET}")
+    lines.append("echo 'HF_DATASETS_OFFLINE:' ${HF_DATASETS_OFFLINE:-NOT SET}")
     # Handle cd failure explicitly so set -e doesn't hide the error
     lines.append(f"if cd {shlex.quote(work_dir)} 2>/dev/null; then")
     lines.append("    echo 'Work dir OK:' $(pwd)")

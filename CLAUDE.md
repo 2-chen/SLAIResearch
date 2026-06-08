@@ -10,7 +10,19 @@
 python search_papers.py "research query" -o workspace/<topic>/literature/
 ```
 这会自动调用 arXiv + Semantic Scholar + OpenAlex，生成 `literature_review.md` + `references.bib`。
+- 新增可选来源: `--google-scholar` (Google Scholar)、`--datacite` (数据集/软件)
+- 新增过滤选项: `--year-start YYYY --year-end YYYY`、`--summary`
 - WebSearch 仅作补充
+
+### 引用工具（全部免费，无需 API Key）
+```bash
+python citation_tools.py doi-to-bibtex <DOI>            # CrossRef -> BibTeX
+python citation_tools.py extract --doi <DOI>             # 结构化元数据提取
+python citation_tools.py extract --arxiv <arXiv_ID>      # arXiv ID -> 元数据
+python citation_tools.py verify --file <markdown_file>   # DOI 验证 + APA/Nature 引用格式化
+python citation_tools.py scholar "<query>"               # Google Scholar 搜索 (需 pip install scholarly)
+python citation_tools.py datacite <DOI_or_query>          # DataCite 数据集/软件 DOI 查询
+```
 
 ### SCO 云端 GPU
 - `sco acp jobs create` — 提交训练任务

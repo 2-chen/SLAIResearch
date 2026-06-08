@@ -70,6 +70,7 @@ logging.basicConfig(
 _OUTPUT_FILE_MAP: dict[Stage, str] = {
     Stage.LITERATURE_SEARCH: "literature/literature_review.md",
     Stage.HYPOTHESIS_GENERATION: "hypothesis/hypothesis_output.json",
+    Stage.BASELINE_FETCHING: "experiment/baseline_context.md",
     Stage.EXPERIMENT_DESIGN: "experiment/experiment_plan.md",
     Stage.EXPERIMENT_EXECUTION: "experiment/experiment_results.json",
     Stage.PAPER_WRITING: "paper",
@@ -79,6 +80,7 @@ _OUTPUT_FILE_MAP: dict[Stage, str] = {
 _PROCESSING_STAGES = [
     Stage.LITERATURE_SEARCH,
     Stage.HYPOTHESIS_GENERATION,
+    Stage.BASELINE_FETCHING,
     Stage.EXPERIMENT_DESIGN,
     Stage.EXPERIMENT_EXECUTION,
     Stage.PAPER_WRITING,
@@ -268,6 +270,8 @@ def _run_pipeline(sm: StateManager, state: ResearchState) -> None:
              f"{state.literature_dir}/literature_review.md"),
             (Stage.HYPOTHESIS_GENERATION, STAGE_HANDLERS[Stage.HYPOTHESIS_GENERATION],
              f"{state.hypothesis_dir}/hypothesis_output.json"),
+            (Stage.BASELINE_FETCHING, STAGE_HANDLERS[Stage.BASELINE_FETCHING],
+             f"{state.experiment_dir}/baseline_context.md"),
             (Stage.EXPERIMENT_DESIGN, STAGE_HANDLERS[Stage.EXPERIMENT_DESIGN],
              f"{state.experiment_dir}/experiment_plan.md"),
             (Stage.EXPERIMENT_EXECUTION, STAGE_HANDLERS[Stage.EXPERIMENT_EXECUTION], None),
@@ -676,12 +680,89 @@ def _do_hypothesis_generation(sm: StateManager, state: ResearchState, retry_feed
     })
 
 
+def _do_baseline_fetching(sm: StateManager, state: ResearchState, retry_feedback: str = "") -> ResearchState:
+    """Clone baseline GitHub repos for structural reference in experiment design."""
+    from config import BASELINE_CLONING_ENABLED, BASELINE_MAX_REPOS
+
+    if not BASELINE_CLONING_ENABLED:
+        logger.info("Baseline cloning disabled — skipping")
+        (Path(state.experiment_dir) / "baseline_context.md").write_text("")
+        return sm.complete_stage(state, Stage.BASELINE_FETCHING, {"skipped": True})
+
+    try:
+        from literature_context import LiteratureContext
+        lc = LiteratureContext(state.work_dir)
+        landscape = lc._parse_literature()
+        papers = landscape.papers if landscape else []
+    except Exception as e:
+        logger.warning("Could not parse literature for baselines: %s", e)
+        papers = []
+
+    # Extract baseline method names from hypothesis output
+    method_names: list[str] = []
+    hypo_file = Path(state.hypothesis_dir) / "hypothesis_output.json"
+    if hypo_file.exists():
+        try:
+            import json
+            hypo = json.loads(hypo_file.read_text())
+            for h in hypo.get("hypotheses", []):
+                if isinstance(h, dict):
+                    baselines = h.get("baselines", []) or h.get("baseline_methods", [])
+                    if isinstance(baselines, list):
+                        method_names.extend(baselines)
+        except Exception:
+            pass
+
+    # Also try to extract from experiment plan if it exists (from literature context)
+    if not method_names and papers:
+        method_names = list(landscape.standard_baselines) if landscape else []
+
+    if not method_names:
+        logger.info("No baseline method names found — skipping baseline fetching")
+        (Path(state.experiment_dir) / "baseline_context.md").write_text("")
+        return sm.complete_stage(state, Stage.BASELINE_FETCHING, {"skipped": True, "reason": "no methods found"})
+
+    logger.info("Fetching baseline repos for %d methods...", len(method_names))
+    try:
+        from baseline_finder import BaselineFinder
+        bf = BaselineFinder(
+            cache_dir=Path(state.work_dir) / ".." / ".shared" / "baselines",
+            max_repos=BASELINE_MAX_REPOS,
+        )
+        contexts = bf.find_and_extract(papers=papers, method_names=method_names[:BASELINE_MAX_REPOS])
+        prompt_block = bf.format_for_prompt(contexts)
+
+        output_path = Path(state.experiment_dir) / "baseline_context.md"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(prompt_block)
+        logger.info("Baseline context saved (%d chars, %d repos)", len(prompt_block), len(contexts))
+
+        return sm.complete_stage(state, Stage.BASELINE_FETCHING, {
+            "repos_found": len(contexts),
+            "methods_searched": len(method_names[:BASELINE_MAX_REPOS]),
+        })
+    except Exception as e:
+        logger.warning("Baseline fetching failed (non-fatal): %s", e)
+        (Path(state.experiment_dir) / "baseline_context.md").write_text("")
+        return sm.complete_stage(state, Stage.BASELINE_FETCHING, {
+            "error": str(e)[:200], "repos_found": 0,
+        })
+
+
 def _do_experiment_design(sm: StateManager, state: ResearchState, retry_feedback: str = "") -> ResearchState:
     lit = _read_or(state.literature_dir, "literature_review.md")
+
+    # Load baseline context if available
+    baseline_ctx = ""
+    baseline_path = Path(state.experiment_dir) / "baseline_context.md"
+    if baseline_path.exists():
+        baseline_ctx = baseline_path.read_text()
+
     prompt = _load_prompt("experiment_design.md",
         TOPIC=state.topic,
         LITERATURE_REVIEW=lit[:30000],
         OUTPUT_DIR=state.experiment_dir,
+        BASELINE_CONTEXT=baseline_ctx if baseline_ctx else "*(No baseline repository references available — design baselines from literature descriptions only.)*",
     )
     logger.info("Calling Claude Code for experiment design …")
     return _call_claude(sm, state, Stage.EXPERIMENT_DESIGN, prompt, retry_feedback)
@@ -1073,6 +1154,7 @@ def _do_revise(sm: StateManager, state: ResearchState, retry_feedback: str = "")
 STAGE_HANDLERS = {
     Stage.LITERATURE_SEARCH: _do_literature_search,
     Stage.HYPOTHESIS_GENERATION: _do_hypothesis_generation,
+    Stage.BASELINE_FETCHING: _do_baseline_fetching,
     Stage.EXPERIMENT_DESIGN: _do_experiment_design,
     Stage.EXPERIMENT_EXECUTION: _do_experiment_execution,
     Stage.PAPER_WRITING: _do_paper_writing,

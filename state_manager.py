@@ -24,7 +24,9 @@ logger = logging.getLogger(__name__)
 class Stage(str, Enum):
     LITERATURE_SEARCH = "literature_search"
     HYPOTHESIS_GENERATION = "hypothesis_generation"
+    BASELINE_FETCHING = "baseline_fetching"
     EXPERIMENT_DESIGN = "experiment_design"
+    ENVIRONMENT_PREPARATION = "environment_preparation"
     EXPERIMENT_EXECUTION = "experiment_execution"
     PAPER_WRITING = "paper_writing"
     SUBMIT_REVIEW = "submit_review"

@@ -74,6 +74,20 @@ SCO_WORKER_SPEC_MAP = {
 DEFAULT_GPU_COUNT = int(os.environ.get("CHENRESEARCH_DEFAULT_GPU_COUNT", "1"))
 
 # ---------------------------------------------------------------------------
+# Baseline GitHub cloning (structural reference for LLM experiment design)
+# ---------------------------------------------------------------------------
+
+BASELINE_CLONING_ENABLED = os.environ.get(
+    "CHENRESEARCH_BASELINE_CLONING", "true",
+).lower() in ("1", "true", "yes")
+
+BASELINE_MAX_REPOS = int(os.environ.get("CHENRESEARCH_BASELINE_MAX_REPOS", "5"))
+BASELINE_CACHE_SIZE_MB = int(os.environ.get("CHENRESEARCH_BASELINE_CACHE_MB", "500"))
+BASELINE_CLONE_TIMEOUT = int(os.environ.get("CHENRESEARCH_BASELINE_CLONE_TIMEOUT", "60"))
+
+GITHUB_API_TOKEN = os.environ.get("GITHUB_API_TOKEN", "")
+
+# ---------------------------------------------------------------------------
 # Pipeline tuning
 # ---------------------------------------------------------------------------
 
@@ -171,3 +185,47 @@ REVISION_CONVERGENCE_THRESHOLD = float(os.environ.get(
 GROUNDING_PROTECTION_ENABLED = os.environ.get(
     "CHENRESEARCH_GROUNDING_PROTECTION", "true",
 ).lower() in ("1", "true", "yes")
+
+# ---------------------------------------------------------------------------
+# Model / dataset download (three-layer fallback: direct → mirror → VPN)
+# ---------------------------------------------------------------------------
+
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
+HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")
+
+# ── Download cache ──
+# All downloaded resources (models, datasets, wheels) go here.
+# Structure:  cache/models/  cache/datasets/  cache/wheels/
+DOWNLOAD_CACHE_DIR = os.environ.get(
+    "CHENRESEARCH_DOWNLOAD_CACHE",
+    os.path.join(os.path.dirname(__file__), "workspace", ".shared", "cache"),
+)
+DOWNLOAD_MODELS_DIR = os.path.join(DOWNLOAD_CACHE_DIR, "models")
+DOWNLOAD_DATASETS_DIR = os.path.join(DOWNLOAD_CACHE_DIR, "datasets")
+DOWNLOAD_WHEELS_DIR = os.path.join(DOWNLOAD_CACHE_DIR, "wheels")
+DOWNLOAD_TIMEOUT = int(os.environ.get("CHENRESEARCH_DOWNLOAD_TIMEOUT", "300"))
+DOWNLOAD_RETRY_COUNT = int(os.environ.get("CHENRESEARCH_DOWNLOAD_RETRIES", "2"))
+
+PROXY_URL = os.environ.get("CHENRESEARCH_PROXY_URL", "http://127.0.0.1:7890")
+
+# ---------------------------------------------------------------------------
+# Citation tools — CrossRef / Google Scholar / DataCite (all FREE, no API keys)
+# ---------------------------------------------------------------------------
+
+CROSSREF_RATE_LIMIT_DELAY = float(os.environ.get(
+    "CROSSREF_RATE_LIMIT_DELAY", "0.1",
+))
+"""Delay between CrossRef API requests (seconds).  0.1 = 10 req/s is well
+within the polite-use limit."""
+
+SCHOLARLY_MAX_RESULTS = int(os.environ.get(
+    "CHENRESEARCH_SCHOLARLY_MAX_RESULTS", "50",
+))
+"""Max results from Google Scholar per query.  scholarly scrapes Google Scholar
+and rate-limiting is aggressive — keep this moderate."""
+
+DATACITE_RATE_LIMIT_DELAY = float(os.environ.get(
+    "DATACITE_RATE_LIMIT_DELAY", "0.2",
+))
+"""Delay between DataCite API requests (seconds).  DataCite has no stated hard
+limit for unauthenticated access; 0.2 s is polite."""

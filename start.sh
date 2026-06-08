@@ -272,6 +272,16 @@ json.dump(result, open('/tmp/cr_review_result.json', 'w'), ensure_ascii=False)
     fi
 }
 
+# ---- _render_prompt: render a prompt template via prompt_render.py ----
+# Usage: _render_prompt <template_name> <output_file>
+# Variables in the template (${VAR}) are read from the environment.
+# Use inline env vars: VAR1="$val1" VAR2="$val2" _render_prompt "file.md" /tmp/out.txt
+_render_prompt() {
+    local template="$1"
+    local output="$2"
+    python "${SCRIPT_DIR}/prompt_render.py" "${SCRIPT_DIR}/prompts/${template}" > "$output"
+}
+
 # ---- _stage_retry_fix: re-run a stage with review feedback via Claude ----
 # Usage: _stage_retry_fix <stage_label> <output_file> [extra_context]
 _stage_retry_fix() {
@@ -282,23 +292,10 @@ _stage_retry_fix() {
     echo ""
     echo -e "${YELLOW}[review] Re-running ${stage_label} with review feedback...${NC}"
 
-    cat > /tmp/cr_stage_fix.txt << PROMPT_EOF
-You are a research quality improvement agent fixing issues found by a stage review.
-
-**Research Topic**: ${TOPIC}
-**Stage**: ${stage_label}
-**Review Score**: ${REVIEW_SCORE}/10
-**Issues Found**: ${REVIEW_FEEDBACK}
-**Suggested Fixes**: ${REVIEW_SUGGESTION}
-**Context**: ${extra_context}
-
-Your task:
-1. Read the current output: ${output_file}
-2. Address ALL issues raised in the review feedback
-3. Make substantive improvements — do NOT just reword text; add missing content, fix structural issues, correct inaccuracies
-4. Overwrite ${output_file} with the improved version
-5. Report "STAGE_FIX_COMPLETE" when done
-PROMPT_EOF
+    TOPIC="$TOPIC" stage_label="$stage_label" REVIEW_SCORE="$REVIEW_SCORE" \
+      REVIEW_FEEDBACK="$REVIEW_FEEDBACK" REVIEW_SUGGESTION="$REVIEW_SUGGESTION" \
+      extra_context="$extra_context" output_file="$output_file" \
+      _render_prompt "stage_review_fix.md" /tmp/cr_stage_fix.txt
     _claude_task "$(cat /tmp/cr_stage_fix.txt)"
 }
 
@@ -330,22 +327,8 @@ except Exception:
     echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
 
-    cat > /tmp/cr_recover_prompt.txt << PROMPT_EOF
-你是 ChenResearch 科研系统的故障恢复助手。流水线在 **${stage}** 阶段出错。
-
-**错误信息**:
-${err_msg}
-
-**工作目录**: ${ws}
-
-**你的任务**:
-1. 检查工作目录下的文件，理解当前状态
-2. 诊断错误原因并尝试修复
-3. 如果修复成功，报告 "RECOVERY_OK"
-4. 如果无法修复，报告 "RECOVERY_FAILED" 并说明原因
-
-**关键**: 项目文件和工作目录都已保留，修复后流水线会继续。不要重新执行已完成的阶段。
-PROMPT_EOF
+    stage="$stage" err_msg="$err_msg" ws="$ws" \
+      _render_prompt "recovery.md" /tmp/cr_recover_prompt.txt
 
     if _claude_task "$(cat /tmp/cr_recover_prompt.txt)" 2>&1 | grep -q "RECOVERY_OK"; then
         echo -e "${GREEN}Claude Code 修复成功，继续流水线${NC}"
@@ -353,6 +336,68 @@ PROMPT_EOF
         echo -e "${YELLOW}Claude Code 无法完全修复，但项目已保留${NC}"
         echo -e "${YELLOW}后续阶段将继续执行（跳过当前阶段）${NC}"
     fi
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# ---- _do_environment_preparation: 预下载 wheels / 模型 / 数据集 ----
+# 在 SCO 提交前，本地下载所有依赖（利用本地的镜像/VPN网络），
+# 确保 SCO 容器可以在离线模式下直接使用缓存。
+_do_environment_preparation() {
+    local exp_dir="${1:-${WORKSPACE}/experiment}"
+    local exp_script="${exp_dir}/run_experiment.sh"
+
+    echo -e "${CYAN}━━━ 环境准备：预下载依赖 ━━━${NC}"
+    echo ""
+
+    # ── 1. Wheels ──
+    echo "[1/3] 检查/下载 Python wheels..."
+    python -c "
+from sco_runner import _ensure_wheels
+_ensure_wheels()
+print('  Wheels OK')
+" 2>&1 || echo "  Wheels 检查完成（部分可能未命中）"
+
+    # ── 2. Models ──
+    echo "[2/3] 预下载模型..."
+    if [[ -f "$exp_script" ]]; then
+        python -c "
+from sco_runner import _ensure_model_cache
+from pathlib import Path
+ok = _ensure_model_cache(Path('$exp_script'))
+print('  Models OK' if ok else '  Models 部分失败（非致命）')
+" 2>&1 || echo "  Models 预下载跳过"
+    else
+        echo "  未找到 run_experiment.sh，跳过模型预下载"
+    fi
+
+    # ── 3. Datasets ──
+    echo "[3/3] 预下载数据集..."
+    if [[ -f "$exp_script" ]]; then
+        python -c "
+from sco_runner import _ensure_dataset_cache
+from pathlib import Path
+ok = _ensure_dataset_cache(Path('$exp_script'))
+print('  Datasets OK' if ok else '  Datasets 部分失败（非致命）')
+" 2>&1 || echo "  Datasets 预下载跳过"
+    else
+        echo "  未找到 run_experiment.sh，跳过数据集预下载"
+    fi
+
+    # ── 4. 预安装 Python 包到共享 site-packages ──
+    echo ""
+    echo "[Extra] 预安装缺失的 Python 包..."
+    if [[ -d "$exp_dir" ]]; then
+        python -c "
+from sco_runner import _prepare_env_for_sco
+from pathlib import Path
+ok = _prepare_env_for_sco(Path('$exp_dir'))
+print('  Env prep OK' if ok else '  Env prep 部分失败（非致命）')
+" 2>&1 || echo "  Env prep 跳过"
+    fi
+
+    echo ""
+    echo -e "${GREEN}  环境准备完成。依赖已缓存到共享存储，SCO 容器可直接使用。${NC}"
     echo ""
 }
 
@@ -371,15 +416,21 @@ meta = ee.get('meta',{})
 print(meta.get('backend') or ee.get('backend') or 'sco')
 " 2>/dev/null)
 
-    # 从 state 中获取 job_id (仅 SCO 场景) — 从 meta 子对象读取，向下兼容顶层
+    # 从 sco_job_id.txt 读取最新任务 ID（优先），回退到 state.json
+    JOB_ID_FILE="${WORKSPACE}/experiment/logs/sco_job_id.txt"
     if [[ "$BACKEND" == "sco" ]]; then
-        JOB_ID=$(python -c "
+        if [[ -f "$JOB_ID_FILE" ]]; then
+            JOB_ID=$(cat "$JOB_ID_FILE" | tr -d '[:space:]')
+            echo "从 sco_job_id.txt 读取最新任务: ${JOB_ID}"
+        else
+            JOB_ID=$(python -c "
 import json
 d = json.load(open('state/${SLUG}/state.json'))
 ee = d.get('stages',{}).get('experiment_execution',{})
 meta = ee.get('meta',{})
 print(meta.get('job_id') or ee.get('job_id') or '')
 " 2>/dev/null)
+        fi
     else
         JOB_ID=""
     fi
@@ -412,6 +463,23 @@ sm.complete_stage(state, Stage.EXPERIMENT_EXECUTION, {'backend': '${BACKEND}', '
             echo -e "${YELLOW}未找到本地日志，重新执行实验（本地优先）...${NC}"
             EXP_SCRIPT="${WORKSPACE}/experiment/run_experiment.sh"
             if [[ -f "$EXP_SCRIPT" ]]; then
+                # ── Preflight + Resource Scheduling ──
+                echo ""
+                echo -e "${CYAN}━━━ 执行前检查 (Preflight) ━━━${NC}"
+                python "${SCRIPT_DIR}/experiment_runner.py" preflight "${WORKSPACE}/experiment" 2>&1 || {
+                    echo -e "${RED}Preflight 检查失败，但仍继续提交（阻断性错误已显示）${NC}"
+                }
+                echo ""
+                echo -e "${CYAN}━━━ 资源调度分析 ━━━${NC}"
+                SCHEDULE_OUT=$(python "${SCRIPT_DIR}/experiment_runner.py" schedule "${WORKSPACE}/experiment" 2>&1) || true
+                echo "$SCHEDULE_OUT"
+                # Apply recommended JOBS_PER_GPU and GPU_COUNT
+                eval $(python "${SCRIPT_DIR}/experiment_runner.py" schedule "${WORKSPACE}/experiment" --env 2>/dev/null) || true
+                echo "  JOBS_PER_GPU=${JOBS_PER_GPU:-1}  GPU_COUNT=${GPU_COUNT:-1}"
+                export JOBS_PER_GPU="${JOBS_PER_GPU:-1}"
+                export GPU_COUNT="${GPU_COUNT:-1}"
+                echo ""
+
                 JOB_NAME="cr-${SLUG:0:30}"
                 EXEC_OUTPUT=$(python -c "
 from sco_runner import run_experiment
@@ -525,45 +593,24 @@ print(f'LOG_PATH={result.log_path}')
                     PROTECTED_LIST+="  - ${_pf}"$'\n'
                 done
 
-                # 用 Claude Code 诊断 SCO 日志并修复脚本
-                cat > /tmp/cr_sco_debug_prompt.txt << PROMPT_EOF
-你是实验调试专家。实验在 SCO 云端 GPU 集群上执行失败了（第 ${sco_round} 轮修复），请诊断并修复。
-
-**后端**: SCO (云端 GPU)
-**SCO 任务状态**: ${STATUS}
-**SCO 错误日志 (关键行)**:
-${ERROR_KEY_LINES}
-
-**完整 SCO 日志尾部 (最后100行)**:
-${SCO_ERROR_TAIL}
-
-**实验脚本** ($(wc -l < "${EXP_SCRIPT}" 2>/dev/null) 行): ${EXP_SCRIPT}
-**工作目录**: ${WORKSPACE}/experiment/
-
-**★★★ 绝对禁止修改的共享基础设施文件 ★★★**:
-${PROTECTED_LIST}
-这些文件被所有项目共享，修改它们会引发级联故障。你只能修改实验项目内的文件
-(${WORKSPACE}/experiment/ 目录下)。如果怀疑是基础设施问题（worker spec 格式、
-SCO 配置等），在 FIX_READY 前报告具体发现，由人工处理。
-
-${ROUND_HISTORY}
-
-你的任务:
-1. 仔细分析 SCO 错误日志，找出失败根因
-2. 参考之前轮次的修复历史（上面已列出），避免重复无效修复
-3. 只修改 ${WORKSPACE}/experiment/ 下的实验代码
-4. 保存修改后的文件
-5. 报告 "FIX_READY" 表示已修复
-
-常见 SCO 失败及修复:
-- OOM / CUDA out of memory → 减小 batch_size, 减小模型, 加 gradient_accumulation
-- ModuleNotFoundError / ImportError → 检查 import，确认包在容器镜像或 site-packages 中
-- CUDA / driver 不兼容 → 调整 CUDA_VISIBLE_DEVICES
-- 数据路径不存在 → 修正路径或先下载数据
-- 脚本超时 (12h) → 减小数据量或增加 checkpoint 续跑
-- 权限问题 → 修正文件权限或路径
-- 容器启动失败 (零输出) → 可能是 worker spec 格式问题，报告但不修改基础设施
-PROMPT_EOF
+                # 用 experiment_runner.py 构建增强版调试 prompt
+                # (自动读取源文件、解析 traceback、检索 debug memory)
+                python "${SCRIPT_DIR}/experiment_runner.py" build-prompt \
+                    "${WORKSPACE}" \
+                    "${WORKSPACE}/experiment/sco_logs.txt" \
+                    --script "${EXP_SCRIPT}" \
+                    --backend sco \
+                    --round "${sco_round}" \
+                    --max-rounds "${SCO_DEBUG_ROUNDS}" \
+                    --history "${ROUND_HISTORY}" \
+                    --protected "${PROTECTED_LIST}" \
+                    > /tmp/cr_sco_debug_prompt.txt 2>/dev/null || {
+                    # 回退：如果增强版 prompt 构建失败，用简化版
+                    sco_round="$sco_round" ERROR_KEY_LINES="$ERROR_KEY_LINES" \
+                      SCO_ERROR_TAIL="$SCO_ERROR_TAIL" EXP_SCRIPT="$EXP_SCRIPT" \
+                      PROTECTED_LIST="$PROTECTED_LIST" ROUND_HISTORY="$ROUND_HISTORY" \
+                      _render_prompt "sco_debug_fallback.md" /tmp/cr_sco_debug_prompt.txt
+                }
                 _claude_task "$(cat /tmp/cr_sco_debug_prompt.txt)" "/tmp/cr_claude_output.txt" "${SCRIPT_DIR}/prompts/sco_debugger_system.md" 2>&1
 
                 # ── 电路断路器：检查受保护文件是否被意外修改 ──
@@ -619,6 +666,23 @@ print(f'LOG_PATH={result.log_path}')
                 elif [[ "$BACKEND" == "local" ]] && [[ -n "$LOG_PATH" ]]; then
                     cp "${LOG_PATH}" "${WORKSPACE}/experiment/sco_logs.txt" 2>/dev/null || true
                 fi
+
+                # ── 保存 debug 记录到持久记忆 ──
+                local _is_success="false"
+                [[ "$SUCCESS" == "True" ]] && _is_success="true"
+                python "${SCRIPT_DIR}/experiment_runner.py" save-record \
+                    "${WORKSPACE}" \
+                    --slug "${SLUG}" \
+                    --error-log "$(tail -500 "${WORKSPACE}/experiment/sco_logs.txt" 2>/dev/null | head -200)" \
+                    --root-cause "" \
+                    --fix-summary "SCO debug round ${sco_round}" \
+                    --files-modified "$(find "${WORKSPACE}/experiment" -name '*.py' -o -name '*.sh' -newer /tmp/cr_sco_debug_prompt.txt 2>/dev/null | tr '\n' ',' | head -200)" \
+                    --success "${_is_success}" \
+                    --fix-round "${sco_round}" \
+                    --total-rounds "${SCO_DEBUG_ROUNDS}" \
+                    --backend "${BACKEND:-sco}" \
+                    --job-id "${JOB_ID}" \
+                    2>/dev/null || true
 
                 if [[ "$SUCCESS" == "True" ]]; then
                     echo -e "${GREEN}★ SCO 修复成功！实验通过 (第 ${sco_round} 轮修复, 后端: ${BACKEND})${NC}"
@@ -793,34 +857,21 @@ print(f'LOG_PATH={result.log_path}')
                     fi
                     ERROR_LOG=$(tail -100 "${LATEST_LOG}" 2>/dev/null || echo "无法读取日志")
 
-                    cat > /tmp/cr_debug_prompt.txt << PROMPT_EOF
-你是实验调试专家。实验执行失败了（第 ${debug_round} 轮修复），请诊断并修复。
-
-**后端**: ${BACKEND}
-**上一轮修复后的错误日志 (最后100行)**:
-${ERROR_LOG}
-
-**实验脚本**: ${EXP_SCRIPT}
-**工作目录**: ${WORKSPACE}/experiment/
-
-你的任务:
-1. 仔细分析错误日志，找出失败原因
-2. 注意之前轮次的修复尝试（如果有）
-3. 修改实验脚本或代码来修复问题
-4. 保存修改后的文件
-5. 报告 "FIX_READY" 表示已修复
-
-常见问题及修复:
-- 依赖缺失 (如 python3-venv) → 先 apt-get install，再让脚本正常工作
-- 路径错误 → 修正文件路径
-- 虚拟环境损坏 → 删除 .venv 目录让脚本重建，或跳过 venv 直接用系统 Python
-- 语法错误 → 修正代码
-- pip 不可用 → 使用 python3 -m pip 代替裸 pip
-- 环境不兼容 → 修改脚本适配当前环境
-- OOM / CUDA out of memory → 减小 batch_size 或模型大小
-- 实验被超时中断 → 不要删除 checkpoints/ 下的 .pth 文件，run_experiment.sh 已配置 --resume 自动续跑
-- CUDA_VISIBLE_DEVICES 硬编码为单一GPU → 改用 \$GPU_COUNT 环境变量动态适配多GPU
-PROMPT_EOF
+                    # 用 experiment_runner.py 构建增强版调试 prompt
+                    # (自动读取源文件、解析 traceback、检索 debug memory)
+                    python "${SCRIPT_DIR}/experiment_runner.py" build-prompt \
+                        "${WORKSPACE}" \
+                        "${LATEST_LOG}" \
+                        --script "${EXP_SCRIPT}" \
+                        --backend "${BACKEND}" \
+                        --round "${debug_round}" \
+                        --max-rounds "${MAX_DEBUG_ROUNDS}" \
+                        > /tmp/cr_debug_prompt.txt 2>/dev/null || {
+                        # 回退：简化版 prompt
+                        debug_round="$debug_round" BACKEND="$BACKEND" ERROR_LOG="$ERROR_LOG" \
+                          EXP_SCRIPT="$EXP_SCRIPT" \
+                          _render_prompt "local_debug_fallback.md" /tmp/cr_debug_prompt.txt
+                    }
                     _claude_task "$(cat /tmp/cr_debug_prompt.txt)" 2>&1
 
                     # ── 修复后重试 (自动判断本地/SCO，不强制本地) ──
@@ -900,55 +951,7 @@ _do_paper_writing() {
     cp templates/aaai2026.sty "${WORKSPACE}/paper/" 2>/dev/null || true
     cp templates/aaai2026.bst "${WORKSPACE}/paper/" 2>/dev/null || true
 
-    cat > /tmp/cr_stage4_prompt.txt << PROMPT_EOF
-你是一个学术论文撰写专家。请撰写完整的 AAAI 2026 格式论文。
-
-研究主题: ${TOPIC}
-会议: AAAI 2026
-
-样式文件已放在 ${WORKSPACE}/paper/ 目录下（aaai2026.sty, aaai2026.bst）。
-LaTeX 模板参考: templates/aaai.tex.j2
-
-请阅读以下材料：
-1. 文献综述: ${WORKSPACE}/literature/literature_review.md
-2. 实验日志: ${WORKSPACE}/experiment/sco_logs.txt
-
-请完成：
-1. 撰写 LaTeX 论文，必须使用 \\usepackage[submission]{aaai2026} 样式
-2. Preamble 必须包含: times, helvet, courier, natbib, caption, graphicx
-3. 禁止使用的包: hyperref, authblk, geometry, float, titlesec, setspace, fullpage, ulem
-4. 所有数据必须来自真实实验日志，不要编造
-5. 保存到: ${WORKSPACE}/paper/paper.tex
-6. 编译前确保 aaai2026.sty 和 aaai2026.bst 在同一目录
-7. 用 pdflatex 编译为 PDF，修复所有 Overfull hbox 警告后再报告完成
-8. 保存 BibTeX: ${WORKSPACE}/paper/references.bib
-
-**LaTeX 排版规范（必须遵守，AAAI 2026 是两栏排版）**:
-
-**图片**:
-- 栏内图片必须用 \\includegraphics[width=\\columnwidth]{...}
-- 禁止不带 width 参数的 \\includegraphics{}（原分辨率会溢出）
-- 跨栏大图用 \\begin{figure*}...\\end{figure*} 配合 [width=\\textwidth]
-- 不要硬编码厘米/英寸（如 width=15cm），用 \\columnwidth 或 \\textwidth
-
-**表格**:
-- ≤4列的表格用 \\resizebox{\\columnwidth}{!}{\\begin{tabular}{...}...\\end{tabular}}
-- 宽表用 \\begin{table*}...\\end{table*} 跨栏 + \\resizebox{\\textwidth}{!}{...}
-- 禁止在 table 环境中使用没有 resizebox 包裹的宽 tabular
-- booktabs 风格：\\toprule / \\midrule / \\bottomrule，无竖线，无双重线
-
-**公式**:
-- 长公式用 \\begin{aligned} 或 \\begin{split} 断行，不要用单行公式溢出栏宽
-- 禁止公式超出栏宽（约 3.25in / 240pt）
-
-**通用**:
-- 每个 figure/table 环境内必须有 \\centering
-- \\textwidth 是整页宽 (~6.75in)，\\columnwidth 是栏宽 (~3.25in)，在栏内用 \\columnwidth
-- 编译后检查 pdflatex 输出，修复所有 "Overfull \\hbox" 警告
-- 图表位置用 [t] (top) 或 [tb] 避免浮动到奇怪位置
-
-完成后先编译检查无 Overfull hbox，再报告'论文撰写完成'。
-PROMPT_EOF
+    TOPIC="$TOPIC" _render_prompt "paper_write_start.md" /tmp/cr_stage4_prompt.txt
     _claude_task "$(cat /tmp/cr_stage4_prompt.txt)"
 
     # === Stage review gate ===
@@ -1191,41 +1194,8 @@ _check_addressed_items() {
     echo ""
 
     # 构建 Claude 检查 prompt
-    cat > /tmp/cr_check_addressed.txt << CHECK_EOF
-你是一个严格的审稿合规检查员。你的任务是逐条核对上一轮外部审稿意见是否已在修订版论文中得到解决。
-
-请阅读以下文件：
-1. 外部审稿意见: ${LATEST_EXTERNAL_REVIEW}
-2. 论文: ${WORKSPACE}/paper/paper.tex
-3. 内部审稿: ${LATEST_INTERNAL:-无}
-
-**检查方法**:
-1. 从外部审稿意见中提取所有具体的问题/建议（包括方法、实验、写作等方面）
-2. 对每一条，检查修订版论文中是否已经解决
-3. 判断标准：
-   - "已解决" = 论文中有明确的对应修改（不只是文字调整）
-   - "部分解决" = 有修改但不充分（如审稿要求补充实验但只加了讨论）
-   - "未解决" = 论文中无对应修改
-4. 特别注意：如果审稿意见要求补充实验而论文只修改了文字 → 标记为"未解决"
-
-**输出格式** (严格要求):
-\`\`\`
-CHECKLIST:
-1. [已解决/部分解决/未解决] <审稿意见摘要> → <论文中的对应修改>
-2. [已解决/部分解决/未解决] <审稿意见摘要> → <论文中的对应修改>
-...
-
-SUMMARY:
-已解决: N 条
-部分解决: M 条
-未解决: K 条
-解决率: XX% (已解决 + 部分解决*0.5) / 总数 * 100
-
-GATE: PASS (解决率 >= 70%) 或 GATE: FAIL (解决率 < 70%)
-\`\`\`
-
-重要：严格按照格式输出，最后一行必须是 "GATE: PASS" 或 "GATE: FAIL"。
-CHECK_EOF
+    LATEST_EXTERNAL_REVIEW="$LATEST_EXTERNAL_REVIEW" LATEST_INTERNAL="${LATEST_INTERNAL:-无}" \
+      _render_prompt "check_addressed.md" /tmp/cr_check_addressed.txt
 
     CHECK_RESULT=$(cat /tmp/cr_check_addressed.txt | claude -p --model "${CLAUDE_MODEL:-deepseek-v4-pro}" --output-format text 2>&1) || true
     echo "${CHECK_RESULT}"
@@ -1322,49 +1292,174 @@ _internal_review_gate() {
             fi
         done
 
-        # 检查是否有已执行的补充实验结果
-        local REV_EXP_RESULTS="${WORKSPACE}/experiment/revision_iter_${ITERATION:-0}/experiment_results.json"
-        local REV_EXP_REF=""
-        if [[ -f "$REV_EXP_RESULTS" ]]; then
-            REV_EXP_REF="
-**已执行的补充实验结果**: ${REV_EXP_RESULTS}
-**实验日志目录**: ${WORKSPACE}/experiment/revision_iter_${ITERATION:-0}/exp_*/
-请阅读这些实验日志，将真实数据整合到论文中。不要编造数据。"
+        # ====================================================================
+        # [NEW] 门控补充实验管线
+        # 分析内部审稿反馈 → 提取实验需求 → 生成代码 → SCO 执行 (含 debug loop)
+        # ====================================================================
+        local GATE_EXP_DIR="${WORKSPACE}/experiment/gate_experiments"
+        local GATE_EXP_CHECK="${GATE_EXP_DIR}/.experiments_checked"
+        local GATE_EXP_RESULTS="${GATE_EXP_DIR}/experiment_results.json"
+
+        if [[ ! -f "$GATE_EXP_CHECK" ]]; then
+            mkdir -p "$GATE_EXP_DIR"
+            echo -e "${CYAN}  [门控] 分析内部审稿意见，判断是否需要补充实验...${NC}"
+
+            # Phase A: 分析内部反馈 → 提取实验需求
+            INTERNAL_FEEDBACK="$INTERNAL_FEEDBACK" TOPIC="$TOPIC" \
+              _render_prompt "gate_experiment_check.md" /tmp/cr_gate_exp_check.txt
+            _claude_task "$(cat /tmp/cr_gate_exp_check.txt)" "/tmp/cr_gate_exp_check_output.txt" || true
+
+            local NEEDS_EXP="false"
+            if [[ -f /tmp/cr_gate_exp_check_output.txt ]]; then
+                NEEDS_EXP=$(python3 -c "
+import re, json
+text = open('/tmp/cr_gate_exp_check_output.txt').read()
+m = re.search(r'\`\`\`json\s*\n(.*?)\n\`\`\`', text, re.DOTALL)
+if m:
+    plan = json.loads(m.group(1))
+    json.dump(plan, open('${GATE_EXP_DIR}/revision_plan.json', 'w'), indent=2)
+    print('true' if plan.get('needs_experiments') else 'false')
+else:
+    print('false')
+" 2>/dev/null || echo "false")
+            fi
+
+            if [[ "$NEEDS_EXP" == "true" ]]; then
+                echo -e "${YELLOW}  [门控] 内部审稿要求补充实验，启动实验管线...${NC}"
+
+                # Phase B1: Claude 编写实验代码
+                echo -e "${CYAN}  [门控 B1] 生成实验代码...${NC}"
+                local GATE_PLAN_JSON
+                GATE_PLAN_JSON=$(cat "${GATE_EXP_DIR}/revision_plan.json" 2>/dev/null || echo "{}")
+                REVISION_PLAN_JSON="$GATE_PLAN_JSON" REVISION_EXP_DIR="$GATE_EXP_DIR" TOPIC="$TOPIC" \
+                  _render_prompt "revision_phase_b.md" /tmp/cr_gate_b1.txt
+                _claude_task "$(cat /tmp/cr_gate_b1.txt)" "/tmp/cr_gate_b1_output.txt" || true
+
+                # Phase B2: 并行提交到 SCO (含 debug loop)
+                echo -e "${CYAN}  [门控 B2] 提交实验到 SCO...${NC}"
+                local gate_pids=()
+                local gate_result_files=()
+                local gate_idx=0
+
+                for exp_subdir in "${GATE_EXP_DIR}"/exp_*/; do
+                    [[ -d "$exp_subdir" ]] || continue
+                    [[ -f "${exp_subdir}/run_experiment.sh" ]] || continue
+                    gate_idx=$((gate_idx + 1))
+                    local exp_name="cr-gate-${SLUG:0:16}-e${gate_idx}"
+                    local result_file="/tmp/cr_gate_exp_${gate_iter}_${gate_idx}.txt"
+                    gate_result_files+=("$result_file")
+
+                    echo -e "  ${YELLOW}▶ 门控实验 ${gate_idx}: ${exp_name}${NC}"
+
+                    # 确保 manifest 存在
+                    if [[ ! -f "${exp_subdir}/experiment_manifest.json" ]]; then
+                        echo '{"gpu_count": 1, "estimated_runtime_hours": 2.0}' > "${exp_subdir}/experiment_manifest.json"
+                    fi
+
+                    python3 -c "
+import sys; sys.path.insert(0, '${SCRIPT_DIR}')
+from sco_runner import run_with_debug_loop
+from pathlib import Path
+result = run_with_debug_loop(Path('${exp_subdir}/run_experiment.sh'), '${exp_name}', force_sco=True, project_slug='${SLUG}', max_debug_rounds=3)
+print(f'BACKEND={result.backend}')
+print(f'SUCCESS={result.success}')
+print(f'JOB_ID={result.job_id}')
+print(f'LOG_PATH={result.log_path}')
+print(f'ERROR={result.error_summary}')
+" > "$result_file" 2>&1 &
+                    gate_pids+=($!)
+                done
+
+                # 等待所有门控实验完成
+                if [[ ${#gate_pids[@]} -gt 0 ]]; then
+                    echo -e "  ${CYAN}等待 ${#gate_pids[@]} 个门控实验完成...${NC}"
+                    for pid in "${gate_pids[@]}"; do
+                        wait "$pid" 2>/dev/null || true
+                    done
+
+                    # 收集结果
+                    local gate_success=0
+                    local gate_failed=0
+                    for rf in "${gate_result_files[@]}"; do
+                        if [[ -f "$rf" ]]; then
+                            local gs_ok
+                            gs_ok=$(grep -oP 'SUCCESS=\K\S+' "$rf" 2>/dev/null || echo "False")
+                            local gs_jid
+                            gs_jid=$(grep -oP 'JOB_ID=\K\S+' "$rf" 2>/dev/null || echo "?")
+                            if [[ "$gs_ok" == "True" ]]; then
+                                gate_success=$((gate_success + 1))
+                                echo -e "  ${GREEN}✓ 门控实验完成 (JOB=${gs_jid})${NC}"
+                            else
+                                gate_failed=$((gate_failed + 1))
+                                local gs_err
+                                gs_err=$(grep -oP 'ERROR=\K.*' "$rf" 2>/dev/null || echo "未知")
+                                echo -e "  ${RED}✗ 门控实验失败 — ${gs_err}${NC}"
+                            fi
+                            rm -f "$rf" 2>/dev/null || true
+                        fi
+                    done
+                    echo -e "  门控结果: ${GREEN}${gate_success} 成功${NC}, ${RED}${gate_failed} 失败${NC}"
+                fi
+
+                # 复制日志到实验目录
+                for exp_subdir in "${GATE_EXP_DIR}"/exp_*/; do
+                    [[ -d "$exp_subdir" ]] || continue
+                    local lrf="${exp_subdir}/logs/result.txt"
+                    if [[ -f "$lrf" ]]; then
+                        local log_src
+                        log_src=$(grep -oP 'LOG_PATH=\K\S+' "$lrf" 2>/dev/null || echo "")
+                        if [[ -n "$log_src" && -f "$log_src" ]]; then
+                            cp "$log_src" "${exp_subdir}/experiment_log.txt" 2>/dev/null || true
+                        fi
+                    fi
+                done
+
+                # 生成 experiment_results.json
+                python3 -c "
+import json
+from pathlib import Path
+gate_dir = Path('${GATE_EXP_DIR}')
+exps = []
+for d in sorted(gate_dir.glob('exp_*')):
+    if d.is_dir():
+        log_file = d / 'experiment_log.txt'
+        exps.append({
+            'id': d.name,
+            'log_path': str(log_file) if log_file.exists() else None,
+            'has_results': (d / 'results').exists(),
+        })
+json.dump(exps, open(gate_dir / 'experiment_results.json', 'w'), indent=2)
+" 2>/dev/null || true
+            else
+                echo -e "  ${GREEN}[门控] 内部审稿无需补充实验，跳过实验管线${NC}"
+            fi
+
+            # 标记已检查，同一 gate 周期不重复分析
+            touch "$GATE_EXP_CHECK"
+        else
+            echo -e "  ${CYAN}[门控] 实验需求已检查过 (.experiments_checked)，跳过分析${NC}"
         fi
 
-        cat > /tmp/cr_gate_revise.txt << GATE_EOF
-你是一个高标准的论文修订专家。你的论文在内部审稿中未达标，需要认真修订。
+        # ====================================================================
+        # 组装实验结果引用（门控实验 + 修订实验），传给 gate_revise prompt
+        # ====================================================================
+        local REV_EXP_REF=""
+        if [[ -f "$GATE_EXP_RESULTS" ]]; then
+            REV_EXP_REF="
+**门控补充实验结果**: ${GATE_EXP_RESULTS}
+**实验日志目录**: ${GATE_EXP_DIR}/exp_*/
+请阅读这些门控实验日志，将真实数据整合到论文中。不要编造数据。"
+        fi
+        if [[ -f "${WORKSPACE}/experiment/revision_iter_${ITERATION:-0}/experiment_results.json" ]]; then
+            REV_EXP_REF+="
+**修订实验结果**: ${WORKSPACE}/experiment/revision_iter_${ITERATION:-0}/experiment_results.json
+**实验日志目录**: ${WORKSPACE}/experiment/revision_iter_${ITERATION:-0}/exp_*/"
+        fi
 
-研究主题: ${TOPIC}
-当前状态: 内部审稿门控第 ${gate_iter} 轮
-
-**内部审稿评分**: ${INTERNAL_SCORE}/10 (需要 ≥ 6.0)
-**外部意见解决率**: ${ADDRESSED_PCT}% (需要 ≥ 70%)
-
-**内部审稿反馈**:
-${INTERNAL_FEEDBACK}
-${REV_EXP_REF}
-
-**你的任务**:
-1. 仔细阅读所有内部审稿意见
-2. 对每一条批评进行实质性修改：
-   - 如果审稿指出实验不足且已有补充实验结果 → 将真实实验数据整合到论文中
-   - 如果审稿指出实验不足但无补充实验数据 → 在论文中明确标记为 future work
-   - 如果审稿指出方法缺陷 → 修改方法设计
-   - 如果审稿指出写作问题 → 修改文本
-   - 如果审稿指出缺少基线 → 添加基线对比（使用已有实验数据）
-3. 只改文字不改实验是不可接受的 — 必须使用实际数据做实质性改进
-4. 修改论文: ${WORKSPACE}/paper/paper.tex
-5. 重新编译 PDF: ${WORKSPACE}/paper/paper.pdf，修复所有 Overfull hbox 警告
-6. 检查排版：
-   - 栏内图片用 [width=\\columnwidth]，表格用 \\resizebox 包裹
-   - 没有表格/图片/公式溢出栏宽
-   - \\textwidth 和 \\columnwidth 区分正确
-7. 完成后报告 "GATE_REVISION_DONE"
-
-重要：不要只做表面修改，要解决审稿人指出的根本问题。如果有已执行的实验结果，必须引用真实数据。
-LaTeX 排版也必须达标：无溢栏、无 Overfull hbox。
-GATE_EOF
+        TOPIC="$TOPIC" gate_iter="$gate_iter" INTERNAL_SCORE="$INTERNAL_SCORE" \
+          ADDRESSED_PCT="$ADDRESSED_PCT" INTERNAL_FEEDBACK="$INTERNAL_FEEDBACK" \
+          REV_EXP_REF="$REV_EXP_REF" \
+          _render_prompt "gate_revise.md" /tmp/cr_gate_revise.txt
         _claude_task "$(cat /tmp/cr_gate_revise.txt)"
 
         # 保存中间状态
@@ -1488,53 +1583,8 @@ print(len(plan.get('experiments', [])))
     echo ""
     mkdir -p "${REVISION_EXP_DIR}"
 
-    cat > /tmp/cr_phase_a.txt << ANALYZE_EOF
-你是一个严格的论文修订专家。请分析外部审稿意见，区分哪些需求必须补充实验、哪些只需修改文字。
-
-研究主题: ${TOPIC}
-请阅读以下文件：
-1. 外部审稿意见: ${LATEST_REVIEW}
-2. 当前论文: ${WORKSPACE}/paper/paper.tex
-3. 实验方案: ${WORKSPACE}/experiment/experiment_plan.md
-4. 实验日志: ${WORKSPACE}/experiment/sco_logs.txt (如果存在)
-
-**分析任务**：
-
-对每条审稿意见进行分类：
-- [需要实验] — 审稿人要求补充实验、添加基线、消融研究、额外评估等
-- [文字修改] — 只需修改表述、补充讨论、修正错误等
-- [理论补充] — 需要补充证明或分析（无需GPU，但需要认真推导）
-
-**输出格式** — 在响应的末尾，必须输出一个 JSON 块：
-
-\`\`\`json
-{
-  "text_fixes": [
-    "文字修改条目1的描述",
-    "文字修改条目2的描述"
-  ],
-  "experiments": [
-    {
-      "id": "exp_1",
-      "name": "简短实验名称",
-      "description": "实验目的、方法和评估指标",
-      "review_item": "对应的审稿意见原文摘要",
-      "estimated_runtime_hours": 2.0,
-      "gpu_count": 1
-    }
-  ]
-}
-\`\`\`
-
-关键约束：
-- gpu_count × estimated_runtime_hours ≤ 32 (总卡时预算)
-- estimated_runtime_hours 必须诚实估算（不要乐观估计）
-- 如果审稿没有要求补充实验，experiments 数组为空 []
-- 多个小实验如果能合并运行就合并
-- JSON 必须可被 Python json.load() 解析，不要有 trailing commas
-
-完成分析后报告 'PHASE_A_DONE'。
-ANALYZE_EOF
+    TOPIC="$TOPIC" LATEST_REVIEW="$LATEST_REVIEW" \
+      _render_prompt "revision_phase_a.md" /tmp/cr_phase_a.txt
 
     _claude_task "$(cat /tmp/cr_phase_a.txt)" "/tmp/cr_phase_a_output.txt" || true
 
@@ -1580,39 +1630,32 @@ else:
             echo -e "${CYAN}  B1: 跳过 (检查点已完成)${NC}"
         else
         echo -e "${CYAN}  B1: 编写实验代码...${NC}"
-        cat > /tmp/cr_phase_b1.txt << CODE_EOF
-你是一个机器学习研究员。请根据审稿意见中要求的补充实验编写完整的实验代码。
-
-研究主题: ${TOPIC}
-实验需求: $(cat "${REVISION_EXP_DIR}/revision_plan.json" 2>/dev/null || echo "见 revision_plan.json")
-
-请阅读以下文件：
-1. 当前实验代码: ${WORKSPACE}/experiment/ (了解现有代码结构)
-2. 当前论文: ${WORKSPACE}/paper/paper.tex
-3. 修订计划: ${REVISION_EXP_DIR}/revision_plan.json
-
-**任务**：
-为每个补充实验编写代码和运行脚本。对于 revision_plan.json 中的每个实验：
-
-1. 在 ${REVISION_EXP_DIR}/<exp_id>/ 下创建独立的实验子目录
-2. 编写 Python 实验代码
-3. 编写 run_experiment.sh（必须包含：环境设置、依赖安装、实验执行）
-4. 创建 experiment_manifest.json：{"gpu_count": N, "estimated_runtime_hours": H}
-   - gpu_count 根据实验实际需要填写（默认 1）
-   - gpu_count × estimated_runtime_hours ≤ 32
-
-**run_experiment.sh 规范**：
-- 读取 \$GPU_COUNT 环境变量设置 CUDA_VISIBLE_DEVICES
-- 必须包含 pip install 需要的依赖
-- 结果保存到当前目录下的 results/ 子目录
-- 用 echo "EXPERIMENT_DONE" 标记完成
-
-完成后报告 'PHASE_B1_DONE'。
-CODE_EOF
+        REVISION_PLAN_JSON=$(cat "${REVISION_EXP_DIR}/revision_plan.json" 2>/dev/null || echo "见 revision_plan.json")
+        TOPIC="$TOPIC" REVISION_PLAN_JSON="$REVISION_PLAN_JSON" REVISION_EXP_DIR="$REVISION_EXP_DIR" \
+          _render_prompt "revision_phase_b.md" /tmp/cr_phase_b1.txt
         _claude_task "$(cat /tmp/cr_phase_b1.txt)" "/tmp/cr_phase_b1_output.txt" || true
         # 保存检查点: Phase B1 完成
         _rev_ckpt_set "$NEXT_ITER" "phase_b1" "done"
         fi  # end of B1 skip block
+
+        # B1.5: 环境准备 — 预下载所有依赖（本地执行，利用镜像/VPN）
+        echo ""
+        echo -e "${CYAN}  B1.5: 环境准备（预下载 wheels/模型/数据集）...${NC}"
+        for exp_subdir in "${REVISION_EXP_DIR}"/exp_*/; do
+            [[ -d "$exp_subdir" ]] || continue
+            local exp_name_tmp="$(basename "$exp_subdir")"
+            echo "    准备: ${exp_name_tmp}"
+            python -c "
+from sco_runner import _ensure_wheels, _ensure_model_cache, _ensure_dataset_cache, _prepare_env_for_sco
+from pathlib import Path
+d = Path('$exp_subdir')
+_ensure_wheels()
+_ensure_model_cache(d / 'run_experiment.sh')
+_ensure_dataset_cache(d / 'run_experiment.sh')
+_prepare_env_for_sco(d)
+" 2>&1 | tail -3
+        done
+        echo -e "  ${GREEN}环境准备完成${NC}"
 
         # B2: 并行提交所有补充实验 (充分利用 GPU)
         echo ""
@@ -1776,9 +1819,9 @@ json.dump(exps, open(rev_dir / 'experiment_results.json', 'w'), indent=2)
                         # Immediately resubmit — same logic as the repairer in 2b
                         python3 -c "
 import sys; sys.path.insert(0, '${SCRIPT_DIR}')
-from sco_runner import run_experiment
+from sco_runner import run_with_debug_loop
 from pathlib import Path
-result = run_experiment(Path('${_w_dir}/run_experiment.sh'), '${_w_name}', force_sco=True)
+result = run_with_debug_loop(Path('${_w_dir}/run_experiment.sh'), '${_w_name}', force_sco=True, project_slug='${SLUG}', max_debug_rounds=3)
 print(f'BACKEND={result.backend}')
 print(f'SUCCESS={result.success}')
 print(f'JOB_ID={result.job_id}')
@@ -1808,9 +1851,9 @@ print(f'ERROR={result.error_summary}')
                 (
                     python3 -c "
 import sys; sys.path.insert(0, '${SCRIPT_DIR}')
-from sco_runner import run_experiment
+from sco_runner import run_with_debug_loop
 from pathlib import Path
-result = run_experiment(Path('${_r_dir}/run_experiment.sh'), '${_r_name}', force_sco=True)
+result = run_with_debug_loop(Path('${_r_dir}/run_experiment.sh'), '${_r_name}', force_sco=True, project_slug='${SLUG}', max_debug_rounds=3)
 print(f'BACKEND={result.backend}')
 print(f'SUCCESS={result.success}')
 print(f'JOB_ID={result.job_id}')
@@ -1901,9 +1944,9 @@ print(f'ERROR={result.error_summary}')
 
                     python -c "
 import sys; sys.path.insert(0, '${SCRIPT_DIR}')
-from sco_runner import run_experiment
+from sco_runner import run_with_debug_loop
 from pathlib import Path
-result = run_experiment(Path('${exp_script}'), '${exp_name}', force_sco=True)
+result = run_with_debug_loop(Path('${exp_script}'), '${exp_name}', force_sco=True, project_slug='${SLUG}', max_debug_rounds=5)
 print(f'BACKEND={result.backend}')
 print(f'SUCCESS={result.success}')
 print(f'JOB_ID={result.job_id}')
@@ -1989,6 +2032,7 @@ print(f'ERROR={result.error_summary}')
                     if [[ -n "$exp_log_path" && -f "$exp_log_path" ]]; then
                         cp "$exp_log_path" "${exp_subdir}/experiment_log.txt" 2>/dev/null || true
                     fi
+                    echo "$EXP_OUTPUT" > "${exp_subdir}/logs/result.txt" 2>/dev/null || true
 
                     if [[ "$exp_ok" == "True" ]]; then
                         echo -e "  ${GREEN}✓ 完成 (${exp_backend})${NC}"
@@ -2000,16 +2044,39 @@ print(f'ERROR={result.error_summary}')
                     echo ""
                 done
             else
-                # 恢复场景：从 experimeng_log.txt 文件收集
+                # 恢复场景：从持久化的 result.txt 解析真实结果
                 for exp_subdir in "${REVISION_EXP_DIR}"/exp_*/; do
                     [[ -d "$exp_subdir" ]] || continue
                     [[ -f "${exp_subdir}/run_experiment.sh" ]] || continue
                     echo -e "  ── 实验: $(basename "$exp_subdir") ──"
-                    if [[ -f "${exp_subdir}/experiment_log.txt" ]]; then
-                        echo -e "  ${GREEN}✓ 日志存在${NC}"
+
+                    local _rec_ok="False"
+                    local _rec_backend="unknown"
+                    local _persist_result="${exp_subdir}/logs/result.txt"
+
+                    if [[ -f "$_persist_result" ]]; then
+                        _rec_ok=$(grep -oP 'SUCCESS=\K\S+' "$_persist_result" 2>/dev/null || echo "False")
+                        _rec_backend=$(grep -oP 'BACKEND=\K\S+' "$_persist_result" 2>/dev/null || echo "unknown")
+                        # Show result summary
+                        grep -oP '^(BACKEND|SUCCESS|ERROR)=' "$_persist_result" 2>/dev/null | head -3 || true
+                    elif [[ -f "${exp_subdir}/experiment_log.txt" ]]; then
+                        # Fallback: check log for error patterns
+                        if grep -qE "AttributeError|Traceback|SyntaxError|FAILED" "${exp_subdir}/experiment_log.txt" 2>/dev/null; then
+                            echo "  (从日志检测到错误模式)"
+                            _rec_ok="False"
+                            _rec_backend="sco"
+                        else
+                            echo "  (旧格式日志，无法确定结果)"
+                            _rec_ok="False"
+                            _rec_backend="unknown"
+                        fi
+                    fi
+
+                    if [[ "$_rec_ok" == "True" ]]; then
+                        echo -e "  ${GREEN}✓ 完成 (${_rec_backend})${NC}"
                         exp_success=$((exp_success + 1))
                     else
-                        echo -e "  ${RED}✗ 无日志${NC}"
+                        echo -e "  ${RED}✗ 失败 (${_rec_backend})${NC}"
                         exp_failed=$((exp_failed + 1))
                     fi
                     echo ""
@@ -2069,46 +2136,9 @@ json.dump(exps, open(rev_dir / 'experiment_results.json', 'w'), indent=2)
     echo -e "${CYAN}━━━ Phase C: 更新论文 ━━━${NC}"
     echo ""
 
-    cat > /tmp/cr_phase_c.txt << UPDATE_EOF
-你是一个严格的论文修订专家。请根据外部审稿意见和**已实际执行的补充实验结果**来修订论文。
-
-研究主题: ${TOPIC}
-当前迭代: 第 ${NEXT_ITER} 轮修订（上一轮外部审稿 verdict: ${verdict}）
-
-请依次阅读以下文件：
-1. 外部审稿意见: ${LATEST_REVIEW}
-2. 文献综述: ${WORKSPACE}/literature/literature_review.md
-3. 当前论文: ${WORKSPACE}/paper/paper.tex
-4. 修订计划: ${REVISION_EXP_DIR}/revision_plan.json
-5. 补充实验结果汇总: ${REVISION_EXP_DIR}/experiment_results.json
-6. 各实验日志: ${REVISION_EXP_DIR}/exp_*/experiment_log.txt
-
-**修订要求**：
-
-1. **逐条修改**: 对审稿意见中的每一条问题/建议，都要有明确的修改
-2. **使用真实实验数据**:
-   - 如果补充实验已成功执行 → 在论文中引用真实结果（数字、图表、表格）
-   - 不要编造数据，只使用 experiment_log.txt 中实际出现的数字
-   - 如果某个实验失败了 → 诚实说明，不要假装有结果
-3. **文字修改**: 对不需要实验的意见，直接修改论文文字
-4. **理论补充**: 如果需要补充证明，在论文中认真推导
-5. **修改论文**: ${WORKSPACE}/paper/paper.tex
-6. **重新编译**: 编译并修复所有 Overfull hbox 警告。检查图片/表格/公式没有溢出栏宽。
-7. **排版规范**:
-   - 栏内图片用 [width=\\columnwidth]，表格用 \\resizebox{\\columnwidth}{!}{...}
-   - \\textwidth ≠ \\columnwidth，两栏中栏内元素必须用 \\columnwidth
-   - booktabs 表格式：\\toprule/\\midrule/\\bottomrule，无竖线
-   - 长公式用 aligned/split 断行
-
-**自我检查清单** (修改完成后逐一确认):
-- [ ] 每条审稿意见都有对应的修改
-- [ ] 所有声称的实验数字都能在 experiment_log.txt 中找到来源
-- [ ] 没有编造数据
-- [ ] 论文可以编译且无 Overfull hbox 警告
-- [ ] 所有图片有 [width=\\columnwidth]，表格有 \\resizebox 包裹
-
-完成后明确报告 'PHASE_C_DONE — 修订完成，请提交内部审稿'。
-UPDATE_EOF
+    TOPIC="$TOPIC" NEXT_ITER="$NEXT_ITER" verdict="$verdict" \
+      LATEST_REVIEW="$LATEST_REVIEW" REVISION_EXP_DIR="$REVISION_EXP_DIR" \
+      _render_prompt "revision_phase_c.md" /tmp/cr_phase_c.txt
     _claude_task "$(cat /tmp/cr_phase_c.txt)" "/tmp/cr_phase_c_output.txt" || true
     # 保存检查点: Phase C 完成
     _rev_ckpt_set "$NEXT_ITER" "phase_c" "done"
@@ -2141,6 +2171,20 @@ _continue_project() {
     echo ""
 
     case "$STAGE" in
+        environment_preparation)
+            echo -e "${CYAN}环境准备阶段 — 重新执行环境准备...${NC}"
+            _do_environment_preparation "${WORKSPACE}/experiment"
+            echo ""
+            # 完成环境准备，进入实验执行
+            python -c "
+from state_manager import StateManager, Stage
+sm = StateManager('state')
+state = sm.load('${SLUG}')
+sm.complete_stage(state, Stage.ENVIRONMENT_PREPARATION)
+sm.start_stage(state, Stage.EXPERIMENT_EXECUTION)
+"
+            _continue_experiment
+            ;;
         experiment_execution)
             _continue_experiment
             ;;
@@ -2157,16 +2201,8 @@ _continue_project() {
 
             if [[ -f "${WORKSPACE}/hypothesis/hypothesis_output.json" ]]; then
                 HYPOTHESIS_JSON=$(cat "${WORKSPACE}/hypothesis/hypothesis_output.json" | head -300)
-                cat > /tmp/cr_hypothesis_refine.txt << HYP_EOF
-你是一位资深的科研假说评审专家。请审阅假说生成结果并优化。
-
-研究主题: ${TOPIC}
-文献综述: ${WORKSPACE}/literature/literature_review.md
-假说生成结果: ${HYPOTHESIS_JSON}
-
-请优化假说并将结果保存到 ${WORKSPACE}/hypothesis/hypothesis_report.md
-完成后报告'假说生成完成'。
-HYP_EOF
+                HYPOTHESIS_JSON="$HYPOTHESIS_JSON" \
+                  _render_prompt "hypothesis_refine.md" /tmp/cr_hypothesis_refine.txt
                 _claude_task "$(cat /tmp/cr_hypothesis_refine.txt)" || true
             fi
 
@@ -2183,44 +2219,69 @@ from state_manager import StateManager, Stage
 sm = StateManager('state')
 state = sm.load('${SLUG}')
 sm.complete_stage(state, Stage.HYPOTHESIS_GENERATION)
+sm.start_stage(state, Stage.BASELINE_FETCHING)
+"
+
+            # ── Baseline fetching: clone GitHub repos for structural reference ──
+            echo "[Phase] Baseline fetching — searching GitHub for reference implementations..."
+            BASELINE_CTX_FILE="${WORKSPACE}/experiment/baseline_context.md"
+            mkdir -p "${WORKSPACE}/experiment"
+
+            # Extract method names from hypothesis
+            HYPO_FILE="${WORKSPACE}/hypothesis/hypothesis_output.json"
+            if [ -f "$HYPO_FILE" ]; then
+                python -c "
+import json, sys
+try:
+    data = json.load(open('$HYPO_FILE'))
+    methods = []
+    for h in data.get('hypotheses', []):
+        if isinstance(h, dict):
+            methods.extend(h.get('baselines', []) or h.get('baseline_methods', []))
+    if methods:
+        with open('/tmp/cr_baseline_methods.txt', 'w') as f:
+            f.write(','.join(methods[:10]))
+        print(f'Found {len(methods)} baseline methods')
+    else:
+        print('No baselines in hypothesis — extracting from literature standards')
+        sys.exit(1)
+except Exception as e:
+    print(f'Hypothesis parse error: {e}')
+    sys.exit(1)
+" 2>/dev/null && BASELINE_METHODS="--methods $(cat /tmp/cr_baseline_methods.txt | tr ',' ' ')" || {
+                    # Fallback: extract from landscape standard_baselines
+                    BASELINE_METHODS=""
+                }
+            else
+                BASELINE_METHODS=""
+            fi
+
+            # Run baseline finder (non-fatal)
+            python "${SCRIPT_DIR}/baseline_finder.py" \
+                ${BASELINE_METHODS} \
+                --cache-dir "${WORKSPACE}/../.shared/baselines" \
+                --max 5 \
+                --output "${BASELINE_CTX_FILE}" 2>&1 || {
+                echo "[Phase] Baseline fetching skipped (no repos found or network unavailable)"
+                echo "" > "${BASELINE_CTX_FILE}"
+            }
+
+            BASELINE_CONTEXT=$(cat "${BASELINE_CTX_FILE}" 2>/dev/null || echo "")
+
+            python -c "
+from state_manager import StateManager, Stage
+sm = StateManager('state')
+state = sm.load('${SLUG}')
+sm.complete_stage(state, Stage.BASELINE_FETCHING)
 sm.start_stage(state, Stage.EXPERIMENT_DESIGN)
 "
 
             # Fall through to experiment design
-            cat > /tmp/cr_stage2_prompt.txt << PROMPT_EOF
-你是一个机器学习研究员。请基于文献综述和假说设计实验方案。
-
-研究主题: ${TOPIC}
-文献综述: ${WORKSPACE}/literature/literature_review.md
-研究假说: ${WORKSPACE}/hypothesis/hypothesis_report.md
-
-请完成以下任务：
-1. 阅读文献综述和研究假说
-2. 基于选定的假说设计完整的实验方案，包括：研究问题和假设、方法/模型详细描述、数据集选择、基线方法、评估指标、实验配置（超参、硬件）、消融实验设计
-3. 编写可执行的 Python 实验代码
-4. 编写 run_experiment.sh（包含环境设置、依赖安装、实验执行的全部命令）
-5. 保存实验方案到: ${WORKSPACE}/experiment/experiment_plan.md
-6. 保存代码和脚本到: ${WORKSPACE}/experiment/
-7. 创建 experiment_manifest.json，声明以下字段：
-   - gpu_count：需要的 GPU 数量
-     - 你有 4 张 N6LS-80G GPU，目标是充分利用它们压缩端到端实验时间
-     - 并行策略（按优先级，应逐项考虑）：
-       a) 任务级并行：不同 baseline / 不同消融实验分配到不同 GPU 同时跑，各自设置 CUDA_VISIBLE_DEVICES
-       b) 数据并行：训练用 DataParallel 或 DistributedDataParallel 加速单任务
-       c) 推理并行：认证/评估阶段多 GPU 分片处理不同数据子集
-     - gpu_count 默认填 4；仅当实验完全无法并行时才填 1
-   - estimated_runtime_hours：预估总运行时间（小时）
-     - 单任务算力预算上限为 32 卡时（gpu_count × estimated_runtime_hours ≤ 32）
-     - 例如 4 卡 × 8h = 32 卡时（OK），4 卡 × 12h = 48 卡时（超预算会被拒绝）
-     - 诚实估算整体实验时间；如果超预算，减少实验规模或增加并行度
-     - 示例：{"gpu_count": 4, "estimated_runtime_hours": 6.0}
-8. run_experiment.sh 规范：
-   - 读取 \$GPU_COUNT 环境变量，据此动态设置 CUDA_VISIBLE_DEVICES（不要硬编码为 0）
-   - GPU_COUNT>=2 时，独立子任务必须并行启动（后台进程 + wait），不能串行逐个跑
-   - 训练脚本内部使用 DataParallel 时，传入可见 GPU 数量
-
-重要：只做实验设计，不要做其他事情。完成后明确报告'实验设计完成'。
-PROMPT_EOF
+            BASELINE_CONTEXT="${BASELINE_CONTEXT}" \
+            HYPOTHESIS_CLAUSE="和假说" \
+              HYPOTHESIS_LINE="研究假说: ${WORKSPACE}/hypothesis/hypothesis_report.md" \
+              DESIGN_STEP_1="阅读文献综述和研究假说" \
+              _render_prompt "experiment_design_start.md" /tmp/cr_stage2_prompt.txt
             _claude_task "$(cat /tmp/cr_stage2_prompt.txt)"
 
             # 验证 manifest 是否被创建，缺失时自动补全
@@ -2257,45 +2318,28 @@ from state_manager import StateManager, Stage
 sm = StateManager('state')
 state = sm.load('${SLUG}')
 sm.complete_stage(state, Stage.EXPERIMENT_DESIGN)
+sm.start_stage(state, Stage.ENVIRONMENT_PREPARATION)
+"
+
+            # ── 环境准备 ──
+            _do_environment_preparation "${WORKSPACE}/experiment"
+
+            python -c "
+from state_manager import StateManager, Stage
+sm = StateManager('state')
+state = sm.load('${SLUG}')
+sm.complete_stage(state, Stage.ENVIRONMENT_PREPARATION)
 sm.start_stage(state, Stage.EXPERIMENT_EXECUTION)
 "
             _continue_experiment
             ;;
         experiment_design)
             echo -e "${YELLOW}实验设计阶段 — 重新执行实验设计...${NC}"
-            cat > /tmp/cr_stage2_prompt.txt << PROMPT_EOF
-你是一个机器学习研究员。请基于文献综述设计实验方案。
-
-研究主题: ${TOPIC}
-文献综述: ${WORKSPACE}/literature/literature_review.md
-
-请完成以下任务：
-1. 阅读文献综述
-2. 设计完整的实验方案，包括：研究问题和假设、方法/模型详细描述、数据集选择、基线方法、评估指标、实验配置（超参、硬件）、消融实验设计
-3. 编写可执行的 Python 实验代码
-4. 编写 run_experiment.sh（包含环境设置、依赖安装、实验执行的全部命令）
-5. 保存实验方案到: ${WORKSPACE}/experiment/experiment_plan.md
-6. 保存代码和脚本到: ${WORKSPACE}/experiment/
-7. 创建 experiment_manifest.json，声明以下字段：
-   - gpu_count：需要的 GPU 数量
-     - 你有 4 张 N6LS-80G GPU，目标是充分利用它们压缩端到端实验时间
-     - 并行策略（按优先级，应逐项考虑）：
-       a) 任务级并行：不同 baseline / 不同消融实验分配到不同 GPU 同时跑，各自设置 CUDA_VISIBLE_DEVICES
-       b) 数据并行：训练用 DataParallel 或 DistributedDataParallel 加速单任务
-       c) 推理并行：认证/评估阶段多 GPU 分片处理不同数据子集
-     - gpu_count 默认填 4；仅当实验完全无法并行时才填 1
-   - estimated_runtime_hours：预估总运行时间（小时）
-     - 单任务算力预算上限为 32 卡时（gpu_count × estimated_runtime_hours ≤ 32）
-     - 例如 4 卡 × 8h = 32 卡时（OK），4 卡 × 12h = 48 卡时（超预算会被拒绝）
-     - 诚实估算整体实验时间；如果超预算，减少实验规模或增加并行度
-     - 示例：{"gpu_count": 4, "estimated_runtime_hours": 6.0}
-8. run_experiment.sh 规范：
-   - 读取 \$GPU_COUNT 环境变量，据此动态设置 CUDA_VISIBLE_DEVICES（不要硬编码为 0）
-   - GPU_COUNT>=2 时，独立子任务必须并行启动（后台进程 + wait），不能串行逐个跑
-   - 训练脚本内部使用 DataParallel 时，传入可见 GPU 数量
-
-重要：只做实验设计，不要做其他事情。完成后明确报告'实验设计完成'。
-PROMPT_EOF
+            BASELINE_CTX_FILE="${WORKSPACE}/experiment/baseline_context.md"
+            BASELINE_CONTEXT=$(cat "${BASELINE_CTX_FILE}" 2>/dev/null || echo "")
+            BASELINE_CONTEXT="${BASELINE_CONTEXT}" \
+            HYPOTHESIS_CLAUSE="" HYPOTHESIS_LINE="" DESIGN_STEP_1="阅读文献综述" \
+              _render_prompt "experiment_design_start.md" /tmp/cr_stage2_prompt.txt
             _claude_task "$(cat /tmp/cr_stage2_prompt.txt)"
 
             # 验证 manifest 是否被创建，缺失时自动补全
@@ -2332,6 +2376,17 @@ from state_manager import StateManager, Stage
 sm = StateManager('state')
 state = sm.load('${SLUG}')
 sm.complete_stage(state, Stage.EXPERIMENT_DESIGN)
+sm.start_stage(state, Stage.ENVIRONMENT_PREPARATION)
+"
+
+            # ── 环境准备 ──
+            _do_environment_preparation "${WORKSPACE}/experiment"
+
+            python -c "
+from state_manager import StateManager, Stage
+sm = StateManager('state')
+state = sm.load('${SLUG}')
+sm.complete_stage(state, Stage.ENVIRONMENT_PREPARATION)
 sm.start_stage(state, Stage.EXPERIMENT_EXECUTION)
 "
             _continue_experiment
@@ -2427,6 +2482,7 @@ if [[ ${#PROJECT_SLUGS[@]} -gt 0 ]]; then
             literature_search) s_disp="文献检索" ;;
             hypothesis_generation) s_disp="假说生成" ;;
             experiment_design) s_disp="实验设计" ;;
+            environment_preparation) s_disp="环境准备" ;;
             experiment_execution) s_disp="实验执行" ;;
             paper_writing) s_disp="论文撰写" ;;
             submit_review) s_disp="提交审稿" ;;
@@ -2455,6 +2511,7 @@ if [[ ${#PROJECT_SLUGS[@]} -gt 0 ]]; then
         STAGE="${PROJECT_STAGES[$idx]}"
         ITERATION="${PROJECT_ITERS[$idx]}"
         WORKSPACE="${PROJECT_WORKSPACES[$idx]}"
+        export TOPIC WORKSPACE STAGE ITERATION SLUG
         _setup_logging "$WORKSPACE"
         _continue_project
     else
@@ -2475,19 +2532,7 @@ if [[ ${#PROJECT_SLUGS[@]} -eq 0 ]]; then
     # 调用 Agent 提炼研究主题
     echo ""
     echo -e "${CYAN}Agent 正在分析你的想法并提炼研究主题...${NC}"
-    cat > /tmp/cr_topic_prompt.txt << PROMPT_EOF
-你是一个科研助手。用户描述了以下研究想法：
-
-"${USER_INPUT}"
-
-你的任务：
-1. 理解用户的核心意图
-2. 提炼为一个清晰、具体、可执行的研究主题（英文，适合作为论文学术标题）
-3. 如果用户想法太模糊，基于该方向给出 2-3 个具体的主题建议
-4. 最终输出格式：TOPIC: <提炼后的研究主题>（一行，不要多余内容）
-
-要求：主题要具体（包含方法+问题+场景），例如 "Improving Few-Shot Learning through Adaptive Prompt Optimization for Cross-Domain NLP Tasks"
-PROMPT_EOF
+    USER_INPUT="$USER_INPUT" _render_prompt "topic_refine.md" /tmp/cr_topic_prompt.txt
 
     REFINED=$(cat /tmp/cr_topic_prompt.txt | claude -p --model "${CLAUDE_MODEL:-deepseek-v4-pro}" --output-format text 2>&1) || true
 
@@ -2550,12 +2595,13 @@ print(state.topic_slug)
 
     # 启动日志记录（追加到项目 run.log，不覆盖历史）
     WORKSPACE="$(cd "$WORKSPACE" 2>/dev/null && pwd || echo "$WORKSPACE")"
+    export TOPIC WORKSPACE SLUG
     STAGE="literature_search" ITERATION=0
     _setup_logging "$WORKSPACE"
 
     # ===== Stage 1: 文献检索 =====
     echo ""
-    echo -e "${CYAN}━━━ Stage 1/4: 文献检索 ━━━${NC}"
+    echo -e "${CYAN}━━━ Stage 1/6: 文献检索 ━━━${NC}"
     echo ""
 
     # 直接调用学术 API（arXiv + Semantic Scholar + OpenAlex）
@@ -2590,7 +2636,7 @@ sm.complete_stage(state, Stage.LITERATURE_SEARCH, {'papers_found': 0})
 
     # ===== Stage 2: 假说生成 (ReAct-based) =====
     echo ""
-    echo -e "${CYAN}━━━ Stage 2/5: 假说生成 (ReAct 检索+对比+假说) ━━━${NC}"
+    echo -e "${CYAN}━━━ Stage 2/6: 假说生成 (ReAct 检索+对比+假说) ━━━${NC}"
     echo ""
 
     mkdir -p "${WORKSPACE}/hypothesis/"
@@ -2604,24 +2650,8 @@ sm.complete_stage(state, Stage.LITERATURE_SEARCH, {'papers_found': 0})
     # 让 Claude Code 审阅和补充假说
     if [[ -f "${WORKSPACE}/hypothesis/hypothesis_output.json" ]]; then
         HYPOTHESIS_JSON=$(cat "${WORKSPACE}/hypothesis/hypothesis_output.json" | head -300)
-        cat > /tmp/cr_hypothesis_refine.txt << HYP_EOF
-你是一位资深的科研假说评审专家。请审阅以下假说生成结果，并进行优化。
-
-研究主题: ${TOPIC}
-文献综述: ${WORKSPACE}/literature/literature_review.md
-
-假说生成结果 (JSON):
-${HYPOTHESIS_JSON}
-
-请完成:
-1. 评估每个假说的创新性和可行性
-2. 指出任何遗漏的研究角度
-3. 如果有改进建议，直接修改假说描述
-4. 将优化后的假说保存到 ${WORKSPACE}/hypothesis/hypothesis_report.md
-5. 格式: 每个假说包含标题、详细描述、方法概述、支撑文献、预期结果
-
-完成后报告'假说生成完成'。
-HYP_EOF
+        HYPOTHESIS_JSON="$HYPOTHESIS_JSON" \
+          _render_prompt "hypothesis_refine.md" /tmp/cr_hypothesis_refine.txt
         _claude_task "$(cat /tmp/cr_hypothesis_refine.txt)" || echo "[WARN] 假说审阅跳过"
     else
         echo -e "${YELLOW}hypothesis_engine.py 未生成输出，检查错误日志${NC}"
@@ -2640,46 +2670,64 @@ from state_manager import StateManager, Stage
 sm = StateManager('state')
 state = sm.load('${SLUG}')
 sm.complete_stage(state, Stage.HYPOTHESIS_GENERATION)
+sm.start_stage(state, Stage.BASELINE_FETCHING)
+"
+
+    # ===== Stage 2.5: 基线仓库获取 =====
+    echo ""
+    echo -e "${CYAN}━━━ Stage 2.5/6: 基线仓库获取 ━━━${NC}"
+    echo ""
+
+    BASELINE_CTX_FILE="${WORKSPACE}/experiment/baseline_context.md"
+    mkdir -p "${WORKSPACE}/experiment"
+
+    HYPO_FILE="${WORKSPACE}/hypothesis/hypothesis_output.json"
+    if [ -f "$HYPO_FILE" ]; then
+        python -c "
+import json, sys
+try:
+    data = json.load(open('$HYPO_FILE'))
+    methods = []
+    for h in data.get('hypotheses', []):
+        if isinstance(h, dict):
+            methods.extend(h.get('baselines', []) or h.get('baseline_methods', []))
+    if methods:
+        with open('/tmp/cr_baseline_methods.txt', 'w') as f:
+            f.write(','.join(methods[:10]))
+        sys.exit(0)
+    sys.exit(1)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null && BASELINE_METHODS_ARG="--methods $(cat /tmp/cr_baseline_methods.txt | tr ',' ' ')" || BASELINE_METHODS_ARG=""
+    fi
+
+    python "${SCRIPT_DIR}/baseline_finder.py" \
+        ${BASELINE_METHODS_ARG} \
+        --cache-dir "${WORKSPACE}/../.shared/baselines" \
+        --max 5 \
+        --output "${BASELINE_CTX_FILE}" 2>&1 || {
+        echo "[Phase] Baseline fetching skipped (no repos found or network unavailable)"
+        echo "" > "${BASELINE_CTX_FILE}"
+    }
+
+    BASELINE_CONTEXT=$(cat "${BASELINE_CTX_FILE}" 2>/dev/null || echo "")
+
+    python -c "
+from state_manager import StateManager, Stage
+sm = StateManager('state')
+state = sm.load('${SLUG}')
+sm.complete_stage(state, Stage.BASELINE_FETCHING)
+sm.start_stage(state, Stage.EXPERIMENT_DESIGN)
 "
 
     # ===== Stage 3: 实验设计 =====
     echo ""
-    echo -e "${CYAN}━━━ Stage 3/5: 实验设计 ━━━${NC}"
+    echo -e "${CYAN}━━━ Stage 3/6: 实验设计 ━━━${NC}"
     echo ""
 
-    cat > /tmp/cr_stage2_prompt.txt << PROMPT_EOF
-你是一个机器学习研究员。请基于文献综述设计实验方案。
-
-研究主题: ${TOPIC}
-文献综述: ${WORKSPACE}/literature/literature_review.md
-
-请完成以下任务：
-1. 阅读文献综述
-2. 设计完整的实验方案，包括：研究问题和假设、方法/模型详细描述、数据集选择、基线方法、评估指标、实验配置（超参、硬件）、消融实验设计
-3. 编写可执行的 Python 实验代码
-4. 编写 run_experiment.sh（包含环境设置、依赖安装、实验执行的全部命令）
-5. 保存实验方案到: ${WORKSPACE}/experiment/experiment_plan.md
-6. 保存代码和脚本到: ${WORKSPACE}/experiment/
-7. 创建 experiment_manifest.json，声明以下字段：
-   - gpu_count：需要的 GPU 数量
-     - 你有 4 张 N6LS-80G GPU，目标是充分利用它们压缩端到端实验时间
-     - 并行策略（按优先级，应逐项考虑）：
-       a) 任务级并行：不同 baseline / 不同消融实验分配到不同 GPU 同时跑，各自设置 CUDA_VISIBLE_DEVICES
-       b) 数据并行：训练用 DataParallel 或 DistributedDataParallel 加速单任务
-       c) 推理并行：认证/评估阶段多 GPU 分片处理不同数据子集
-     - gpu_count 默认填 4；仅当实验完全无法并行时才填 1
-   - estimated_runtime_hours：预估总运行时间（小时）
-     - 单任务算力预算上限为 32 卡时（gpu_count × estimated_runtime_hours ≤ 32）
-     - 例如 4 卡 × 8h = 32 卡时（OK），4 卡 × 12h = 48 卡时（超预算会被拒绝）
-     - 诚实估算整体实验时间；如果超预算，减少实验规模或增加并行度
-     - 示例：{"gpu_count": 4, "estimated_runtime_hours": 6.0}
-8. run_experiment.sh 规范：
-   - 读取 \$GPU_COUNT 环境变量，据此动态设置 CUDA_VISIBLE_DEVICES（不要硬编码为 0）
-   - GPU_COUNT>=2 时，独立子任务必须并行启动（后台进程 + wait），不能串行逐个跑
-   - 训练脚本内部使用 DataParallel 时，传入可见 GPU 数量
-
-重要：只做实验设计，不要做其他事情。完成后明确报告'实验设计完成'。
-PROMPT_EOF
+    BASELINE_CONTEXT="${BASELINE_CONTEXT}" \
+    HYPOTHESIS_CLAUSE="" HYPOTHESIS_LINE="" DESIGN_STEP_1="阅读文献综述" \
+      _render_prompt "experiment_design_start.md" /tmp/cr_stage2_prompt.txt
     _claude_task "$(cat /tmp/cr_stage2_prompt.txt)"
 
     # 验证 manifest 是否被创建，缺失时自动补全
@@ -2716,12 +2764,46 @@ from state_manager import StateManager, Stage
 sm = StateManager('state')
 state = sm.load('${SLUG}')
 sm.complete_stage(state, Stage.EXPERIMENT_DESIGN)
+sm.start_stage(state, Stage.ENVIRONMENT_PREPARATION)
+"
+
+    # ===== Stage 4/6: 环境准备 =====
+    echo ""
+    echo -e "${CYAN}━━━ Stage 4/6: 环境准备（预下载依赖）━━━${NC}"
+    echo ""
+
+    # 调用 sco_runner 内部函数进行预下载，利用本地网络（镜像/VPN）下载
+    # wheels、模型、数据集到共享存储，确保 SCO 容器离线可用。
+    _do_environment_preparation "${WORKSPACE}/experiment"
+
+    # 轻量级审查门控：确认关键缓存路径非空
+    echo ""
+    echo "[env-prep review] 检查共享缓存..."
+    CACHE_DIR="${SCRIPT_DIR}/workspace/.shared/cache"
+    WHEELS_COUNT=$(find "${CACHE_DIR}/wheels/" -name "*.whl" 2>/dev/null | wc -l)
+    DATASET_CACHE="${CACHE_DIR}/datasets"
+    DATASET_DIRS=$(find "$DATASET_CACHE" -type d -mindepth 1 -maxdepth 2 2>/dev/null | wc -l || echo "0")
+    echo "  wheels: ${WHEELS_COUNT} 个 .whl 文件"
+    echo "  datasets: ${DATASET_DIRS} 个缓存目录"
+    if [[ "$WHEELS_COUNT" -ge 5 ]]; then
+        echo -e "  ${GREEN}✓ 环境准备完成${NC}"
+    else
+        echo -e "  ${YELLOW}⚠ wheels 数量偏少 ($WHEELS_COUNT)，SCO 容器可能无法安装依赖${NC}"
+        echo -e "  ${YELLOW}  将尝试继续执行 (SCO 容器镜像可能已预装所需包)${NC}"
+    fi
+    echo ""
+
+    python -c "
+from state_manager import StateManager, Stage
+sm = StateManager('state')
+state = sm.load('${SLUG}')
+sm.complete_stage(state, Stage.ENVIRONMENT_PREPARATION)
 sm.start_stage(state, Stage.EXPERIMENT_EXECUTION)
 "
 
-    # ===== Stage 4: 实验执行（本地优先，SCO 后备）=====
+    # ===== Stage 5/6: 实验执行（本地优先，SCO 后备）=====
     echo ""
-    echo -e "${CYAN}━━━ Stage 4/5: 实验执行（本地优先）━━━${NC}"
+    echo -e "${CYAN}━━━ Stage 5/6: 实验执行（本地优先）━━━${NC}"
     echo ""
 
     EXP_SCRIPT="${WORKSPACE}/experiment/run_experiment.sh"
@@ -2832,35 +2914,9 @@ sm.save(state)
                 fi
                 ERROR_LOG=$(tail -100 "${LATEST_LOG}" 2>/dev/null || echo "无法读取日志")
 
-                cat > /tmp/cr_debug_prompt.txt << PROMPT_EOF
-你是实验调试专家。实验执行失败了（第 ${debug_round} 轮修复），请诊断并修复。
-
-**后端**: ${BACKEND}
-**原始错误**: ${ERROR_SUMMARY}
-**上一轮修复后的错误日志 (最后100行)**:
-${ERROR_LOG}
-
-**实验脚本**: ${WORKSPACE}/experiment/run_experiment.sh
-**工作目录**: ${WORKSPACE}/experiment/
-
-你的任务:
-1. 仔细分析错误日志，找出失败原因
-2. 注意之前轮次的修复尝试（如果有）
-3. 修改实验脚本或代码来修复问题
-4. 保存修改后的文件
-5. 报告 "FIX_READY" 表示已修复
-
-常见问题及修复:
-- 依赖缺失 (如 python3-venv) → 先 apt-get install，再让脚本正常工作
-- 路径错误 → 修正文件路径
-- 虚拟环境损坏 → 删除 .venv 目录让脚本重建，或跳过 venv 直接用系统 Python
-- 语法错误 → 修正代码
-- pip 不可用 → 使用 python3 -m pip 代替裸 pip
-- 环境不兼容 → 修改脚本适配当前环境
-- OOM / CUDA out of memory → 减小 batch_size 或模型大小
-- 实验被超时中断 → 不要删除 checkpoints/ 下的 .pth 文件，run_experiment.sh 已配置 --resume 自动续跑
-- CUDA_VISIBLE_DEVICES 硬编码为单一GPU → 改用 \$GPU_COUNT 环境变量动态适配多GPU
-PROMPT_EOF
+                debug_round="$debug_round" BACKEND="$BACKEND" ERROR_SUMMARY="$ERROR_SUMMARY" \
+                  ERROR_LOG="$ERROR_LOG" \
+                  _render_prompt "local_debug_extended.md" /tmp/cr_debug_prompt.txt
                 _claude_task "$(cat /tmp/cr_debug_prompt.txt)" 2>&1
 
                 # ── 修复后重试 ──

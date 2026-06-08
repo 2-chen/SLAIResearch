@@ -19,7 +19,9 @@ Design a complete experimental plan that:
 
 3. **Datasets**: Specify which datasets to use, why, and how to preprocess them.
 
-4. **Baselines**: List all baseline methods to compare against, with justification for each.
+4. **Baselines**: List all baseline methods to compare against, with justification for each. When available, consult the structural references below for implementation accuracy.
+
+{{BASELINE_CONTEXT}}
 
 5. **Evaluation Metrics**: Define clear, quantitative metrics. Include both primary and secondary metrics.
 

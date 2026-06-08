@@ -15,11 +15,13 @@ import requests
 import re
 import hashlib
 import urllib.parse
+from typing import Optional
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger("search")
 
 from config import SEMANTIC_SCHOLAR_API_KEY
+from citation_tools import DOIConverter, GoogleScholarSearch, DataCiteClient
 
 # ---------------------------------------------------------------------------
 # Paper ID extraction (for dedup + PDF download)
@@ -212,6 +214,128 @@ def search_openalex(query: str, max_results: int = 20) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Google Scholar (free, via scholarly package — optional dependency)
+# ---------------------------------------------------------------------------
+
+def search_google_scholar(query: str, max_results: int = 20) -> list[dict]:
+    """Search Google Scholar via scholarly. Gracefully returns [] if scholarly
+    is not installed or the query is rate-limited."""
+    try:
+        searcher = GoogleScholarSearch()
+        results = searcher.search(query, max_results=max_results)
+        papers = []
+        for r in results:
+            # Normalize to standard paper dict format
+            authors = r.get("authors", "")
+            author_list = [a.strip() for a in authors.split(",") if a.strip()]
+            papers.append({
+                "source": "google_scholar",
+                "title": r.get("title", ""),
+                "authors": author_list,
+                "year": r.get("year", ""),
+                "abstract": r.get("abstract", ""),
+                "url": r.get("url", ""),
+                "arxiv_id": _extract_arxiv_id(r.get("url", "")),
+                "open_access_pdf_url": "",
+                "citations": r.get("citations", 0),
+                "venue": r.get("venue", ""),
+            })
+        return papers
+    except Exception as e:
+        logger.warning("Google Scholar error: %s", e)
+        return []
+
+
+# ---------------------------------------------------------------------------
+# DataCite (free, no key — datasets, software, research outputs)
+# ---------------------------------------------------------------------------
+
+def search_datacite(query: str, max_results: int = 20) -> list[dict]:
+    """Search DataCite for datasets/software. Returns paper-like dicts for
+    compatibility with merge_results."""
+    try:
+        client = DataCiteClient()
+        results = client.search(query, max_results=max_results)
+        papers = []
+        for r in results:
+            # Normalize to standard paper dict format
+            creators = r.get("creators", [])
+            author_list = creators if creators else (
+                [r.get("authors", "")] if r.get("authors") else []
+            )
+            papers.append({
+                "source": "datacite",
+                "title": r.get("title", ""),
+                "authors": author_list,
+                "year": r.get("year", ""),
+                "abstract": r.get("description", ""),
+                "url": f"https://doi.org/{r.get('doi', '')}",
+                "arxiv_id": "",
+                "open_access_pdf_url": "",
+                "citations": r.get("citations", 0),
+                "venue": r.get("publisher", ""),
+                "resource_type": r.get("resourceType", ""),
+            })
+        return papers
+    except Exception as e:
+        logger.warning("DataCite error: %s", e)
+        return []
+
+
+# ---------------------------------------------------------------------------
+# CrossRef metadata enrichment
+# ---------------------------------------------------------------------------
+
+def _enrich_with_crossref(papers: list[dict]) -> list[dict]:
+    """Enrich papers that have DOIs with CrossRef metadata.
+
+    Papers from arXiv may lack journal/volume/pages info. This fills those gaps
+    using the CrossRef API (free, no key)."""
+    converter = DOIConverter()
+    enriched = []
+    for p in papers:
+        doi = _extract_doi(p.get("url", ""))
+        if not doi:
+            # Also try open_access_pdf_url
+            doi = _extract_doi(p.get("open_access_pdf_url", ""))
+        if doi:
+            try:
+                meta = converter._get_crossref_metadata(doi)
+                if meta:
+                    # Fill in missing fields (don't overwrite existing)
+                    if not p.get("venue"):
+                        p["venue"] = meta.get("journal", "")
+                    if meta.get("volume"):
+                        p.setdefault("volume", meta["volume"])
+                    if meta.get("pages"):
+                        p.setdefault("pages", meta["pages"])
+                    # Use DOI as canonical URL if current URL is not a DOI
+                    if not p.get("url", "").startswith("https://doi.org/"):
+                        p["doi"] = doi
+            except Exception as e:
+                logger.debug("CrossRef enrich error: %s", e)
+        enriched.append(p)
+    return enriched
+
+
+# ---------------------------------------------------------------------------
+# DOI extraction helper
+# ---------------------------------------------------------------------------
+
+def _extract_doi(url_or_text: str) -> str:
+    """Extract a clean DOI from a URL or text snippet."""
+    if not url_or_text:
+        return ""
+    m = re.search(r"(10\.\d{4,}/[^\s\]\)\"\'\,]+)", url_or_text)
+    if m:
+        doi = m.group(1)
+        # Clean trailing punctuation
+        doi = doi.rstrip(".,;:)}]\"'")
+        return doi
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # JSON metadata export (for hypothesis engine integration)
 # ---------------------------------------------------------------------------
 
@@ -386,12 +510,22 @@ def _title_key(title: str) -> str:
 
 
 def merge_results(all_papers: list[dict]) -> list[dict]:
-    """Deduplicate by title, prefer entries with abstracts."""
+    """Deduplicate by DOI first (more reliable), then title. Prefer entries
+    with abstracts, then those with higher citation counts."""
     seen: dict[str, dict] = {}
-    for p in sorted(all_papers, key=lambda x: len(x.get("abstract") or "")):
-        key = _title_key(p["title"])
-        if key not in seen:
-            seen[key] = p
+    # Sort: prefer papers with abstracts, then higher citations
+    for p in sorted(all_papers, key=lambda x: (
+        len(x.get("abstract") or ""),
+        x.get("citations") or 0,
+    )):
+        # DOI-based key (most reliable)
+        doi = _extract_doi(p.get("url", ""))
+        if doi:
+            key = f"doi:{doi.lower()}"
+        else:
+            key = _title_key(p["title"])
+        # Overwrite: later entries in the sorted order have richer abstracts
+        seen[key] = p
     # Sort by citations desc
     return sorted(seen.values(), key=lambda x: x.get("citations") or 0, reverse=True)
 
@@ -406,7 +540,7 @@ def format_markdown(papers: list[dict], query: str) -> str:
         f"# Literature Review: {query}",
         "",
         f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-        f"Papers found: {len(papers)} (sources: arXiv, Semantic Scholar, OpenAlex)",
+        f"Papers found: {len(papers)} (sources: arXiv, Semantic Scholar, OpenAlex, Google Scholar, DataCite)",
         "",
         "---",
         "",
@@ -441,9 +575,20 @@ def format_markdown(papers: list[dict], query: str) -> str:
 
 
 def format_bibtex(papers: list[dict]) -> str:
-    """Generate BibTeX entries for all papers."""
+    """Generate BibTeX entries. Uses CrossRef for DOIs (authoritative), falls
+    back to in-hand metadata for arXiv/non-DOI papers."""
+    converter = DOIConverter()
     entries = []
     for i, p in enumerate(papers, 1):
+        # Try CrossRef content negotiation for papers with DOIs
+        doi = _extract_doi(p.get("url", ""))
+        if doi:
+            bibtex = converter.doi_to_bibtex(doi)
+            if bibtex:
+                entries.append(bibtex)
+                continue
+
+        # Fallback: generate from in-hand metadata
         key = f"ref{i}"
         title = p["title"].replace("{", "\\{").replace("}", "\\}")
         authors = " and ".join(p["authors"][:5])
@@ -460,15 +605,99 @@ def format_bibtex(papers: list[dict]) -> str:
                 f"  archivePrefix = {{arXiv}},\n"
                 f"}}"
             )
-        else:
+        elif doi:
             entries.append(
                 f"@misc{{{key},\n"
                 f"  title = {{{title}}},\n"
                 f"  author = {{{authors}}},\n"
                 f"  year = {{{year}}},\n"
+                f"  doi = {{{doi}}},\n"
                 f"}}"
             )
+        else:
+            venue = p.get("venue", "")
+            lines = [
+                f"@misc{{{key},",
+                f"  title = {{{title}}},",
+                f"  author = {{{authors}}},",
+                f"  year = {{{year}}},",
+            ]
+            if venue:
+                lines.append(f"  note = {{{venue}}},")
+            lines.append("}")
+            entries.append("\n".join(lines))
     return "\n\n".join(entries)
+
+
+# ---------------------------------------------------------------------------
+# Post-processing helpers
+# ---------------------------------------------------------------------------
+
+def filter_by_year(papers: list[dict], start_year: int = None, end_year: int = None) -> list[dict]:
+    """Filter papers by publication year range (inclusive)."""
+    if start_year is None and end_year is None:
+        return papers
+    filtered = []
+    for p in papers:
+        try:
+            year = int(p.get("year", 0))
+        except (ValueError, TypeError):
+            # Include papers with unparseable years
+            filtered.append(p)
+            continue
+        if start_year is not None and year < start_year:
+            continue
+        if end_year is not None and year > end_year:
+            continue
+        filtered.append(p)
+    return filtered
+
+
+def rank_results(papers: list[dict], criteria: str = "citations") -> list[dict]:
+    """Rank papers by the given criteria.
+
+    Args:
+        papers: List of paper dicts.
+        criteria: One of 'citations' (default), 'year', or 'relevance'.
+
+    Returns:
+        Sorted list of papers (descending).
+    """
+    if criteria == "citations":
+        return sorted(papers, key=lambda x: x.get("citations") or 0, reverse=True)
+    elif criteria == "year":
+        return sorted(papers, key=lambda x: x.get("year", "0"), reverse=True)
+    elif criteria == "relevance":
+        return sorted(papers, key=lambda x: x.get("citations") or 0, reverse=True)
+    return papers
+
+
+def generate_search_summary(papers: list[dict]) -> dict:
+    """Generate summary statistics for search results."""
+    summary: dict = {
+        "total_results": len(papers),
+        "sources": {},
+        "year_distribution": {},
+        "avg_citations": 0.0,
+        "total_citations": 0,
+    }
+    citations = []
+    for p in papers:
+        src = p.get("source", "Unknown")
+        summary["sources"][src] = summary["sources"].get(src, 0) + 1
+        year = p.get("year", "Unknown")
+        summary["year_distribution"][year] = (
+            summary["year_distribution"].get(year, 0) + 1
+        )
+        if p.get("citations"):
+            try:
+                citations.append(int(p["citations"]))
+            except (ValueError, TypeError):
+                pass
+    if citations:
+        summary["avg_citations"] = round(sum(citations) / len(citations), 1)
+        summary["total_citations"] = sum(citations)
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +713,12 @@ def main():
     parser.add_argument("--no-arxiv", action="store_true")
     parser.add_argument("--no-s2", action="store_true")
     parser.add_argument("--no-openalex", action="store_true")
+    parser.add_argument("--google-scholar", action="store_true", help="Also search Google Scholar (requires scholarly package)")
+    parser.add_argument("--datacite", action="store_true", help="Also search DataCite (datasets/software)")
+    parser.add_argument("--year-start", type=int, help="Filter by minimum publication year")
+    parser.add_argument("--year-end", type=int, help="Filter by maximum publication year")
+    parser.add_argument("--no-enrich", action="store_true", help="Skip CrossRef metadata enrichment")
+    parser.add_argument("--summary", action="store_true", help="Show search result summary statistics")
     parser.add_argument("--save-json", default=None, help="Save paper metadata as JSON to this path")
     parser.add_argument("--download-pdfs", default=None, help="Download top-N PDFs to this directory (N from --num)")
     args = parser.parse_args()
@@ -511,12 +746,44 @@ def main():
         except Exception as e:
             logger.error("OpenAlex failed: %s", e)
 
+    if args.google_scholar:
+        try:
+            all_papers.extend(search_google_scholar(args.query, args.num))
+        except Exception as e:
+            logger.error("Google Scholar failed: %s", e)
+
+    if args.datacite:
+        try:
+            all_papers.extend(search_datacite(args.query, args.num))
+        except Exception as e:
+            logger.error("DataCite failed: %s", e)
+
     if not all_papers:
         logger.error("No results from any source. Try a different query.")
         sys.exit(1)
 
     merged = merge_results(all_papers)
     logger.info("Total unique papers: %d", len(merged))
+
+    # CrossRef metadata enrichment
+    if not args.no_enrich:
+        try:
+            merged = _enrich_with_crossref(merged)
+            logger.info("CrossRef enrichment complete")
+        except Exception as e:
+            logger.warning("CrossRef enrichment failed: %s", e)
+
+    # Year filter
+    if args.year_start or args.year_end:
+        before = len(merged)
+        merged = filter_by_year(merged, args.year_start, args.year_end)
+        logger.info("Year filter: %d → %d papers", before, len(merged))
+
+    # Summary statistics
+    if args.summary:
+        summary = generate_search_summary(merged)
+        print(json.dumps(summary, indent=2))
+        print()
 
     # Write markdown review
     md = format_markdown(merged, args.query)
