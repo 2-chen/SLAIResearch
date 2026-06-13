@@ -2,17 +2,30 @@
 
 你是 ChenResearch 科研系统的执行工具。`start.sh` 是控制器，会在需要时调用你执行具体任务。每次调用只做一件事，上下文保持干净。
 
-## 可用工具
+## 执行模式
 
-### 文献检索
-首选工具 — 直接调用学术 API:
+### 实验环节 — Claude Code 全权接管
+实验环节（从实验设计到结果产出）由 Claude Code 完全自主执行，不再由硬编码流程控制。
+
+**系统提示词**: `prompts/experiment_scientist_system.md`
+**任务模板**: `prompts/experiment_scientist_task.md`
+
+控制器调用方式：
+```bash
+claude -p "$(python prompt_render.py prompts/experiment_scientist_task.md ...)" \
+       --system-prompt prompts/experiment_scientist_system.md \
+       --model deepseek-v4-pro \
+       --output-format text
+```
+
+Claude Code 自主完成：环境检查 → 实验设计 → 代码编写 → 本地/SCO 执行 → 调试修复 → 评估迭代 → 结果报告。
+
+### 文献检索（控制器直接调度）
 ```bash
 python search_papers.py "research query" -o workspace/<topic>/literature/
 ```
-这会自动调用 arXiv + Semantic Scholar + OpenAlex，生成 `literature_review.md` + `references.bib`。
-- 新增可选来源: `--google-scholar` (Google Scholar)、`--datacite` (数据集/软件)
-- 新增过滤选项: `--year-start YYYY --year-end YYYY`、`--summary`
-- WebSearch 仅作补充
+- 自动调用 arXiv + Semantic Scholar + OpenAlex
+- 可选: `--google-scholar`、`--datacite`、`--year-start/end`、`--summary`
 
 ### 引用工具（全部免费，无需 API Key）
 ```bash
@@ -20,9 +33,14 @@ python citation_tools.py doi-to-bibtex <DOI>            # CrossRef -> BibTeX
 python citation_tools.py extract --doi <DOI>             # 结构化元数据提取
 python citation_tools.py extract --arxiv <arXiv_ID>      # arXiv ID -> 元数据
 python citation_tools.py verify --file <markdown_file>   # DOI 验证 + APA/Nature 引用格式化
-python citation_tools.py scholar "<query>"               # Google Scholar 搜索 (需 pip install scholarly)
+python citation_tools.py scholar "<query>"               # Google Scholar 搜索
 python citation_tools.py datacite <DOI_or_query>          # DataCite 数据集/软件 DOI 查询
 ```
+
+### 实验辅助工具（Claude Code 可选调用）
+- `python experiment_runner.py preflight <dir>` — 实验代码预检（语法/导入/结构）
+- `python experiment_runner.py diagnose <dir>` — 增强错误诊断 + debug memory
+- `python sco_runner.py run <dir>` — 程序化 SCO 作业提交（可选，推荐直接用 sco CLI）
 
 ### SCO 云端 GPU
 - `sco acp jobs create` — 提交训练任务
@@ -38,7 +56,7 @@ python citation_tools.py datacite <DOI_or_query>          # DataCite 数据集/�
 
 ### Python 工具
 - `paperreview_api.py` — paperreview.ai 上传和轮询
-- `sco_runner.py` — SCO CLI 封装
+- `sco_runner.py` — SCO CLI 封装（Claude Code 可选调用）
 - `state_manager.py` — 状态持久化
 - `config.py` — 统一配置
 - `review_tools.py` — 自动化审稿检查（AI痕迹、引用覆盖、文献对比）
@@ -55,7 +73,8 @@ python citation_tools.py datacite <DOI_or_query>          # DataCite 数据集/�
 
 ## 规则
 
-1. **只做被要求的事** — 不要自作主张
+1. **实验环节驱动方式**: Claude Code 以实验科学家系统提示词自主执行，不依赖硬编码流程
 2. **如实报告** — 编造实验结果比没有结果更糟糕
 3. **保存到指定路径** — 严格按照 prompt 中的文件路径保存
 4. **明确报告完成** — 任务完成后说"XXX完成"
+5. **受保护文件** — `sco_runner.py`、`config.py`、`workspace/.shared/` 不可修改

@@ -70,42 +70,28 @@ Write a complete academic paper with the following sections:
 - Save compiled PDF to: {{OUTPUT_DIR}}/paper.pdf
 - Save BibTeX to: {{OUTPUT_DIR}}/references.bib
 
-## Figures & Tables — Publication Quality Standards
+## Figures & Tables — MUST INCLUDE ALL
 
-Generate ALL quantitative figures using `figure_generation.py`:
-```bash
-# Bar chart for main results
-python figure_generation.py bar --methods "Baseline1" "Baseline2" "Ours" --values 72.3 74.1 78.9 --metric "Accuracy (%)" -o {{OUTPUT_DIR}}/figures
+**IMPORTANT**: Experiment figures already exist. Your job:
+1. Copy all from experiment: `cp experiment/figures/*.pdf paper/figures/`
+2. Copy LaTeX table: `cp experiment/figures/*.tex paper/figures/`
+3. Insert EVERY figure into the paper — don't leave any out
+4. Reference every figure and table in the text
+5. Do NOT generate new figures — use the experiment outputs
 
-# Or use the Python API:
-python -c "
-from figure_generation import FigureGenerator, TableGenerator
-fg = FigureGenerator('{{OUTPUT_DIR}}/figures')
-fg.bar_comparison(methods=['A','B','Ours'], values=[72,74,79], metric_name='Accuracy (%)')
-tg = TableGenerator()
-print(tg.main_results_table(methods=['A','B','Ours'], metrics={'Acc':[72,74,79], 'F1':[68,70,74]}))
-"
-```
-
-**Figure requirements** (Nature/CCF-A standards):
-- PDF vector format (not PNG raster)
-- Font size ≥7pt in all text elements
-- Colorblind-safe palette (Wong 2011)
-- Same color = same method across ALL figures
+**Figure requirements**:
+- `\includegraphics[width=\columnwidth]{...}` for single-column figures
+- `\includegraphics[width=\textwidth]{...}` for figure* (cross-column)
 - Each figure gets a self-contained caption
 
 **Table requirements** (booktabs style):
-- NO vertical rules — period
-- Only \toprule, \midrule, \bottomrule (no other horizontal rules)
+- NO vertical rules
+- Only `\toprule`, `\midrule`, `\bottomrule`
 - Bold best result per column, underline second-best
-- Arrow indicators on metric headers ($\uparrow$ / $\downarrow$)
-- Caption is self-contained mini-abstract
-- Never use \resizebox — restructure the table instead
 
 CRITICAL REQUIREMENTS:
 - Every factual claim must have a citation
-- All figures/tables must be properly labeled and referenced
-- The paper must compile without errors
-- Use proper academic writing style — clear, precise, objective
-- Do NOT fabricate results — only report what was actually found in the experiments
-- If experiments haven't been run yet, clearly mark placeholder sections with [EXPERIMENTAL RESULTS PENDING]
+- ALL figures/tables from experiment must be included and referenced in text
+- The paper must compile without errors (pdflatex -> bibtex -> pdflatex x2)
+- Use proper academic writing style
+- Do NOT fabricate results — only report actual experiment data

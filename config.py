@@ -229,3 +229,32 @@ DATACITE_RATE_LIMIT_DELAY = float(os.environ.get(
 ))
 """Delay between DataCite API requests (seconds).  DataCite has no stated hard
 limit for unauthenticated access; 0.2 s is polite."""
+
+# ---------------------------------------------------------------------------
+# Experiment scientist — Claude Code prompt-driven experiment execution
+# ---------------------------------------------------------------------------
+
+EXPERIMENT_SYSTEM_PROMPT = os.environ.get(
+    "CHENRESEARCH_EXPERIMENT_SYSTEM_PROMPT",
+    os.path.join(os.path.dirname(__file__), "prompts", "experiment_scientist_system.md"),
+)
+"""Path to the experiment scientist system prompt.  Claude Code loads this
+via ``--system-prompt`` when taking over the experiment phase."""
+
+EXPERIMENT_TASK_TEMPLATE = os.environ.get(
+    "CHENRESEARCH_EXPERIMENT_TASK_TEMPLATE",
+    os.path.join(os.path.dirname(__file__), "prompts", "experiment_scientist_task.md"),
+)
+"""Path to the per-task prompt template (``${VAR}``-style placeholders)."""
+
+EXPERIMENT_MAX_DEBUG_ROUNDS = int(os.environ.get(
+    "CHENRESEARCH_EXPERIMENT_MAX_DEBUG_ROUNDS", "20",
+))
+"""Maximum auto-debug rounds when an experiment fails.  After this many rounds
+the experiment is marked as failed and the controller moves on."""
+
+EXPERIMENT_CLAUDE_TIMEOUT = int(os.environ.get(
+    "CHENRESEARCH_EXPERIMENT_CLAUDE_TIMEOUT", "3600",
+))
+"""Maximum time (seconds) a single Claude Code experiment session can run
+before the controller times it out."""

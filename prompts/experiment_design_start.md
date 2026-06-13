@@ -5,6 +5,13 @@
 ${HYPOTHESIS_LINE}
 ${BASELINE_CONTEXT}
 
+## 共享基础设施（所有路径必须用绝对路径，不可用相对路径拼接 ROOT_DIR）
+- 全局共享缓存: /data/AutoResearch/ChenResearch/workspace/.shared/cache/
+- 预装包路径: /data/AutoResearch/ChenResearch/env/site-packages/ (datasets, accelerate, sklearn 可从此加载)
+- 模型下载: source /data/AutoResearch/ChenResearch/workspace/.shared/download_model.sh (已内置三层回退)
+- SCO 容器无网络，pip install 必须用 --no-index --find-links /data/AutoResearch/ChenResearch/workspace/.shared/cache/wheels/
+- 数据集: tar -xzf /data/AutoResearch/ChenResearch/workspace/.shared/cache/datasets_cache.tar.gz -C ~/.cache/huggingface/
+
 请完成以下任务：
 1. ${DESIGN_STEP_1}
 2. 设计完整的实验方案，包括：研究问题和假设、方法/模型详细描述、数据集选择、基线方法、评估指标、实验配置（超参、硬件）、消融实验设计

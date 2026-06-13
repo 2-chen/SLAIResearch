@@ -6,19 +6,26 @@
 样式文件已放在 ${WORKSPACE}/paper/ 目录下（aaai2026.sty, aaai2026.bst）。
 LaTeX 模板参考: templates/aaai.tex.j2
 
-请阅读以下材料：
-1. 文献综述: ${WORKSPACE}/literature/literature_review.md
-2. 实验日志: ${WORKSPACE}/experiment/sco_logs.txt
+## 材料来源（必须全部读取）
 
-请完成：
-1. 撰写 LaTeX 论文，必须使用 \usepackage[submission]{aaai2026} 样式
-2. Preamble 必须包含: times, helvet, courier, natbib, caption, graphicx
-3. 禁止使用的包: hyperref, authblk, geometry, float, titlesec, setspace, fullpage, ulem
-4. 所有数据必须来自真实实验日志，不要编造
-5. 保存到: ${WORKSPACE}/paper/paper.tex
-6. 编译前确保 aaai2026.sty 和 aaai2026.bst 在同一目录
-7. 用 pdflatex 编译为 PDF，修复所有 Overfull hbox 警告后再报告完成
-8. 保存 BibTeX: ${WORKSPACE}/paper/references.bib
+1. **文献综述**: ${WORKSPACE}/literature/literature_review.md
+2. **实验日志**: ${WORKSPACE}/experiment/experiment_log.md (15KB, 完整实验过程)
+3. **实验数据**: ${WORKSPACE}/experiment/results/*/results.json (50+ 个独立实验的指标)
+4. **实验图表**: ${WORKSPACE}/experiment/figures/ (6张PDF图表 + 1个LaTeX表格)
+
+## 必须完成的任务
+
+1. 撰写 LaTeX 论文，使用 \usepackage[submission]{aaai2026} 样式
+2. **复制所有实验图表**: cp ${WORKSPACE}/experiment/figures/*.pdf ${WORKSPACE}/paper/figures/
+3. **复制 LaTeX 表格**: cp ${WORKSPACE}/experiment/figures/table_results_cifar10.tex ${WORKSPACE}/paper/figures/
+4. **论文中必须包含所有实验图表** — 6张 PDF 图和 1张 LaTeX 表全部插入正文
+5. Preamble 必须包含: times, helvet, courier, natbib, caption, graphicx, booktabs, multirow (用于表格)
+6. 禁止使用的包: hyperref, authblk, geometry, float, titlesec, setspace, fullpage, ulem
+7. 所有数据必须来自真实实验日志和 results.json，不要编造
+8. 保存到: ${WORKSPACE}/paper/paper.tex
+9. 保存参考文献: ${WORKSPACE}/paper/references.bib
+10. 用 pdflatex → bibtex → pdflatex × 2 编译
+11. 修复所有 Overfull hbox 警告后再报告完成
 
 **LaTeX 排版规范（必须遵守，AAAI 2026 是两栏排版）**:
 

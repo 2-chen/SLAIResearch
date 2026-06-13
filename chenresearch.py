@@ -17,6 +17,7 @@ import re
 import time
 import subprocess
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -750,65 +751,101 @@ def _do_baseline_fetching(sm: StateManager, state: ResearchState, retry_feedback
 
 
 def _do_experiment_design(sm: StateManager, state: ResearchState, retry_feedback: str = "") -> ResearchState:
-    lit = _read_or(state.literature_dir, "literature_review.md")
+    """Prompt-driven experiment phase — Claude Code autonomously handles design
+    through execution via the experiment scientist system prompt.
 
-    # Load baseline context if available
+    This replaces the old hardcoded experiment pipeline (preflight → schedule →
+    local/SCO dispatch → debug loop).  Claude Code now owns the full experiment
+    lifecycle: environment check → code writing → local/SCO execution → debug
+    → evaluation → report.
+    """
+    from config import (
+        EXPERIMENT_SYSTEM_PROMPT, EXPERIMENT_TASK_TEMPLATE,
+        SCO_WORKSPACE, SCO_AEC2, SCO_IMAGE, SCO_STORAGE_MOUNT,
+        SCO_WORKER_SPEC_MAP, MAX_COMPUTE_BUDGET_GPU_HOURS,
+        EXPERIMENT_MAX_DEBUG_ROUNDS, EXPERIMENT_CLAUDE_TIMEOUT,
+        LOCAL_EXECUTION_TIMEOUT, LOCAL_EXECUTION_MAX_RETRIES,
+        DOWNLOAD_CACHE_DIR,
+    )
+
+    # Read inputs
+    lit = _read_or(state.literature_dir, "literature_review.md")
+    hyp = _read_or(state.hypothesis_dir, "hypothesis_output.json")
+
+    # Baseline context (if available)
     baseline_ctx = ""
     baseline_path = Path(state.experiment_dir) / "baseline_context.md"
     if baseline_path.exists():
         baseline_ctx = baseline_path.read_text()
 
-    prompt = _load_prompt("experiment_design.md",
-        TOPIC=state.topic,
-        LITERATURE_REVIEW=lit[:30000],
+    # Load previous execution trace for resume context
+    trace_context = _load_execution_trace(state)
+
+    # Render the task template with variable substitution
+    task_prompt = _render_template_file(
+        EXPERIMENT_TASK_TEMPLATE,
+        HYPOTHESIS_FILE=str(Path(state.hypothesis_dir) / "hypothesis_output.json"),
+        LITERATURE_FILE=str(Path(state.literature_dir) / "literature_review.md"),
         OUTPUT_DIR=state.experiment_dir,
-        BASELINE_CONTEXT=baseline_ctx if baseline_ctx else "*(No baseline repository references available — design baselines from literature descriptions only.)*",
+        BASELINE_SECTION=(
+            f"- **基线参考**: {baseline_path}\n{baseline_ctx[:5000]}"
+            if baseline_ctx
+            else "*(无基线代码参考 — 根据文献描述自行设计基线)*"
+        ),
+        SCO_WORKSPACE=SCO_WORKSPACE,
+        SCO_AEC2=SCO_AEC2,
+        SCO_IMAGE=SCO_IMAGE,
+        SCO_STORAGE_MOUNT=SCO_STORAGE_MOUNT,
+        SCO_WORKER_SPEC_1GPU=SCO_WORKER_SPEC_MAP.get(1, "n6ls.iu.i40.1.8c128g"),
+        SCO_WORKER_SPEC_2GPU=SCO_WORKER_SPEC_MAP.get(2, "n6ls.iu.i40.2.16c256g"),
+        SCO_WORKER_SPEC_4GPU=SCO_WORKER_SPEC_MAP.get(4, "n6ls.iu.i40.4.32c512g"),
+        MAX_GPU_HOURS=str(MAX_COMPUTE_BUDGET_GPU_HOURS),
+        MAX_DEBUG_ROUNDS=str(EXPERIMENT_MAX_DEBUG_ROUNDS),
+        LOCAL_TIMEOUT=str(LOCAL_EXECUTION_TIMEOUT),
+        LOCAL_MAX_RETRIES=str(LOCAL_EXECUTION_MAX_RETRIES),
+        MODEL_CACHE_DIR=str(Path(DOWNLOAD_CACHE_DIR) / "models"),
     )
-    logger.info("Calling Claude Code for experiment design …")
-    return _call_claude(sm, state, Stage.EXPERIMENT_DESIGN, prompt, retry_feedback)
+
+    # Inject previous execution trace as context for resume
+    if trace_context:
+        task_prompt = task_prompt + trace_context
+        logger.info("Injected execution trace (%d chars) for resume context",
+                    len(trace_context))
+
+    # Ensure output directory exists
+    os.makedirs(state.experiment_dir, exist_ok=True)
+
+    logger.info("Launching experiment scientist (Claude Code + system prompt) …")
+    return _call_claude_with_system_prompt(
+        sm, state, Stage.EXPERIMENT_DESIGN,
+        task_prompt=task_prompt,
+        system_prompt_path=EXPERIMENT_SYSTEM_PROMPT,
+        retry_feedback=retry_feedback,
+        timeout=EXPERIMENT_CLAUDE_TIMEOUT,
+    )
 
 
 def _do_experiment_execution(sm: StateManager, state: ResearchState, retry_feedback: str = "") -> ResearchState:
-    script = Path(state.experiment_dir) / "run_experiment.sh"
-    if not script.exists():
-        raise FileNotFoundError(f"Experiment script not found: {script}")
+    """Execution-only phase — used when experiment_design completed but execution
+    was not done (e.g. in a pipeline resume scenario).
 
-    # --- If retrying with feedback, try to fix the experiment script first ---
-    if retry_feedback:
-        logger.info("Retrying experiment with review feedback — attempting auto-fix...")
-        _try_fix_experiment_script(script, retry_feedback, state)
+    With prompt-driven experiments the design phase already covers execution.
+    This stage now checks for existing results and falls back to the design
+    path if execution is needed.
+    """
+    exp_dir = Path(state.experiment_dir)
+    results = exp_dir / "experiment_results.json"
 
-    gpu_info = detect_gpu()
-    has_gpu = gpu_info["available"]
-    logger.info("Local GPU: %s (count=%d)", has_gpu, gpu_info["count"])
+    if results.exists():
+        logger.info("Experiment results already exist → %s", results)
+        return sm.complete_stage(state, Stage.EXPERIMENT_EXECUTION, {
+            "results_file": str(results),
+            "note": "Results from previous experiment_design session",
+        })
 
-    if FORCE_SCO:
-        logger.info("FORCE_SCO=true — skipping local, going straight to SCO")
-
-    result = sco_run_experiment(
-        script_path=script,
-        job_name=f"cr-{state.topic_slug}",
-        local_timeout=LOCAL_EXECUTION_TIMEOUT,
-        max_local_retries=LOCAL_EXECUTION_MAX_RETRIES,
-        force_sco=FORCE_SCO,
-    )
-
-    logger.info("Experiment result: backend=%s success=%s attempts=%d",
-                result.backend, result.success, result.attempts)
-
-    if not result.success:
-        # Diagnose the failure before raising
-        error_detail = _diagnose_experiment_failure(result, state)
-        logger.error("Experiment failed: %s", error_detail)
-        raise RuntimeError(error_detail)
-
-    return sm.complete_stage(state, Stage.EXPERIMENT_EXECUTION, {
-        "backend": result.backend,
-        "job_id": result.job_id,
-        "job_status": "SUCCEEDED" if result.success else "FAILED",
-        "log_path": result.log_path,
-        "attempts": result.attempts,
-    })
+    # Results missing — re-run the full experiment scientist
+    logger.info("No experiment results found, re-running experiment scientist …")
+    return _do_experiment_design(sm, state, retry_feedback)
 
 
 def _diagnose_experiment_failure(result, state) -> str:
@@ -1198,6 +1235,310 @@ def _load_stage_output_on_resume(state: ResearchState, stage: Stage) -> None:
 # Claude Code tool integration
 # ======================================================================
 
+# ---------------------------------------------------------------------------
+# Execution trace — preserve Claude Code session history for resume
+# ---------------------------------------------------------------------------
+
+_TRACE_FILENAME = ".trace.jsonl"
+
+
+def _save_execution_trace(state: ResearchState, stage: Stage, output: str,
+                          meta: dict | None = None) -> Path:
+    """Append a structured trace record after a Claude Code session completes.
+
+    The trace is a JSON-lines file that accumulates every session's key
+    information: what was asked, what was done, what artifacts were created,
+    and any errors encountered.  On resume this trace is injected as context
+    so Claude Code "remembers" the full execution history.
+    """
+    import hashlib
+
+    trace_file = Path(state.experiment_dir) / _TRACE_FILENAME
+
+    # Extract key decisions and actions from output (first 3000 chars)
+    output_summary = output[:3000] if output else "(empty output)"
+
+    # Try to extract a one-line summary from the output
+    summary_line = ""
+    for line in output_summary.split("\n"):
+        line = line.strip()
+        if len(line) > 10 and not line.startswith("#") and not line.startswith("```"):
+            summary_line = line[:200]
+            break
+
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "stage": stage.value,
+        "iteration": state.iteration,
+        "task_hash": hashlib.md5(
+            (state.topic_slug + stage.value + str(state.iteration)).encode()
+        ).hexdigest()[:8],
+        "summary": summary_line,
+        "output_preview": output_summary,
+        "artifacts": meta.get("artifacts_present", {}) if meta else {},
+        "missing_artifacts": meta.get("missing_artifacts", []) if meta else [],
+        "error": meta.get("error", "") if meta else "",
+    }
+
+    # Append as JSON line
+    with trace_file.open("a") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    logger.info("Execution trace saved → %s (%d records)",
+                trace_file, _count_trace_records(trace_file))
+    return trace_file
+
+
+def _load_execution_trace(state: ResearchState) -> str:
+    """Load previous execution traces and format them as context for Claude Code.
+
+    Returns a markdown string summarizing all previous experiment sessions,
+    or empty string if no trace exists yet.
+    """
+    trace_file = Path(state.experiment_dir) / _TRACE_FILENAME
+    if not trace_file.exists():
+        return ""
+
+    records = []
+    with trace_file.open() as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+
+    if not records:
+        return ""
+
+    lines = [
+        "",
+        "---",
+        "# 执行轨迹记忆 (Execution Trace Memory)",
+        "",
+        f"以下是之前 {len(records)} 次实验会话的执行轨迹。你可以在其中了解之前的决策、",
+        "已完成的步骤、遇到的错误和修复、以及当前实验状态。",
+        "",
+        "| # | 时间 | 阶段 | 摘要 | 产物 |",
+        "|---|------|------|------|------|",
+    ]
+
+    for i, r in enumerate(records, 1):
+        ts = r.get("timestamp", "?")[:19]
+        stage = r.get("stage", "?")
+        summary = r.get("summary", "")[:100]
+        artifacts = r.get("artifacts", {})
+        art_str = ", ".join(
+            k for k, v in artifacts.items() if v
+        ) or "(none)"
+        lines.append(f"| {i} | {ts} | {stage} | {summary} | {art_str} |")
+
+    lines.append("")
+    lines.append("## 最近一次会话详情")
+    lines.append("")
+    last = records[-1]
+    lines.append(f"- **时间**: {last.get('timestamp', '?')}")
+    lines.append(f"- **阶段**: {last.get('stage', '?')}")
+    lines.append(f"- **迭代**: {last.get('iteration', '?')}")
+    lines.append(f"- **产物**: {json.dumps(last.get('artifacts', {}))}")
+    if last.get("missing_artifacts"):
+        lines.append(f"- **缺失产物**: {', '.join(last['missing_artifacts'])}")
+    if last.get("error"):
+        lines.append(f"- **错误**: {last['error']}")
+
+    lines.append("")
+    lines.append("## 最近一次会话输出摘要")
+    lines.append("")
+    lines.append(last.get("output_preview", "(empty)")[:2000])
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("请基于以上执行轨迹继续工作。避免重复已完成的步骤，优先处理缺失的产物。")
+
+    return "\n".join(lines)
+
+
+def _count_trace_records(trace_file: Path) -> int:
+    """Count the number of trace records (for logging)."""
+    if not trace_file.exists():
+        return 0
+    return sum(1 for _ in trace_file.open() if _.strip())
+
+
+def _call_claude_with_system_prompt(
+    sm: StateManager,
+    state: ResearchState,
+    stage: Stage,
+    task_prompt: str,
+    system_prompt_path: str,
+    retry_feedback: str = "",
+    max_retries: int = _CLAUDE_MAX_RETRIES,
+    timeout: int | None = None,
+) -> ResearchState:
+    """Invoke Claude Code with a system prompt for autonomous experiment execution.
+
+    This is the prompt-driven experiment path.  Claude Code runs with a
+    comprehensive system prompt that tells it HOW to be an experiment
+    scientist; the task prompt tells it WHAT to do this session.
+
+    Args:
+        sm: StateManager instance.
+        state: Current research state.
+        stage: Pipeline stage being executed.
+        task_prompt: The per-task prompt (rendered template).
+        system_prompt_path: Path to the system prompt markdown file.
+        retry_feedback: Optional review feedback from a failed prior attempt.
+        max_retries: Max retry attempts for transient failures.
+        timeout: Override timeout in seconds (defaults to EXPERIMENT_CLAUDE_TIMEOUT).
+    """
+    if timeout is None:
+        from config import EXPERIMENT_CLAUDE_TIMEOUT
+
+        timeout = EXPERIMENT_CLAUDE_TIMEOUT
+
+    if retry_feedback:
+        feedback_block = f"""
+
+---
+# IMPORTANT: Previous Review Feedback
+
+The previous attempt at this stage was reviewed and did NOT pass. You MUST
+address ALL of the following issues in this revision:
+
+{retry_feedback}
+
+Please explicitly acknowledge how you've addressed each issue above.
+---
+"""
+        task_prompt = task_prompt + feedback_block
+
+    # Write task prompt to file (avoids shell argument length limits)
+    prompt_file = Path(state.work_dir) / f"{stage.value}_task.md"
+    prompt_file.write_text(task_prompt)
+
+    output_file = Path(state.work_dir) / f"{stage.value}_output.md"
+
+    # Build command: claude reads task from stdin, loads system prompt from file
+    cmd = [
+        CLAUDE_CMD, "-p",
+        "--output-format", "text",
+        "--model", CLAUDE_MODEL,
+        "--system-prompt", system_prompt_path,
+        "--max-turns", "100",  # Allow many turns for autonomous work
+    ]
+
+    last_error = ""
+    for attempt in range(max_retries + 1):
+        logger.info(
+            "Executing experiment scientist (attempt %d/%d, timeout=%ds)...",
+            attempt + 1, max_retries + 1, timeout,
+        )
+
+        try:
+            result = subprocess.run(
+                cmd,
+                input=task_prompt,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=str(state.work_dir),
+            )
+            output = result.stdout or ""
+            if result.returncode != 0:
+                error_msg = (
+                    result.stderr[:300] if result.stderr
+                    else f"exit code {result.returncode}"
+                )
+                raise subprocess.CalledProcessError(
+                    result.returncode, cmd,
+                    output=output, stderr=result.stderr,
+                )
+
+            output_file.write_text(output)
+            logger.info(
+                "Experiment scientist output → %s (%d chars)",
+                output_file, len(output),
+            )
+
+            # Verify expected artifacts exist
+            exp_dir = Path(state.experiment_dir)
+            manifest = exp_dir / "experiment_manifest.json"
+            results = exp_dir / "experiment_results.json"
+            log_file = exp_dir / "experiment_log.md"
+
+            missing = []
+            if not manifest.exists():
+                missing.append("experiment_manifest.json")
+            if not results.exists():
+                missing.append("experiment_results.json")
+            if not log_file.exists():
+                missing.append("experiment_log.md")
+
+            meta = {
+                "prompt_file": str(prompt_file),
+                "output_file": str(output_file),
+                "system_prompt": system_prompt_path,
+                "artifacts_present": {
+                    "manifest": manifest.exists(),
+                    "results": results.exists(),
+                    "log": log_file.exists(),
+                },
+            }
+
+            if missing:
+                logger.warning(
+                    "Experiment scientist completed but missing: %s",
+                    ", ".join(missing),
+                )
+                meta["missing_artifacts"] = missing
+
+            # Save execution trace for future resume
+            _save_execution_trace(state, stage, output, meta)
+
+            return sm.complete_stage(state, stage, meta)
+
+        except FileNotFoundError:
+            logger.warning(
+                "`%s` CLI not found. Task saved to %s — run manually.",
+                CLAUDE_CMD, prompt_file,
+            )
+            raise
+
+        except subprocess.TimeoutExpired as exc:
+            last_error = f"Timeout after {timeout}s"
+            logger.warning(
+                "Experiment scientist timed out (attempt %d/%d)",
+                attempt + 1, max_retries + 1,
+            )
+
+        except subprocess.CalledProcessError as exc:
+            last_error = (
+                f"Exit {exc.returncode}: "
+                f"{exc.stderr[:200] if exc.stderr else 'no stderr'}"
+            )
+            logger.warning(
+                "Experiment scientist failed (attempt %d/%d): %s",
+                attempt + 1, max_retries + 1, last_error,
+            )
+
+        except Exception as exc:
+            last_error = str(exc)
+            logger.warning(
+                "Experiment scientist error (attempt %d/%d): %s",
+                attempt + 1, max_retries + 1, exc,
+            )
+
+        if attempt < max_retries:
+            wait = min(30 * (2 ** attempt), 300)
+            logger.info("Retrying in %ds ...", wait)
+            time.sleep(wait)
+
+    raise RuntimeError(
+        f"Experiment scientist failed after {max_retries + 1} attempts: "
+        f"{last_error}"
+    )
+
 
 def _call_claude(sm: StateManager, state: ResearchState, stage: Stage,
                  prompt: str, retry_feedback: str = "",
@@ -1314,6 +1655,18 @@ def _load_prompt(name: str, **kwargs: str) -> str:
 def _read_or(dir_path: str, filename: str) -> str:
     p = Path(dir_path) / filename
     return p.read_text() if p.exists() else ""
+
+
+def _render_template_file(template_path: str, **kwargs: str) -> str:
+    """Read a template file and substitute ``${VAR}``-style placeholders.
+
+    Unlike ``_load_prompt`` which uses ``str.format(**kwargs)``, this uses
+    simple ``${VAR}`` substitution to match shell-style templates.
+    """
+    template = Path(template_path).read_text()
+    for key, value in kwargs.items():
+        template = template.replace("${" + key + "}", value)
+    return template
 
 
 def _safe_dirname(text: str) -> str:

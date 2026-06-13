@@ -13,9 +13,174 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ -d "${HOME}/.sco/bin" ]] && export PATH="${HOME}/.sco/bin:${PATH}"
 
 # Ctrl-C 优雅中断
-trap 'echo -e "\n${YELLOW}收到中断信号，保存状态后退出...${NC}"; exit 130' INT TERM
-# 会话结束标记（写入 run.log）
-trap 'echo ""; echo "── 会话结束: $(date "+%Y-%m-%d %H:%M:%S") ──"' EXIT
+trap '_on_interrupt' INT TERM
+# 会话结束标记 + 故障检测
+trap '_on_exit' EXIT
+
+# ── 故障恢复：记录崩溃状态，下次启动时触发 Claude Code 自动修复 ──
+CRASH_MARKER_DIR="${SCRIPT_DIR}/.crash_markers"
+mkdir -p "$CRASH_MARKER_DIR"
+
+_on_interrupt() {
+    echo -e "\n${YELLOW}收到中断信号，保存状态后退出...${NC}"
+    exit 130
+}
+
+_on_exit() {
+    local _exit_code=$?
+    echo ""
+    echo "── 会话结束: $(date "+%Y-%m-%d %H:%M:%S") ──"
+
+    # 正常退出(0)或用户中断(130) → 清零修复计数，不触发恢复
+    if [[ $_exit_code -eq 0 || $_exit_code -eq 130 ]]; then
+        rm -f "$RECOVERY_COUNT_FILE"
+        return 0
+    fi
+
+    # 没有活动项目 → 无法恢复
+    if [[ -z "${SLUG:-}" ]]; then
+        return 0
+    fi
+
+    # ── 防止无限修复循环 ──
+    local _rec_count=0
+    [[ -f "$RECOVERY_COUNT_FILE" ]] && _rec_count=$(cat "$RECOVERY_COUNT_FILE" 2>/dev/null || echo 0)
+    _rec_count=$((_rec_count + 1))
+    echo "$_rec_count" > "$RECOVERY_COUNT_FILE"
+
+    if [[ $_rec_count -gt $MAX_AUTO_RECOVERY ]]; then
+        echo -e "${RED}⚠ 已达最大连续修复次数($MAX_AUTO_RECOVERY)，停止自动重启以避免死循环${NC}"
+        echo -e "${RED}  请手动检查并修复后重新运行 start.sh${NC}"
+        rm -f "$RECOVERY_COUNT_FILE"
+        return 0
+    fi
+
+    # ── 异常退出：立即触发 Claude Code 全权接管修复 ──
+    echo ""
+    echo -e "${RED}╔══════════════════════════════════════════════╗${NC}"
+    echo -e "${RED}║  异常退出 (exit=$_exit_code) — 触发自动修复  ║${NC}"
+    echo -e "${RED}╚══════════════════════════════════════════════╗${NC}"
+    echo ""
+    echo -e "  项目: ${TOPIC:-$SLUG}"
+    echo -e "  阶段: ${STAGE:-unknown}"
+    echo -e "  日志: ${WORKSPACE}/run.log"
+    echo ""
+
+    # 构建修复 prompt — 直接调用 Claude Code（不经 _claude_task，避免递归）
+    cat > /tmp/cr_crash_recovery_prompt.txt <<CRASHPROMPT
+你是 ChenResearch 系统的故障恢复专家。项目在阶段"${STAGE:-unknown}"异常退出(exit=$_exit_code)。
+
+请立即读取以下文件诊断并修复问题：
+1. **运行日志**: ${WORKSPACE}/run.log (读取最后300行定位错误)
+2. **项目状态**: /data/AutoResearch/ChenResearch/state/${SLUG}/state.json
+3. **SCO 日志**: ${WORKSPACE}/experiment/logs/run_output.log (如存在)
+4. **实验代码**: ${WORKSPACE}/experiment/ (如有错误，修复对应文件)
+
+**关键规则**：
+- 只能修改 ${WORKSPACE}/ 下的文件
+- 受保护文件(sco_runner.py, config.py)不可修改，如怀疑是基础设施问题请报告
+- 如果是 SCO 容器内错误(网络不可达、OOM、包缺失)，修复 run_experiment.sh 后重新提交
+- 如果是环境问题(缺少依赖)，确保 env/site-packages/ 中有对应包
+- 如果是论文编译问题，修复 LaTeX 后重新编译
+- 修复完成后，确保项目状态可以继续运行，然后输出 'CRASH_RECOVERY_DONE'
+
+你拥有完全权限来修复项目。目标是让项目能继续顺利运行到下一阶段。
+CRASHPROMPT
+
+    cat /tmp/cr_crash_recovery_prompt.txt | claude -p \
+        --model "${CLAUDE_MODEL:-deepseek-v4-pro}" \
+        --output-format text \
+        --verbose \
+        --append-system-prompt "$(cat ${SCRIPT_DIR}/prompts/sco_debugger_system.md 2>/dev/null || echo '')" 2>&1 | stdbuf -oL tee /tmp/cr_crash_recovery_output.log
+
+    echo ""
+    echo -e "${GREEN}  自动修复完成，系统继续运行...${NC}"
+    echo ""
+
+    # ── 自动重启：继续该项目（带参数跳过菜单）──
+    cd "${SCRIPT_DIR}"
+    exec bash "$0" --auto-resume "${SLUG}"
+}
+
+# ── 最大连续修复次数（防止死循环）──
+MAX_AUTO_RECOVERY=3
+RECOVERY_COUNT_FILE="/tmp/cr_auto_recovery_count"
+
+_auto_recover_if_crashed() {
+    local slug="${1:-}"
+    [[ -z "$slug" ]] && return 0
+    local marker="${CRASH_MARKER_DIR}/${slug}.crash"
+    [[ -f "$marker" ]] && rm -f "$marker"
+    return 0
+}
+
+# ── 故障自动修复：读取 run.log → Claude Code 诊断修复 → 继续运行 ──
+_auto_recover_if_crashed() {
+    local slug="${1:-}"
+    [[ -z "$slug" ]] && return 0
+    local marker="${CRASH_MARKER_DIR}/${slug}.crash"
+    [[ -f "$marker" ]] || return 0
+
+    echo ""
+    echo -e "${RED}╔══════════════════════════════════════════════╗${NC}"
+    echo -e "${RED}║  检测到上次运行异常退出 — 启动自动修复      ║${NC}"
+    echo -e "${RED}╚══════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    # 读取崩溃信息
+    source "$marker" 2>/dev/null || true
+    local crash_log="${log:-${WORKSPACE}/run.log}"
+    local crash_stage="${stage:-unknown}"
+
+    echo -e "  崩溃阶段: ${crash_stage}"
+    echo -e "  日志文件: ${crash_log}"
+    echo ""
+
+    # 构建修复 prompt
+    cat > /tmp/cr_crash_recovery_prompt.txt <<CRASHPROMPT
+你是 ChenResearch 系统的故障恢复专家。上次运行时项目在阶段"${crash_stage}"异常退出。
+
+请立即读取以下文件来诊断问题：
+1. **运行日志**: ${crash_log} (读取最后200行定位错误)
+2. **项目状态**: /data/AutoResearch/ChenResearch/state/${slug}/state.json
+3. **SCO 日志**: ${WORKSPACE}/experiment/logs/run_output.log (如存在)
+4. **实验日志目录**: ${WORKSPACE}/experiment/logs/ (如存在)
+
+**任务**：
+1. 分析日志中的错误，确定根因
+2. 修复实验代码或配置（只能修改 ${WORKSPACE}/ 下的文件）
+3. 如果项目状态是 experiment_execution 且 SCO 任务失败，修复后重新提交
+4. 如果项目状态是 environment_preparation 且依赖缺失，补充安装
+5. 如果项目状态是 paper_writing 且编译失败，修复 LaTeX 后重编译
+6. 确保修复后项目可以继续运行
+
+修复完成后输出 'CRASH_RECOVERY_DONE'，然后系统会自动继续运行该项目。
+CRASHPROMPT
+
+    echo -e "${CYAN}  Claude Code 故障恢复中...${NC}"
+    echo "  (读取日志、诊断问题、自动修复)"
+
+    cat /tmp/cr_crash_recovery_prompt.txt | claude -p \
+        --model "${CLAUDE_MODEL:-deepseek-v4-pro}" \
+        --output-format text \
+        --verbose \
+        --append-system-prompt "$(cat ${SCRIPT_DIR}/prompts/sco_debugger_system.md 2>/dev/null || echo '')" 2>&1 | stdbuf -oL tee /tmp/cr_crash_recovery_output.log
+
+    local _rc=$?
+    echo ""
+
+    # 清掉崩溃标记（无论修复是否成功，避免无限循环）
+    rm -f "$marker"
+
+    if [[ $_rc -eq 0 ]]; then
+        echo -e "${GREEN}  故障恢复完成，继续运行项目...${NC}"
+        return 0
+    else
+        echo -e "${YELLOW}  故障恢复部分完成 (exit=$_rc)，尝试继续...${NC}"
+        return 0
+    fi
+}
+
 cd "${SCRIPT_DIR}"
 
 RED='\033[0;31m'
@@ -188,8 +353,8 @@ _claude_task() {
         _sys_flag=("--append-system-prompt" "$(cat "$sys_prompt_file")")
     fi
 
-    # 实时输出到终端 + 同时保存到日志
-    echo "$prompt" | claude -p --model "${CLAUDE_MODEL:-deepseek-v4-pro}" --output-format text --verbose "${_sys_flag[@]}" 2>&1 | tee "$log"
+    echo "$prompt" | claude -p --model "${CLAUDE_MODEL:-deepseek-v4-pro}" --output-format text --verbose \
+        "${_sys_flag[@]}" 2>&1 | stdbuf -oL tee "$log"
 
     local rc=${PIPESTATUS[0]}
     echo ""
@@ -199,6 +364,132 @@ _claude_task() {
         echo -e "${YELLOW}  Claude Code 退出码: $rc${NC}"
     fi
     return $rc
+}
+
+# ---- _claude_experiment_design: Claude Code 实验科学家接管实验设计+执行 ----
+# 使用 prompts/experiment_scientist_system.md 作为系统提示词，
+# prompts/experiment_scientist_task.md 作为任务模板（变量替换后）。
+# Claude Code 自主完成: 环境检查 → 代码编写 → 执行 → 调试 → 报告。
+_claude_experiment_design() {
+    local SYS_PROMPT="${SCRIPT_DIR}/prompts/experiment_scientist_system.md"
+    local TASK_TEMPLATE="${SCRIPT_DIR}/prompts/experiment_scientist_task.md"
+
+    if [[ ! -f "$SYS_PROMPT" ]]; then
+        echo -e "${YELLOW}[fallback] 系统提示词缺失，使用旧 experiment_design_start.md${NC}"
+        BASELINE_CONTEXT="${BASELINE_CONTEXT}" \
+        HYPOTHESIS_CLAUSE="${HYPOTHESIS_CLAUSE:-}" \
+        HYPOTHESIS_LINE="${HYPOTHESIS_LINE:-}" \
+        DESIGN_STEP_1="${DESIGN_STEP_1:-阅读文献综述}" \
+          _render_prompt "experiment_design_start.md" /tmp/cr_stage2_prompt.txt
+        _claude_task "$(cat /tmp/cr_stage2_prompt.txt)"
+        return
+    fi
+
+    echo -e "${CYAN}━━━ 实验设计 (Claude Code 实验科学家) ━━━${NC}"
+    echo "  系统提示词: ${SYS_PROMPT}"
+
+    # 输入文件路径
+    local HYP_FILE="${WORKSPACE}/hypothesis/hypothesis_output.json"
+    local LIT_FILE="${WORKSPACE}/literature/literature_review.md"
+    local BASELINE_CTX="*(无基线代码参考 — 根据文献描述自行设计基线)*"
+    local BASELINE_FILE="${WORKSPACE}/experiment/baseline_context.md"
+    [[ -f "$BASELINE_FILE" ]] && BASELINE_CTX="- **基线参考**: ${BASELINE_FILE}
+$(head -100 "$BASELINE_FILE" 2>/dev/null || echo '')"
+
+    # 读取 SCO 配置
+    source <(python -c "
+from config import (SCO_WORKSPACE, SCO_AEC2, SCO_IMAGE, SCO_STORAGE_MOUNT,
+                    SCO_WORKER_SPEC_MAP, MAX_COMPUTE_BUDGET_GPU_HOURS,
+                    EXPERIMENT_MAX_DEBUG_ROUNDS,
+                    LOCAL_EXECUTION_TIMEOUT, LOCAL_EXECUTION_MAX_RETRIES,
+                    DOWNLOAD_CACHE_DIR)
+print(f'SCO_WS={SCO_WORKSPACE}')
+print(f'SCO_CL={SCO_AEC2}')
+print(f'SCO_IMG={SCO_IMAGE}')
+print(f'SCO_MNT={SCO_STORAGE_MOUNT}')
+print(f'SCO_S1={SCO_WORKER_SPEC_MAP.get(1, \"n6ls.iu.i40.1.8c128g\")}')
+print(f'SCO_S2={SCO_WORKER_SPEC_MAP.get(2, \"n6ls.iu.i40.2.16c256g\")}')
+print(f'SCO_S4={SCO_WORKER_SPEC_MAP.get(4, \"n6ls.iu.i40.4.32c512g\")}')
+print(f'MAX_HRS={MAX_COMPUTE_BUDGET_GPU_HOURS}')
+print(f'MAX_DBG={EXPERIMENT_MAX_DEBUG_ROUNDS}')
+print(f'LCL_TO={LOCAL_EXECUTION_TIMEOUT}')
+print(f'LCL_RT={LOCAL_EXECUTION_MAX_RETRIES}')
+print(f'CACHE_M={DOWNLOAD_CACHE_DIR}/models')
+" 2>/dev/null)
+
+    # 变量替换
+    local TASK
+    TASK=$(sed \
+        -e "s|\${HYPOTHESIS_FILE}|${HYP_FILE}|g" \
+        -e "s|\${LITERATURE_FILE}|${LIT_FILE}|g" \
+        -e "s|\${OUTPUT_DIR}|${WORKSPACE}/experiment|g" \
+        -e "s|\${BASELINE_SECTION}|${BASELINE_CTX}|g" \
+        -e "s|\${SCO_WORKSPACE}|${SCO_WS:-share-space}|g" \
+        -e "s|\${SCO_AEC2}|${SCO_CL:-share-cluster}|g" \
+        -e "s|\${SCO_IMAGE}|${SCO_IMG:-}|g" \
+        -e "s|\${SCO_STORAGE_MOUNT}|${SCO_MNT:-}|g" \
+        -e "s|\${SCO_WORKER_SPEC_1GPU}|${SCO_S1:-n6ls.iu.i40.1.8c128g}|g" \
+        -e "s|\${SCO_WORKER_SPEC_2GPU}|${SCO_S2:-n6ls.iu.i40.2.16c256g}|g" \
+        -e "s|\${SCO_WORKER_SPEC_4GPU}|${SCO_S4:-n6ls.iu.i40.4.32c512g}|g" \
+        -e "s|\${MAX_GPU_HOURS}|${MAX_HRS:-32}|g" \
+        -e "s|\${MAX_DEBUG_ROUNDS}|${MAX_DBG:-20}|g" \
+        -e "s|\${LOCAL_TIMEOUT}|${LCL_TO:-7200}|g" \
+        -e "s|\${LOCAL_MAX_RETRIES}|${LCL_RT:-20}|g" \
+        -e "s|\${MODEL_CACHE_DIR}|${CACHE_M:-workspace/.shared/cache/models}|g" \
+        "${TASK_TEMPLATE}")
+
+    # 注入执行轨迹记忆（如果存在）
+    local TRACE_FILE="${WORKSPACE}/experiment/.trace.jsonl"
+    if [[ -f "$TRACE_FILE" ]]; then
+        local TRACE_COUNT=$(wc -l < "$TRACE_FILE" 2>/dev/null || echo 0)
+        if [[ $TRACE_COUNT -gt 0 ]]; then
+            TASK="${TASK}
+---
+# 执行轨迹记忆 (${TRACE_COUNT} 条历史)
+
+\`\`\`
+$(tail -5 "$TRACE_FILE" 2>/dev/null)
+\`\`\`
+
+请基于以上轨迹继续。避免重复已完成步骤。"
+        fi
+    fi
+
+    echo "$TASK" > /tmp/cr_experiment_task.md
+
+    echo -e "${CYAN}  Claude Code 实验科学家工作中...${NC}"
+    echo "  (环境检查 → 代码编写 → 执行 → 调试 → 报告)"
+    echo ""
+
+    echo "$TASK" | claude -p \
+        --model "${CLAUDE_MODEL:-deepseek-v4-pro}" \
+        --output-format text \
+        --system-prompt "$SYS_PROMPT" \
+        --max-turns 100 \
+        --verbose \
+        2>&1 | tee "${WORKSPACE}/experiment/claude_design_$(date +%Y%m%d-%H%M%S).log"
+
+    local rc=${PIPESTATUS[0]}
+    echo ""
+    if [[ $rc -eq 0 ]]; then
+        echo -e "${GREEN}  Claude Code 实验设计完成${NC}"
+    else
+        echo -e "${YELLOW}  Claude Code 退出码: $rc${NC}"
+    fi
+
+    # 保存执行轨迹
+    python -c "
+import json
+from datetime import datetime, timezone
+trace = {
+    'timestamp': datetime.now(timezone.utc).isoformat(),
+    'stage': 'experiment_design',
+    'summary': 'Claude Code experiment scientist session',
+    'rc': $rc,
+}
+with open('${TRACE_FILE}', 'a') as f:
+    f.write(json.dumps(trace, ensure_ascii=False) + '\n')
+" 2>/dev/null || true
 }
 
 # ---- _stage_review: LLM quality gate for pipeline stages ----
@@ -402,9 +693,198 @@ print('  Env prep OK' if ok else '  Env prep 部分失败（非致命）')
 }
 
 # ---------------------------------------------------------------------------
-# ---- _continue_experiment: 继续实验执行阶段 (local-first) ----
+# ---- _continue_experiment: 实验执行阶段 (Claude Code + prompt 驱动) ----
+# Claude Code 以实验科学家系统提示词全权接管：环境检查 → 代码编写 →
+# 本地/SCO 执行 → 调试修复 → 评估报告。
+# 旧的硬编码 preflight → schedule → sco_runner 路径作为 fallback。
 _continue_experiment() {
-    echo -e "${CYAN}━━━ 继续实验执行 ━━━${NC}"
+    echo -e "${CYAN}━━━ 实验执行 (Claude Code 实验科学家接管) ━━━${NC}"
+    echo ""
+
+    local SYS_PROMPT="${SCRIPT_DIR}/prompts/experiment_scientist_system.md"
+    local TASK_TEMPLATE="${SCRIPT_DIR}/prompts/experiment_scientist_task.md"
+
+    if [[ ! -f "$SYS_PROMPT" ]]; then
+        echo -e "${YELLOW}[fallback] 系统提示词缺失，使用旧 hardcoded 流程${NC}"
+        _continue_experiment_legacy
+        return
+    fi
+
+    # 检查实验脚本是否存在
+    EXP_SCRIPT="${WORKSPACE}/experiment/run_experiment.sh"
+    MANIFEST="${WORKSPACE}/experiment/experiment_manifest.json"
+    RESULTS="${WORKSPACE}/experiment/experiment_results.json"
+
+    # 如果已有结果，直接跳过
+    if [[ -f "$RESULTS" ]]; then
+        echo -e "${GREEN}实验已有结果 → ${RESULTS}${NC}"
+        echo "跳过执行，继续到论文撰写..."
+        python -c "
+from state_manager import StateManager, Stage
+sm = StateManager('state')
+state = sm.load('${SLUG}')
+sm.complete_stage(state, Stage.EXPERIMENT_EXECUTION, {'results_file': '${RESULTS}', 'note': '已有结果，跳过执行'})
+"
+        _do_paper_writing
+        _do_submit_review
+        return
+    fi
+
+    # 构建任务提示词（变量替换）
+    local HYP_FILE="${WORKSPACE}/hypothesis/hypothesis_output.json"
+    local LIT_FILE="${WORKSPACE}/literature/literature_review.md"
+    local BASELINE_CTX="*(无基线代码参考)*"
+    local BASELINE_FILE="${WORKSPACE}/experiment/baseline_context.md"
+    [[ -f "$BASELINE_FILE" ]] && BASELINE_CTX="- **基线参考**: ${BASELINE_FILE}"
+
+    # 读取 SCO 配置
+    source <(python -c "
+from config import (SCO_WORKSPACE, SCO_AEC2, SCO_IMAGE, SCO_STORAGE_MOUNT,
+                    SCO_WORKER_SPEC_MAP, MAX_COMPUTE_BUDGET_GPU_HOURS,
+                    EXPERIMENT_MAX_DEBUG_ROUNDS, EXPERIMENT_CLAUDE_TIMEOUT,
+                    LOCAL_EXECUTION_TIMEOUT, LOCAL_EXECUTION_MAX_RETRIES,
+                    DOWNLOAD_CACHE_DIR)
+print(f'SCO_WORKSPACE={SCO_WORKSPACE}')
+print(f'SCO_AEC2={SCO_AEC2}')
+print(f'SCO_IMAGE={SCO_IMAGE}')
+print(f'SCO_STORAGE_MOUNT={SCO_STORAGE_MOUNT}')
+print(f'SCO_SPEC_1={SCO_WORKER_SPEC_MAP.get(1, \"n6ls.iu.i40.1.8c128g\")}')
+print(f'SCO_SPEC_2={SCO_WORKER_SPEC_MAP.get(2, \"n6ls.iu.i40.2.16c256g\")}')
+print(f'SCO_SPEC_4={SCO_WORKER_SPEC_MAP.get(4, \"n6ls.iu.i40.4.32c512g\")}')
+print(f'MAX_GPU_HOURS={MAX_COMPUTE_BUDGET_GPU_HOURS}')
+print(f'MAX_DEBUG_ROUNDS={EXPERIMENT_MAX_DEBUG_ROUNDS}')
+print(f'LOCAL_TIMEOUT={LOCAL_EXECUTION_TIMEOUT}')
+print(f'LOCAL_MAX_RETRIES={LOCAL_EXECUTION_MAX_RETRIES}')
+print(f'MODEL_CACHE={DOWNLOAD_CACHE_DIR}/models')
+" 2>/dev/null)
+
+    # 变量默认值
+    SCO_WORKSPACE="${SCO_WORKSPACE:-share-space}"
+    SCO_AEC2="${SCO_AEC2:-share-cluster}"
+    SCO_IMAGE="${SCO_IMAGE:-}"
+    SCO_STORAGE_MOUNT="${SCO_STORAGE_MOUNT:-}"
+    SCO_SPEC_1="${SCO_SPEC_1:-n6ls.iu.i40.1.8c128g}"
+    SCO_SPEC_2="${SCO_SPEC_2:-n6ls.iu.i40.2.16c256g}"
+    SCO_SPEC_4="${SCO_SPEC_4:-n6ls.iu.i40.4.32c512g}"
+    MAX_GPU_HOURS="${MAX_GPU_HOURS:-32}"
+    MAX_DEBUG_ROUNDS="${MAX_DEBUG_ROUNDS:-20}"
+    LOCAL_TIMEOUT="${LOCAL_TIMEOUT:-7200}"
+    LOCAL_MAX_RETRIES="${LOCAL_MAX_RETRIES:-20}"
+    MODEL_CACHE="${MODEL_CACHE:-workspace/.shared/cache/models}"
+
+    # 读取模板并替换变量
+    local TASK_PROMPT
+    TASK_PROMPT=$(sed \
+        -e "s|\${HYPOTHESIS_FILE}|${HYP_FILE}|g" \
+        -e "s|\${LITERATURE_FILE}|${LIT_FILE}|g" \
+        -e "s|\${OUTPUT_DIR}|${WORKSPACE}/experiment|g" \
+        -e "s|\${BASELINE_SECTION}|${BASELINE_CTX}|g" \
+        -e "s|\${SCO_WORKSPACE}|${SCO_WORKSPACE}|g" \
+        -e "s|\${SCO_AEC2}|${SCO_AEC2}|g" \
+        -e "s|\${SCO_IMAGE}|${SCO_IMAGE}|g" \
+        -e "s|\${SCO_STORAGE_MOUNT}|${SCO_STORAGE_MOUNT}|g" \
+        -e "s|\${SCO_WORKER_SPEC_1GPU}|${SCO_SPEC_1}|g" \
+        -e "s|\${SCO_WORKER_SPEC_2GPU}|${SCO_SPEC_2}|g" \
+        -e "s|\${SCO_WORKER_SPEC_4GPU}|${SCO_SPEC_4}|g" \
+        -e "s|\${MAX_GPU_HOURS}|${MAX_GPU_HOURS}|g" \
+        -e "s|\${MAX_DEBUG_ROUNDS}|${MAX_DEBUG_ROUNDS}|g" \
+        -e "s|\${LOCAL_TIMEOUT}|${LOCAL_TIMEOUT}|g" \
+        -e "s|\${LOCAL_MAX_RETRIES}|${LOCAL_MAX_RETRIES}|g" \
+        -e "s|\${MODEL_CACHE_DIR}|${MODEL_CACHE}|g" \
+        "${TASK_TEMPLATE}")
+
+    # 如果有之前的执行轨迹，注入为上下文
+    local TRACE_FILE="${WORKSPACE}/experiment/.trace.jsonl"
+    if [[ -f "$TRACE_FILE" ]]; then
+        local TRACE_COUNT=$(wc -l < "$TRACE_FILE" 2>/dev/null || echo 0)
+        if [[ $TRACE_COUNT -gt 0 ]]; then
+            echo -e "${CYAN}加载执行轨迹: ${TRACE_COUNT} 条历史记录${NC}"
+            TASK_PROMPT="${TASK_PROMPT}
+---
+# 执行轨迹记忆
+
+以下是之前 ${TRACE_COUNT} 次实验会话。请阅读以了解已完成的工作，避免重复。
+
+\`\`\`
+$(tail -5 "$TRACE_FILE" 2>/dev/null)
+\`\`\`
+
+请基于以上轨迹继续工作。如果 experiment_results.json 已存在且完整，直接报告完成。"
+        fi
+    fi
+
+    # 保存任务提示词（调试用）
+    echo "$TASK_PROMPT" > "${WORKSPACE}/experiment/.task_prompt.md"
+
+    echo -e "${CYAN}启动 Claude Code 实验科学家...${NC}"
+    echo "  系统提示词: ${SYS_PROMPT}"
+    echo "  任务模板: ${TASK_TEMPLATE}"
+    echo "  工作目录: ${WORKSPACE}/experiment"
+    echo ""
+
+    # 通过 PTY 运行 claude — 消除 Node.js 管道缓冲，实现逐行实时输出
+    local OUT_LOG="${WORKSPACE}/experiment/claude_session_$(date +%Y%m%d-%H%M%S).log"
+    echo "$TASK_PROMPT" | python "${SCRIPT_DIR}/claude_pty.py" \
+        claude -p \
+        --model "${CLAUDE_MODEL:-deepseek-v4-pro}" \
+        --output-format text \
+        --system-prompt "$SYS_PROMPT" \
+        --max-turns 100 \
+        --verbose \
+        2>&1 | tee "$OUT_LOG"
+
+    local rc=${PIPESTATUS[0]}
+
+    # 检查产物
+    if [[ -f "$RESULTS" ]]; then
+        echo ""
+        echo -e "${GREEN}━━━ 实验完成 ━━━${NC}"
+        echo "  结果文件: ${RESULTS}"
+
+        # 保存执行轨迹
+        local OUT_CONTENT
+        OUT_CONTENT=$(tail -100 "$OUT_LOG" 2>/dev/null || echo "")
+        python -c "
+import json, sys
+from datetime import datetime, timezone
+trace = {
+    'timestamp': datetime.now(timezone.utc).isoformat(),
+    'stage': 'experiment_execution',
+    'summary': 'Claude Code experiment scientist session completed',
+    'results_exist': True,
+    'manifest_exist': $([[ -f "$MANIFEST" ]] && echo 'True' || echo 'False'),
+    'output_tail': '''${OUT_CONTENT//\'/\'\\\'\'}'''[:2000]
+}
+with open('${TRACE_FILE}', 'a') as f:
+    f.write(json.dumps(trace, ensure_ascii=False) + '\n')
+" 2>/dev/null || true
+
+        # 标记完成
+        python -c "
+from state_manager import StateManager, Stage
+sm = StateManager('state')
+state = sm.load('${SLUG}')
+sm.complete_stage(state, Stage.EXPERIMENT_EXECUTION, {
+    'results_file': '${RESULTS}',
+    'session_log': '${OUT_LOG}',
+    'backend': 'claude_prompt_driven'
+})
+"
+        _do_paper_writing
+        _do_submit_review
+    else
+        echo ""
+        echo -e "${YELLOW}━━━ Claude Code 会话结束，但未找到 experiment_results.json ━━━${NC}"
+        echo "  检查日志: ${OUT_LOG}"
+        echo ""
+        echo -e "${YELLOW}回退到旧的 hardcoded 执行流程...${NC}"
+        _continue_experiment_legacy
+    fi
+}
+
+# ---- _continue_experiment_legacy: 旧的硬编码实验执行流程 (fallback) ----
+_continue_experiment_legacy() {
+    echo -e "${CYAN}━━━ 继续实验执行 (legacy hardcoded) ━━━${NC}"
     echo ""
 
     # 检查之前用什么后端 (从 meta 子对象读取，向下兼容顶层)
@@ -458,7 +938,7 @@ sm.complete_stage(state, Stage.EXPERIMENT_EXECUTION, {'backend': '${BACKEND}', '
 "
             _do_paper_writing
             _do_submit_review
-            exit 0
+            return
         else
             echo -e "${YELLOW}未找到本地日志，重新执行实验（本地优先）...${NC}"
             EXP_SCRIPT="${WORKSPACE}/experiment/run_experiment.sh"
@@ -1561,13 +2041,69 @@ _do_revise_and_resubmit() {
         _rev_ckpt_is_done "$NEXT_ITER" "phase_b2" && PHASE_B2_DONE=true
         _rev_ckpt_is_done "$NEXT_ITER" "phase_c" && PHASE_C_DONE=true
         echo -e "  [检查点] A=$PHASE_A_DONE B1=$PHASE_B1_DONE B2提交=$PHASE_B2_SUBMITTED B2完成=$PHASE_B2_DONE C=$PHASE_C_DONE"
+
+        # ── 精确跳转到上次中断的位置 ──
+        # 全部完成 → 直接到审稿门控
+        if [[ "$PHASE_A_DONE" == "true" && "$PHASE_B1_DONE" == "true" && \
+              "$PHASE_B2_SUBMITTED" == "true" && "$PHASE_B2_DONE" == "true" && \
+              "$PHASE_C_DONE" == "true" ]]; then
+            echo -e "  ${GREEN}▶ 直接进入审稿门控 (所有阶段已完成)${NC}"
+            echo ""
+            ITERATION=${NEXT_ITER}
+            _internal_review_gate 5
+            _do_submit_review
+            python -c "
+from state_manager import StateManager, Stage
+sm = StateManager('state')
+state = sm.load('${SLUG}')
+state.iteration = ${NEXT_ITER}
+sm.save(state)
+sm.complete_stage(state, Stage.REVISE)
+"
+            return 0
+        fi
+        # A+B1+B2 完成，C 未完成 → 直接跳到 Phase C
+        if [[ "$PHASE_A_DONE" == "true" && "$PHASE_B1_DONE" == "true" && \
+              "$PHASE_B2_DONE" == "true" ]]; then
+            echo -e "  ${GREEN}▶ 直接跳到 Phase C (实验已完成，更新论文)${NC}"
+            echo ""
+            EXP_COUNT=$(python -c "import json; print(len(json.load(open('${REVISION_EXP_DIR}/revision_plan.json')).get('experiments',[])))" 2>/dev/null || echo "0")
+            TOPIC="$TOPIC" NEXT_ITER="$NEXT_ITER" verdict="$verdict" \
+              LATEST_REVIEW="$LATEST_REVIEW" REVISION_EXP_DIR="$REVISION_EXP_DIR" \
+              _render_prompt "revision_phase_c.md" /tmp/cr_phase_c.txt
+            _claude_task "$(cat /tmp/cr_phase_c.txt)" "/tmp/cr_phase_c_output.txt" || true
+            _rev_ckpt_set "$NEXT_ITER" "phase_c" "done"
+            ITERATION=${NEXT_ITER}
+            _internal_review_gate 5
+            _do_submit_review
+            python -c "
+from state_manager import StateManager, Stage
+sm = StateManager('state')
+state = sm.load('${SLUG}')
+state.iteration = ${NEXT_ITER}
+sm.save(state)
+sm.complete_stage(state, Stage.REVISE)
+"
+            return 0
+        fi
+        # A+B1 完成，B2 未完成 → 直接跳到 B2 提交
+        if [[ "$PHASE_A_DONE" == "true" && "$PHASE_B1_DONE" == "true" && \
+              "$PHASE_B2_DONE" != "true" ]]; then
+            echo -e "  ${GREEN}▶ 直接跳到 Phase B2 (代码已编写，提交实验)${NC}"
+            EXP_COUNT=1  # 确保进入 B2
+            PHASE_A_DONE=true; PHASE_B1_DONE=true
+            _goto_b2=true
+        fi
         echo ""
     fi
 
     # ========================================================================
     # Phase A: 分析审稿意见，分离「需要实验」和「只改文字」的需求
     # ========================================================================
-    if [[ "$PHASE_A_DONE" == "true" ]]; then
+    if [[ "${_goto_b2:-false}" == "true" ]]; then
+        echo -e "  ${GREEN}⏩ 跳过 Phase A (已完成)，直接进入 Phase B2${NC}"
+        echo ""
+    elif [[ "$PHASE_A_DONE" == "true" ]]; then
         echo -e "${CYAN}━━━ Phase A: 跳过 (检查点已完成) ━━━${NC}"
         echo ""
         # 仍需从已有 revision_plan.json 读取 EXP_COUNT
@@ -1621,7 +2157,13 @@ else:
     # ========================================================================
     # Phase B: 实际执行补充实验
     # ========================================================================
-    if [[ "$EXP_COUNT" -gt 0 ]]; then
+    if [[ "${_goto_b2:-false}" == "true" ]]; then
+        echo -e "  ${GREEN}⏩ 跳过 Phase B1，直接进入 B2${NC}"
+        echo ""
+        EXP_COUNT=1  # ensure B2 runs
+        PHASE_B1_DONE=true
+        PHASE_B2_SUBMITTED=false  # allow initial submission
+    elif [[ "$EXP_COUNT" -gt 0 ]]; then
         echo -e "${CYAN}━━━ Phase B: 执行 ${EXP_COUNT} 个补充实验 ━━━${NC}"
         echo ""
 
@@ -1814,6 +2356,10 @@ json.dump(exps, open(rev_dir / 'experiment_results.json', 'w'), indent=2)
                     if [[ "$_s" == "SUCCEEDED" ]]; then
                         sco acp jobs stream-logs --workspace-name share-space "${_w_jobid}" > "${_w_dir}/experiment_log.txt" 2>/dev/null || true
                         echo -e "  ${GREEN}✓ ${_w_name}: 完成，日志已获取${NC}"
+                    elif [[ "$_s" == "RUNNING" || "$_s" == "PENDING" || "$_s" == "QUEUED" || "$_s" == "STARTING" ]]; then
+                        echo -e "  ${YELLOW}⏳ ${_w_name}: 仍在运行 (${_s})，轮询超时但任务未失败${NC}"
+                        echo -e "  ${YELLOW}  请稍后手动检查: sco acp jobs describe --workspace-name share-space ${_w_jobid}${NC}"
+                        # 不触发修复，保留等待标记以便下次续跑时继续等待
                     else
                         echo -e "  ${RED}✗ ${_w_name}: 最终状态 ${_s}，立即触发修复...${NC}"
                         # Immediately resubmit — same logic as the repairer in 2b
@@ -1919,6 +2465,8 @@ print(f'ERROR={result.error_summary}')
             if [[ "$all_ready" == "true" ]]; then
                 echo -e "  ${GREEN}所有实验日志已就绪，跳过重新提交${NC}"
                 PHASE_B2_SUBMITTED=true
+                PHASE_B2_DONE=true
+                _rev_ckpt_set "$NEXT_ITER" "phase_b2" "done"
             elif [[ $repaired_count -gt 0 || $still_running -gt 0 ]]; then
                 # 已修复的实验需要等待 SCO 执行；仍在运行的实验需要等待完成。
                 # 两种情况都应保持 submitted 状态，让下一轮检查点来收割结果。
@@ -1931,6 +2479,36 @@ print(f'ERROR={result.error_summary}')
         fi
 
         if [[ "$PHASE_B2_DONE" != "true" ]]; then
+            # ── 提交前先检查每个实验的 SCO 状态（断点续跑保护）──
+            for i in $(seq 0 $((${#exp_dirs[@]} - 1))); do
+                local _exp_subdir="${exp_dirs[$i]}"
+                local _exp_name="${exp_names[$i]}"
+                local _jid_file="${_exp_subdir}/logs/sco_job_id.txt"
+                if [[ -f "$_jid_file" ]]; then
+                    local _jid=$(cat "$_jid_file" | tr -d '[:space:]')
+                    if [[ -n "$_jid" ]]; then
+                        local _sco_state=$(sco acp jobs describe --workspace-name share-space -o json "$_jid" 2>/dev/null | python3 -c "import json,sys; d=sys.stdin.read().strip(); print(json.loads(d).get('status', json.loads(d).get('state','UNKNOWN')) if d else 'UNKNOWN')" 2>/dev/null || echo "UNKNOWN")
+                        case "$_sco_state" in
+                            SUCCEEDED)
+                                echo -e "  ${GREEN}✓ ${_exp_name}: SCO 任务成功 (${_jid})，下载日志，跳过重新提交${NC}"
+                                sco acp jobs stream-logs --workspace-name share-space "$_jid" > "${_exp_subdir}/experiment_log.txt" 2>/dev/null || true
+                                # 标记跳过，不重新提交
+                                mkdir -p "${_exp_subdir}/logs"
+                                echo "SKIPPED_ALREADY_DONE" > "${_exp_subdir}/logs/.skip_submit"
+                                ;;
+                            RUNNING|PENDING|QUEUED|STARTING)
+                                echo -e "  ${CYAN}⏳ ${_exp_name}: SCO 任务运行中 (${_jid}, ${_sco_state})，等待完成，不重新提交${NC}"
+                                mkdir -p "${_exp_subdir}/logs"
+                                echo "WAIT_FOR_JOB ${_jid}" > "${_exp_subdir}/logs/.skip_submit"
+                                ;;
+                            *)
+                                echo -e "  ${YELLOW}  ${_exp_name}: SCO 任务 ${_sco_state} (${_jid})，将重新提交${NC}"
+                                ;;
+                        esac
+                    fi
+                fi
+            done
+
             # 提交实验（如果尚未提交）
             if [[ "$PHASE_B2_SUBMITTED" != "true" ]]; then
                 for i in $(seq 0 $((${#exp_dirs[@]} - 1))); do
@@ -1940,19 +2518,88 @@ print(f'ERROR={result.error_summary}')
                     local result_file="/tmp/cr_rev_exp_${NEXT_ITER}_${i}.txt"
                     result_files+=("$result_file")
 
-                    echo -e "  ${YELLOW}▶ 提交实验 $((i+1))/${#exp_dirs[@]}: ${exp_name}${NC}"
+                    # 跳过已成功或运行中的实验
+                    local _skip_file="${exp_subdir}/logs/.skip_submit"
+                    if [[ -f "$_skip_file" ]]; then
+                        local _skip_reason=$(cat "$_skip_file")
+                        if [[ "$_skip_reason" == SKIPPED_ALREADY_DONE* ]]; then
+                            echo -e "  ${GREEN}⊘ ${exp_name}: 已完成，跳过${NC}"
+                            echo "BACKEND=sco" > "$result_file"
+                            echo "SUCCESS=True" >> "$result_file"
+                            echo "JOB_ID=$(echo $_skip_reason | awk '{print $NF}')" >> "$result_file"
+                            continue
+                        elif [[ "$_skip_reason" == WAIT_FOR_JOB* ]]; then
+                            local _w_jid=$(echo "$_skip_reason" | awk '{print $2}')
+                            echo -e "  ${CYAN}⏳ ${exp_name}: 等待 SCO 任务 ${_w_jid}...${NC}"
+                            (
+                                for _wi in $(seq 1 120); do
+                                    sleep 30
+                                    _ws=$(sco acp jobs describe --workspace-name share-space -o json "$_w_jid" 2>/dev/null | python3 -c "import json,sys; d=sys.stdin.read().strip(); print(json.loads(d).get('status',json.loads(d).get('state','UNKNOWN')) if d else 'UNKNOWN')" 2>/dev/null || echo "UNKNOWN")
+                                    case "$_ws" in SUCCEEDED|FAILED|STOPPED|SUSPENDED|CANCELLED) break ;; esac
+                                done
+                                if [[ "$_ws" == "SUCCEEDED" ]]; then
+                                    sco acp jobs stream-logs --workspace-name share-space "$_w_jid" > "${exp_subdir}/experiment_log.txt" 2>/dev/null || true
+                                    echo "BACKEND=sco" > "$result_file"
+                                    echo "SUCCESS=True" >> "$result_file"
+                                    echo "JOB_ID=$_w_jid" >> "$result_file"
+                                fi
+                            ) &
+                            pids+=($!)
+                            continue
+                        fi
+                    fi
 
-                    python -c "
-import sys; sys.path.insert(0, '${SCRIPT_DIR}')
-from sco_runner import run_with_debug_loop
+                    echo -e "  ${YELLOW}▶ 提交实验 $((i+1))/${#exp_dirs[@]}: ${exp_name} → 日志: ${result_file}${NC}"
+                    (
+                        local _rev_exp_script="$exp_script"
+                        local _rev_exp_name="$exp_name"
+                        local _rev_result_file="$result_file"
+                        local _rev_max_rounds=20
+                        (
+                            for ((_rev_round=1; _rev_round<=_rev_max_rounds; _rev_round++)); do
+                                echo "━━━ 补充实验修复轮次 ${_rev_round}/${_rev_max_rounds}: ${_rev_exp_name} ━━━"
+                                local _rev_output
+                                _rev_output=$(python -c "
+from sco_runner import run_experiment
 from pathlib import Path
-result = run_with_debug_loop(Path('${exp_script}'), '${exp_name}', force_sco=True, project_slug='${SLUG}', max_debug_rounds=5)
+result = run_experiment(
+    Path('${_rev_exp_script}'),
+    job_name='${_rev_exp_name}-fix${_rev_round}',
+    force_sco=True,
+)
 print(f'BACKEND={result.backend}')
 print(f'SUCCESS={result.success}')
 print(f'JOB_ID={result.job_id}')
 print(f'LOG_PATH={result.log_path}')
 print(f'ERROR={result.error_summary}')
-" > "$result_file" 2>&1 &
+" 2>&1)
+                                echo "$_rev_output"
+                                if echo "$_rev_output" | grep -q 'SUCCESS=True'; then
+                                    echo "✓ ${_rev_exp_name}: 成功"
+                                    break
+                                fi
+                                if [[ $_rev_round -lt _rev_max_rounds ]]; then
+                                    echo "── Claude Code 诊断修复中... ──"
+                                    python "${SCRIPT_DIR}/experiment_runner.py" build-prompt \
+                                        "${WORKSPACE}/experiment/revision_iter_${NEXT_ITER}" \
+                                        "${_rev_exp_script%.sh}_log.txt" \
+                                        --script "${_rev_exp_script}" \
+                                        --backend sco \
+                                        --round "${_rev_round}" \
+                                        --max-rounds "${_rev_max_rounds}" \
+                                        --protected "sco_runner.py
+config.py" \
+                                        > "/tmp/cr_rev_debug_${NEXT_ITER}_${i}.txt" 2>/dev/null || \
+                                        echo "补充实验 ${_rev_exp_name} 第 ${_rev_round} 轮失败，请检查" > "/tmp/cr_rev_debug_${NEXT_ITER}_${i}.txt"
+                                    cat "/tmp/cr_rev_debug_${NEXT_ITER}_${i}.txt" | claude -p \
+                                        --model "${CLAUDE_MODEL:-deepseek-v4-pro}" \
+                                        --output-format text \
+                                        --append-system-prompt "$(cat ${SCRIPT_DIR}/prompts/sco_debugger_system.md)" 2>&1
+                                    echo "── 修复完成，重新提交... ──"
+                                fi
+                            done
+                        ) 2>&1 | tee "$_rev_result_file"
+                    ) &
                     pids+=($!)
                 done
 
@@ -2276,13 +2923,8 @@ sm.complete_stage(state, Stage.BASELINE_FETCHING)
 sm.start_stage(state, Stage.EXPERIMENT_DESIGN)
 "
 
-            # Fall through to experiment design
-            BASELINE_CONTEXT="${BASELINE_CONTEXT}" \
-            HYPOTHESIS_CLAUSE="和假说" \
-              HYPOTHESIS_LINE="研究假说: ${WORKSPACE}/hypothesis/hypothesis_report.md" \
-              DESIGN_STEP_1="阅读文献综述和研究假说" \
-              _render_prompt "experiment_design_start.md" /tmp/cr_stage2_prompt.txt
-            _claude_task "$(cat /tmp/cr_stage2_prompt.txt)"
+            # Fall through to experiment design — Claude Code experiment scientist
+            _claude_experiment_design
 
             # 验证 manifest 是否被创建，缺失时自动补全
             MANIFEST="${WORKSPACE}/experiment/experiment_manifest.json"
@@ -2337,10 +2979,8 @@ sm.start_stage(state, Stage.EXPERIMENT_EXECUTION)
             echo -e "${YELLOW}实验设计阶段 — 重新执行实验设计...${NC}"
             BASELINE_CTX_FILE="${WORKSPACE}/experiment/baseline_context.md"
             BASELINE_CONTEXT=$(cat "${BASELINE_CTX_FILE}" 2>/dev/null || echo "")
-            BASELINE_CONTEXT="${BASELINE_CONTEXT}" \
-            HYPOTHESIS_CLAUSE="" HYPOTHESIS_LINE="" DESIGN_STEP_1="阅读文献综述" \
-              _render_prompt "experiment_design_start.md" /tmp/cr_stage2_prompt.txt
-            _claude_task "$(cat /tmp/cr_stage2_prompt.txt)"
+            # Claude Code experiment scientist (prompt-driven)
+            _claude_experiment_design
 
             # 验证 manifest 是否被创建，缺失时自动补全
             MANIFEST="${WORKSPACE}/experiment/experiment_manifest.json"
@@ -2432,6 +3072,30 @@ print(reviews[-1].get('verdict', 'unknown') if reviews else 'unknown')
 
 # 核心：根据 state 决定执行什么
 # ---------------------------------------------------------------------------
+
+# ── 自动续跑：如果通过 --auto-resume <slug> 启动，直接继续该项目 ──
+if [[ "${1:-}" == "--auto-resume" && -n "${2:-}" ]]; then
+    AUTO_SLUG="$2"
+    if [[ -f "state/${AUTO_SLUG}/state.json" ]]; then
+        SLUG="$AUTO_SLUG"
+        # 读取项目信息
+        TOPIC=$(python -c "import json; print(json.load(open('state/${SLUG}/state.json'))['topic'])" 2>/dev/null)
+        STAGE=$(python -c "import json; print(json.load(open('state/${SLUG}/state.json'))['stage'])" 2>/dev/null)
+        ITERATION=$(python -c "import json; print(json.load(open('state/${SLUG}/state.json'))['iteration'])" 2>/dev/null)
+        WORKSPACE=$(python -c "import json; print(json.load(open('state/${SLUG}/state.json'))['work_dir'])" 2>/dev/null)
+        export TOPIC WORKSPACE STAGE ITERATION SLUG
+        _setup_logging "$WORKSPACE"
+        echo ""
+        echo -e "${CYAN}  ▶ 自动续跑: ${TOPIC:0:60}${NC}"
+        echo -e "  阶段: ${STAGE}  迭代: ${ITERATION}"
+        echo ""
+        # 清零恢复计数（成功续跑）
+        rm -f "$RECOVERY_COUNT_FILE"
+        _continue_project
+        exit $?
+    fi
+fi
+
 banner
 
 # 收集所有项目（仅列出 workspace/ 真实存在的）
@@ -2513,6 +3177,8 @@ if [[ ${#PROJECT_SLUGS[@]} -gt 0 ]]; then
         WORKSPACE="${PROJECT_WORKSPACES[$idx]}"
         export TOPIC WORKSPACE STAGE ITERATION SLUG
         _setup_logging "$WORKSPACE"
+        # ── 故障自动恢复：检测上次是否崩溃，如是则触发 Claude Code 修复 ──
+        _auto_recover_if_crashed "$SLUG"
         _continue_project
     else
         exit 1
@@ -2725,10 +3391,8 @@ sm.start_stage(state, Stage.EXPERIMENT_DESIGN)
     echo -e "${CYAN}━━━ Stage 3/6: 实验设计 ━━━${NC}"
     echo ""
 
-    BASELINE_CONTEXT="${BASELINE_CONTEXT}" \
-    HYPOTHESIS_CLAUSE="" HYPOTHESIS_LINE="" DESIGN_STEP_1="阅读文献综述" \
-      _render_prompt "experiment_design_start.md" /tmp/cr_stage2_prompt.txt
-    _claude_task "$(cat /tmp/cr_stage2_prompt.txt)"
+    # Claude Code experiment scientist (prompt-driven)
+    _claude_experiment_design
 
     # 验证 manifest 是否被创建，缺失时自动补全
     MANIFEST="${WORKSPACE}/experiment/experiment_manifest.json"

@@ -24,7 +24,7 @@ echo "[2/4] 配置 Claude Code …"
 
 if ! command -v claude &>/dev/null; then
     echo "  安装 Claude Code CLI …"
-    npm install -g @anthropic-ai/claude-code 2>/dev/null || \
+    npm install -g @anthropic-ai/claude-code@2.1.156 2>/dev/null || \
     curl -fsSL https://claude.ai/install.sh | bash 2>/dev/null || \
     echo "  [WARN] Claude Code 安装失败，请手动安装: https://claude.ai/code"
 fi
