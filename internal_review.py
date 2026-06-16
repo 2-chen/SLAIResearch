@@ -50,166 +50,137 @@ logger = logging.getLogger("internal_review")
 # Reviewer Personas
 # ---------------------------------------------------------------------------
 
-REVIEWER_POOL = [
+
+def _load_reviewer_pool():
+    """从 reviewer_prompts.json 加载审稿员 Prompt，支持系统自我迭代升级。"""
+    import json
+    prompts_file = Path(__file__).resolve().parent / "reviewer_prompts.json"
+    if prompts_file.exists():
+        try:
+            data = json.loads(prompts_file.read_text())
+            reviewers = data.get("reviewers", [])
+            if reviewers:
+                logger.info("从 reviewer_prompts.json 加载了 %d 个审稿员", len(reviewers))
+                return reviewers
+        except Exception as e:
+            logger.warning("加载 reviewer_prompts.json 失败: %s，使用内置默认", e)
+    return _BUILTIN_REVIEWERS
+
+_BUILTIN_REVIEWERS = [
     {
         "name": "Methodology Expert",
         "role": "方法论与算法专家",
         "focus": "method, algorithm design, theoretical justification, notation",
-        "prompt": textwrap.dedent("""\
-            You are a senior reviewer specializing in methodology and algorithm design.
-            Evaluate the paper's METHOD section focusing on:
-
-            1. **Technical Soundness**: Is the proposed method mathematically/theoretically sound?
-            2. **Novelty**: What is genuinely new vs. incremental? Be specific.
-            3. **Clarity of Description**: Can a competent researcher reproduce the method from the description?
-            4. **Design Justification**: Are design choices justified (not arbitrary)?
-            5. **Notation**: Is mathematical notation consistent, well-defined, and standard?
-
-            For each issue found, use format:
-            [PROBLEM] specific issue → [IMPACT] why it matters → [FIX] concrete suggestion
-
-            Output a structured review section:
-            ## Methodology Review
-            ### Strengths (3-5)
-            ### Weaknesses (3-5)
-            ### Detailed Issues (with PROBLEM→IMPACT→FIX format)
-            ### Score (1-10)
-            ### Recommendation (Accept / Weak Accept / Borderline / Reject)
-        """).strip(),
+        "prompt": "\\\n            You are a senior reviewer specializing in methodology and algorithm design.\n            Evaluate the paper's METHOD section focusing on:\n\n            1. **Technical Soundness**: Is the proposed method mathematically/theoretically sound?\n            2. **Novelty**: What is genuinely new vs. incremental? Be specific.\n            3. **Clarity of Description**: Can a competent researcher reproduce the method from the description?\n            4. **Design Justification**: Are design choices justified (not arbitrary)?\n            5. **Notation**: Is mathematical notation consistent, well-defined, and standard?\n\n            For each issue found, use format:\n            [PROBLEM] specific issue → [IMPACT] why it matters → [FIX] concrete suggestion\n\n            Output a structured review section:\n            ## Methodology Review\n            ### Strengths (3-5)\n            ### Weaknesses (3-5)\n            ### Detailed Issues (with PROBLEM→IMPACT→FIX format)\n            ### Score (1-10)\n            ### Recommendation (Accept / Weak Accept / Borderline / Reject)",
+        "version": "1.0",
+        "created": "2026-06-14",
+        "evolution_notes": ""
     },
     {
         "name": "Experiments Reviewer",
         "role": "实验评估专家",
         "focus": "experiments, baselines, metrics, statistical rigor, ablation",
-        "prompt": textwrap.dedent("""\
-            You are a senior reviewer specializing in experimental evaluation.
-            Evaluate the paper's EXPERIMENTS section focusing on:
-
-            1. **Dataset Selection**: Are the datasets standard and appropriate?
-            2. **Baseline Comparison**: Are all relevant baselines included? Are they fairly tuned?
-            3. **Metrics**: Are the evaluation metrics standard and comprehensive?
-            4. **Statistical Rigor**: Error bars, significance tests, multiple seeds?
-            5. **Ablation Studies**: Are key components ablated to show their contribution?
-            6. **Result Interpretation**: Are claimed improvements actually significant?
-
-            For each issue found, use format:
-            [PROBLEM] specific issue → [IMPACT] why it matters → [FIX] concrete suggestion
-
-            Output a structured review section:
-            ## Experimental Review
-            ### Strengths (3-5)
-            ### Weaknesses (3-5)
-            ### Missing Baselines / Metrics
-            ### Statistical Issues
-            ### Detailed Issues (with PROBLEM→IMPACT→FIX format)
-            ### Score (1-10)
-            ### Recommendation (Accept / Weak Accept / Borderline / Reject)
-        """).strip(),
+        "prompt": "\\\n            You are a senior reviewer specializing in experimental evaluation.\n            Evaluate the paper's EXPERIMENTS section focusing on:\n\n            1. **Dataset Selection**: Are the datasets standard and appropriate?\n            2. **Baseline Comparison**: Are all relevant baselines included? Are they fairly tuned?\n            3. **Metrics**: Are the evaluation metrics standard and comprehensive?\n            4. **Statistical Rigor**: Error bars, significance tests, multiple seeds?\n            5. **Ablation Studies**: Are key components ablated to show their contribution?\n            6. **Result Interpretation**: Are claimed improvements actually significant?\n\n            For each issue found, use format:\n            [PROBLEM] specific issue → [IMPACT] why it matters → [FIX] concrete suggestion\n\n            Output a structured review section:\n            ## Experimental Review\n            ### Strengths (3-5)\n            ### Weaknesses (3-5)\n            ### Missing Baselines / Metrics\n            ### Statistical Issues\n            ### Detailed Issues (with PROBLEM→IMPACT→FIX format)\n            ### Score (1-10)\n            ### Recommendation (Accept / Weak Accept / Borderline / Reject)",
+        "version": "1.0",
+        "created": "2026-06-14",
+        "evolution_notes": ""
     },
     {
         "name": "Clarity & Writing Reviewer",
         "role": "写作与表达专家",
         "focus": "writing quality, structure, clarity, flow, presentation",
-        "prompt": textwrap.dedent("""\
-            You are a senior reviewer specializing in academic writing quality.
-            Evaluate the paper's WRITING focusing on:
-
-            1. **Structure**: Is the paper well-organized (Abstract→Intro→Related Work→Method→Experiments→Conclusion)?
-            2. **Clarity**: Is every claim clear and unambiguous?
-            3. **Flow**: Do sections connect logically?
-            4. **Conciseness**: Is there redundant or verbose text?
-            5. **Title & Abstract**: Do they accurately reflect the contribution?
-            6. **Figures & Tables**: Are they well-designed, properly labeled, and informative?
-            7. **Layout & Formatting**: Do any figures, tables, or equations overflow the column? Is \\columnwidth used correctly for in-column figures? Are tables resized to fit? Check for Overfull hbox warnings.
-            8. **AI Writing Detection**: Any signs of LLM-generated text (hedging pileups, "delve", "leverage", "furthermore" overuse)?
-
-            For each issue found, use format:
-            [PROBLEM] specific issue → [IMPACT] why it matters → [FIX] concrete suggestion
-
-            Output a structured review section:
-            ## Writing & Presentation Review
-            ### Strengths (3-5)
-            ### Weaknesses (3-5)
-            ### Structural Issues
-            ### Language & Clarity Issues
-            ### Figure/Table Issues
-            ### Layout & Formatting Issues
-            ### AI Writing Flags (if any)
-            ### Score (1-10)
-            ### Recommendation
-        """).strip(),
+        "prompt": "\\\n            You are a senior reviewer specializing in academic writing quality.\n            Evaluate the paper's WRITING focusing on:\n\n            1. **Structure**: Is the paper well-organized (Abstract→Intro→Related Work→Method→Experiments→Conclusion)?\n            2. **Clarity**: Is every claim clear and unambiguous?\n            3. **Flow**: Do sections connect logically?\n            4. **Conciseness**: Is there redundant or verbose text?\n            5. **Title & Abstract**: Do they accurately reflect the contribution?\n            6. **Figures & Tables**: Are they well-designed, properly labeled, and informative?\n            7. **Layout & Formatting**: Do any figures, tables, or equations overflow the column? Is \\\\columnwidth used correctly for in-column figures? Are tables resized to fit? Check for Overfull hbox warnings.\n            8. **AI Writing Detection**: Any signs of LLM-generated text (hedging pileups, \"delve\", \"leverage\", \"furthermore\" overuse)?\n\n            For each issue found, use format:\n            [PROBLEM] specific issue → [IMPACT] why it matters → [FIX] concrete suggestion\n\n            Output a structured review section:\n            ## Writing & Presentation Review\n            ### Strengths (3-5)\n            ### Weaknesses (3-5)\n            ### Structural Issues\n            ### Language & Clarity Issues\n            ### Figure/Table Issues\n            ### Layout & Formatting Issues\n            ### AI Writing Flags (if any)\n            ### Score (1-10)\n            ### Recommendation",
+        "version": "1.0",
+        "created": "2026-06-14",
+        "evolution_notes": ""
     },
     {
         "name": "Related Work Reviewer",
         "role": "文献覆盖度专家",
         "focus": "related work coverage, citation completeness, positioning",
-        "prompt": textwrap.dedent("""\
-            You are a senior reviewer specializing in literature coverage.
-            Evaluate the paper's RELATED WORK and CITATIONS focusing on:
-
-            1. **Coverage**: Are all relevant lines of work cited?
-            2. **Currency**: Are recent papers (last 2-3 years) adequately covered?
-            3. **Positioning**: Does the paper clearly explain how it differs from prior work?
-            4. **Missing Citations**: What important papers are NOT cited but should be?
-            5. **Over-citation**: Are there citations that don't actually support the claim?
-            6. **Reference Quality**: Are the cited papers from reputable venues?
-
-            For each issue found, use format:
-            [PROBLEM] specific issue → [IMPACT] why it matters → [FIX] concrete suggestion
-
-            Output a structured review section:
-            ## Literature Coverage Review
-            ### Strengths
-            ### Weaknesses
-            ### Missing Citations (be specific: author, year, title)
-            ### Positioning Issues
-            ### Score (1-10)
-            ### Recommendation
-        """).strip(),
+        "prompt": "\\\n            You are a senior reviewer specializing in literature coverage.\n            Evaluate the paper's RELATED WORK and CITATIONS focusing on:\n\n            1. **Coverage**: Are all relevant lines of work cited?\n            2. **Currency**: Are recent papers (last 2-3 years) adequately covered?\n            3. **Positioning**: Does the paper clearly explain how it differs from prior work?\n            4. **Missing Citations**: What important papers are NOT cited but should be?\n            5. **Over-citation**: Are there citations that don't actually support the claim?\n            6. **Reference Quality**: Are the cited papers from reputable venues?\n\n            For each issue found, use format:\n            [PROBLEM] specific issue → [IMPACT] why it matters → [FIX] concrete suggestion\n\n            Output a structured review section:\n            ## Literature Coverage Review\n            ### Strengths\n            ### Weaknesses\n            ### Missing Citations (be specific: author, year, title)\n            ### Positioning Issues\n            ### Score (1-10)\n            ### Recommendation",
+        "version": "1.0",
+        "created": "2026-06-14",
+        "evolution_notes": ""
     },
     {
         "name": "Devils Advocate",
         "role": "魔鬼辩护人",
         "focus": "fundamental flaws, overclaims, hidden assumptions, alternative explanations",
-        "prompt": textwrap.dedent("""\
-            You are a skeptical reviewer (Devil's Advocate). Your job is to find EVERY possible flaw,
-            overclaim, hidden assumption, or alternative explanation.
-
-            Attack the paper from every angle:
-
-            1. **Overclaims**: Does the paper claim more than the evidence supports?
-            2. **Hidden Assumptions**: What unstated assumptions does the method rely on?
-            3. **Alternative Explanations**: Could the results be explained by something other than the proposed method?
-            4. **Reproducibility**: Would another team get the same results?
-            5. **Generalizability**: Would this work on different datasets/domains?
-            6. **Fair Comparison**: Are baselines unfairly handicapped?
-            7. **Cherry Picking**: Are the best results selectively reported?
-            8. **Data Leakage**: Any sign of train/test contamination?
-
-            Be harsh but fair. If the paper is genuinely good, say so — but only after trying hard to find flaws.
-
-            Output a structured review section:
-            ## Critical Review (Devil's Advocate)
-            ### Potential Overclaims
-            ### Hidden Assumptions
-            ### Alternative Explanations for Results
-            ### Reproducibility Concerns
-            ### Generalizability Concerns
-            ### Fairness of Comparison
-            ### Score (1-10)
-            ### Overall Verdict (be honest: is this paper fundamentally sound?)
-        """).strip(),
-    },
+        "prompt": "\\\n            You are a skeptical reviewer (Devil's Advocate). Your job is to find EVERY possible flaw,\n            overclaim, hidden assumption, or alternative explanation.\n\n            Attack the paper from every angle:\n\n            1. **Overclaims**: Does the paper claim more than the evidence supports?\n            2. **Hidden Assumptions**: What unstated assumptions does the method rely on?\n            3. **Alternative Explanations**: Could the results be explained by something other than the proposed method?\n            4. **Reproducibility**: Would another team get the same results?\n            5. **Generalizability**: Would this work on different datasets/domains?\n            6. **Fair Comparison**: Are baselines unfairly handicapped?\n            7. **Cherry Picking**: Are the best results selectively reported?\n            8. **Data Leakage**: Any sign of train/test contamination?\n\n            Be harsh but fair. If the paper is genuinely good, say so — but only after trying hard to find flaws.\n\n            Output a structured review section:\n            ## Critical Review (Devil's Advocate)\n            ### Potential Overclaims\n            ### Hidden Assumptions\n            ### Alternative Explanations for Results\n            ### Reproducibility Concerns\n            ### Generalizability Concerns\n            ### Fairness of Comparison\n            ### Score (1-10)\n            ### Overall Verdict (be honest: is this paper fundamentally sound?)",
+        "version": "1.0",
+        "created": "2026-06-14",
+        "evolution_notes": ""
+    }
 ]
+
+# 实际使用的审稿员池（从文件加载或内置默认）
+REVIEWER_POOL = _load_reviewer_pool()
 
 
 # ---------------------------------------------------------------------------
 # Core logic
 # ---------------------------------------------------------------------------
 
-def review_paper(paper_path: str, output_dir: str, model: str = CLAUDE_MODEL,
+def _load_dynamic_reviewers(workspace_dir: str) -> list[dict]:
+    """Load dynamically registered reviewers from review/reviewer_pool.json."""
+    pool_path = Path(workspace_dir) / "review" / "reviewer_pool.json"
+    if not pool_path.exists():
+        return []
+    try:
+        data = json.loads(pool_path.read_text())
+        added = data.get("add", [])
+        # Validate each reviewer has required fields
+        valid = []
+        for r in added:
+            if all(k in r for k in ("name", "role", "focus", "prompt")):
+                valid.append(r)
+            else:
+                logger.warning("Skipping invalid dynamic reviewer: %s", r.get("name", "unknown"))
+        if valid:
+            logger.info("Loaded %d dynamic reviewer(s): %s", len(valid),
+                        ", ".join(r["name"] for r in valid))
+        return valid
+    except Exception as e:
+        logger.warning("Failed to load dynamic reviewers: %s", e)
+        return []
+
+
+def _apply_prompt_modifications(reviewers: list[dict], workspace_dir: str) -> list[dict]:
+    """Apply prompt modifications from review/reviewer_pool.json to existing reviewers.
+
+    The ``modify`` key in reviewer_pool.json specifies prompt changes for reviewers
+    already defined in REVIEWER_POOL. Each entry has ``name`` (matching an existing
+    reviewer) and ``prompt_change`` (text appended to the reviewer's prompt).
+    """
+    pool_path = Path(workspace_dir) / "review" / "reviewer_pool.json"
+    if not pool_path.exists():
+        return reviewers
+    try:
+        data = json.loads(pool_path.read_text())
+        modifications = data.get("modify", [])
+        for mod in modifications:
+            name = mod.get("name", "")
+            prompt_change = mod.get("prompt_change", "")
+            if not name or not prompt_change:
+                continue
+            matched = False
+            for r in reviewers:
+                if r["name"] == name:
+                    r["prompt"] = r["prompt"] + "\n\n" + prompt_change
+                    logger.info("Applied prompt modification to: %s", name)
+                    matched = True
+                    break
+            if not matched:
+                logger.warning("Prompt modification target not found in pool: %s", name)
+    except Exception as e:
+        logger.warning("Failed to apply prompt modifications: %s", e)
+    return reviewers
+
+
+def review_paper(paper_path: str, output_dir: str, model: str = CLAUDE_MODEL, memory_context: str = '',
                  parallel: bool = True, reviewers: list[dict] | None = None,
-                 literature_dir: str = "") -> dict:
+                 literature_dir: str = "", workspace_dir: str = "") -> dict:
     """
     Run all reviewers against *paper_path*.
     Returns a dict with merged review data.
@@ -217,9 +188,24 @@ def review_paper(paper_path: str, output_dir: str, model: str = CLAUDE_MODEL,
     If *literature_dir* points to a valid literature/ directory containing
     literature_review.md, the function builds literature context and injects
     it into each reviewer's prompt for cross-comparison.
+
+    If *workspace_dir* is provided, dynamically registered reviewers from
+    review/reviewer_pool.json are loaded and added to the pool. Prompt
+    modifications for existing reviewers (the ``modify`` key) are also applied.
     """
     if reviewers is None:
-        reviewers = REVIEWER_POOL
+        reviewers = list(REVIEWER_POOL)  # copy to avoid mutating module-level list
+        # 注入审稿记忆到每个审稿员的 prompt 前面
+        if memory_context:
+            for r in reviewers:
+                r["prompt"] = memory_context + "\n\n---\n\n" + r["prompt"]
+
+    # Load dynamic reviewers (from calibration analysis)
+    if workspace_dir:
+        dynamic = _load_dynamic_reviewers(workspace_dir)
+        reviewers.extend(dynamic)
+        # Apply prompt modifications to existing reviewers
+        reviewers = _apply_prompt_modifications(reviewers, workspace_dir)
 
     paper_path = Path(paper_path).resolve()
     if not paper_path.exists():
@@ -612,6 +598,20 @@ def main():
     parser.add_argument("--sequential", action="store_true", help="Run reviewers sequentially")
     parser.add_argument("--skip", nargs="*", help="Reviewers to skip (name prefix)")
     parser.add_argument("--model", default=CLAUDE_MODEL, help="Model for reviewers")
+    parser.add_argument("--memory", default=None, help="审稿记忆文件路径 (review_memory.md)")
+
+    # 加载审稿记忆上下文
+    memory_context = ""
+    if args.memory:
+        try:
+            from review_memory import ReviewMemory
+            rm = ReviewMemory(str(Path(args.memory).parent) if Path(args.memory).is_file() else args.memory)
+            memory_context = rm.context()
+            if memory_context:
+                logger.info("已加载审稿记忆 (%d chars)", len(memory_context))
+        except Exception as e:
+            logger.warning("审稿记忆加载失败: %s", e)
+
     args = parser.parse_args()
 
     # Filter reviewers (don't mutate module-level list)
@@ -623,8 +623,11 @@ def main():
     print(f"\nRunning {len(reviewer_list)} reviewers on {args.paper}\n")
     start = time.time()
 
+    # Detect workspace dir (parent of output or explicit)
+    workspace_dir = str(Path(args.output).parent) if args.output != "review" else "."
     merged = review_paper(args.paper, args.output, model=args.model,
-                          parallel=not args.sequential, reviewers=reviewer_list)
+                          parallel=not args.sequential, reviewers=reviewer_list,
+                          workspace_dir=workspace_dir)
     save_review(merged, args.output)
 
     elapsed = time.time() - start

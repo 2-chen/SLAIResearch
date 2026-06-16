@@ -1,5 +1,5 @@
 """
-Progress emitter for the ChenResearch pipeline.
+Progress emitter for the SLAIResearch pipeline.
 Writes real-time progress events to workspace/progress.json with atomic writes.
 Maintains a rolling window of up to 50 events.
 """

@@ -1,25 +1,25 @@
 ---
-name: chenresearch
+name: slairesearch
 description: Automated research pipeline — the project orchestrates Claude Code as its execution tool. Claude Code handles literature search, experiment design, LaTeX writing, and revision. paperreview.ai provides peer review. SCO CLI runs cloud GPU experiments. Iterates until accept.
 argument-hint: "<topic> [--resume] [--status]"
 ---
 
-# ChenResearch — Automated Research Pipeline
+# SLAIResearch — Automated Research Pipeline
 
-A lean, iterative research system. **The project owns Claude Code** — Claude Code is an execution tool, not the controller. The project orchestrator (`chenresearch.py`) runs the pipeline, calls `claude -p` for intelligent tasks, and manages the iteration loop with paperreview.ai.
+A lean, iterative research system. **The project owns Claude Code** — Claude Code is an execution tool, not the controller. The project orchestrator (`slairesearch.py`) runs the pipeline, calls `claude -p` for intelligent tasks, and manages the iteration loop with paperreview.ai.
 
 ## When to Use
 
 - "Write a paper on X" — full pipeline from topic to AAAI-format paper
 - "Do a literature review on X" — just the lit search phase
 - "Help me research X" — step-by-step guided research
-- Triggers: `chenresearch`, `auto research`, `自动科研`, `paper pipeline`, `写论文`
+- Triggers: `slairesearch`, `auto research`, `自动科研`, `paper pipeline`, `写论文`
 
 ## Architecture
 
 ```
 ┌────────────────────────────────────────────┐
-│        chenresearch.py (controller)         │
+│        slairesearch.py (controller)         │
 │                                              │
 │  ┌─ Tools called by the project ──────────┐ │
 │  │  Claude Code  → literature, design,    │ │
@@ -38,14 +38,14 @@ A lean, iterative research system. **The project owns Claude Code** — Claude C
 bash install.sh
 
 # Run the pipeline
-python chenresearch.py run "Federated Learning with Differential Privacy for Medical Imaging"
+python slairesearch.py run "Federated Learning with Differential Privacy for Medical Imaging"
 
 # Resume from saved state
-python chenresearch.py resume "federated_learning_with_differential_privacy"
+python slairesearch.py resume "federated_learning_with_differential_privacy"
 
 # Check status
-python chenresearch.py status
-python chenresearch.py list
+python slairesearch.py status
+python slairesearch.py list
 ```
 
 ## Pipeline Stages
@@ -77,10 +77,10 @@ export CLAUDE_BASE_URL=https://api.deepseek.com/anthropic
 export SEMANTIC_SCHOLAR_API_KEY=s2k-...
 
 # paperreview.ai
-export PAPERREVIEW_EMAIL=250010008@slai.edu.cn
+export PAPERREVIEW_EMAIL=your-email@example.com
 export PAPERREVIEW_VENUE=AAAI
 
 # Pipeline tuning
-export CHENRESEARCH_MAX_ITERATIONS=10
-export CHENRESEARCH_POLL_INTERVAL=60
+export SLAIRESEARCH_MAX_ITERATIONS=10
+export SLAIRESEARCH_POLL_INTERVAL=60
 ```

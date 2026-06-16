@@ -66,7 +66,7 @@ class DOIConverter:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "ChenResearch/1.0 (Citation Tools; mailto:research@example.com)"
+            "User-Agent": "SLAIResearch/1.0 (Citation Tools; mailto:research@example.com)"
         })
 
     def clean_doi(self, doi: str) -> str:
@@ -86,7 +86,7 @@ class DOIConverter:
         url = f"https://doi.org/{doi}"
         headers = {
             "Accept": "application/x-bibtex",
-            "User-Agent": "ChenResearch/1.0 (Citation Tools)",
+            "User-Agent": "SLAIResearch/1.0 (Citation Tools)",
         }
         try:
             resp = self.session.get(url, headers=headers, timeout=15)
@@ -203,7 +203,7 @@ class MetadataExtractor:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "ChenResearch/1.0 (Metadata Extractor)"
+            "User-Agent": "SLAIResearch/1.0 (Metadata Extractor)"
         })
 
     def identify_type(self, identifier: str) -> Tuple[str, str]:
@@ -510,7 +510,7 @@ class CitationVerifier:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "ChenResearch/1.0 (Citation Verifier)"
+            "User-Agent": "SLAIResearch/1.0 (Citation Verifier)"
         })
 
     @staticmethod
@@ -812,7 +812,7 @@ class DataCiteClient:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "ChenResearch/1.0 (DataCite Client; mailto:research@example.com)"
+            "User-Agent": "SLAIResearch/1.0 (DataCite Client; mailto:research@example.com)"
         })
 
     def lookup_doi(self, doi: str) -> Optional[Dict]:

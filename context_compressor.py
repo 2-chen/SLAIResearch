@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Context Compressor for ChenResearch — prevents Claude Code context overflow
+Context Compressor for SLAIResearch — prevents Claude Code context overflow
 across pipeline iterations.
 
 Features ported from chen-research-skills pipeline-skill:

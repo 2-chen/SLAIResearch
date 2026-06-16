@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
-# ChenResearch — 全自动科研系统 安装脚本
+# SLAIResearch — 全自动科研系统 安装脚本
 # =============================================================================
 # 一键安装：Python 依赖 + Claude Code + LaTeX + SCO 检查
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-echo "ChenResearch 安装脚本"
+echo "SLAIResearch 安装脚本"
 echo "项目路径: ${SCRIPT_DIR}"
 echo ""
 
@@ -15,7 +15,9 @@ echo ""
 # 1. Python 依赖
 # ---------------------------------------------------------------------------
 echo "[1/4] 安装 Python 依赖 …"
-pip install requests scholarly -q
+# 使用清华镜像加速（国内环境）
+pip install requests pyyaml -q -i https://pypi.tuna.tsinghua.edu.cn/simple 2>/dev/null || \
+pip install requests pyyaml -q
 
 # ---------------------------------------------------------------------------
 # 2. Claude Code (作为项目的执行工具)
@@ -158,10 +160,10 @@ fi
 
 echo ""
 echo "=============================="
-echo "  ChenResearch 安装完成"
+echo "  SLAIResearch 安装完成"
 echo "=============================="
 echo ""
 echo "使用方法:"
-echo "  python ${SCRIPT_DIR}/chenresearch.py run \"你的研究主题\""
-echo "  python ${SCRIPT_DIR}/chenresearch.py status"
-echo "  python ${SCRIPT_DIR}/chenresearch.py resume <topic_slug>"
+echo "  python ${SCRIPT_DIR}/slairesearch.py run \"你的研究主题\""
+echo "  python ${SCRIPT_DIR}/slairesearch.py status"
+echo "  python ${SCRIPT_DIR}/slairesearch.py resume <topic_slug>"

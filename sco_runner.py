@@ -1,5 +1,5 @@
 """
-SCO CLI wrapper + local execution for ChenResearch experiment execution.
+SCO CLI wrapper + local execution for SLAIResearch experiment execution.
 Imports defaults from config.py; everything overridable via env vars.
 
 Execution strategy (local-first):
@@ -33,6 +33,8 @@ from config import (
     DOWNLOAD_CACHE_DIR, DOWNLOAD_WHEELS_DIR, DOWNLOAD_DATASETS_DIR,
 )
 from fix_db import FixDatabase
+
+_PROJECT_ROOT = Path(__file__).resolve().parent
 
 logger = logging.getLogger(__name__)
 
@@ -518,7 +520,7 @@ def _pre_submit_check(experiment_dir: str | Path, gpu_count: int) -> None:
         logger.error("COMPUTE BUDGET EXCEEDED")
         logger.error(budget["message"])
         logger.error("Reduce estimated_runtime_hours or split into smaller tasks.")
-        logger.error("Set CHENRESEARCH_MAX_GPU_HOURS to override (not recommended).")
+        logger.error("Set SLAIRESEARCH_MAX_GPU_HOURS to override (not recommended).")
         logger.error("=" * 60)
         raise RuntimeError(budget["message"])
     if budget["estimated_gpu_hours"] is not None:
@@ -566,7 +568,7 @@ def run_local_experiment(
     if extra_env:
         env.update(extra_env)
     # Ensure local execution marker
-    env["CHENRESEARCH_LOCAL"] = "1"
+    env["SLAIRESEARCH_LOCAL"] = "1"
 
     for attempt in range(1, max_retries + 1):
         log_path = log_dir / f"local_run_{attempt:02d}.log"
@@ -652,7 +654,7 @@ class ExperimentResult:
 
 def run_experiment(
     script_path: str | Path,
-    job_name: str = "chenresearch",
+    job_name: str = "slairesearch",
     work_dir: str | Path | None = None,
     log_dir: str | Path | None = None,
     local_timeout: int = 7200,
@@ -772,7 +774,7 @@ def run_experiment(
 
 def run_with_debug_loop(
     script_path: str | Path,
-    job_name: str = "chenresearch",
+    job_name: str = "slairesearch",
     work_dir: str | Path | None = None,
     log_dir: str | Path | None = None,
     local_timeout: int = 7200,
@@ -1093,12 +1095,12 @@ def _extract_key_lines(error_text: str, max_lines: int = 5) -> list[str]:
 def _ensure_wheels() -> bool:
     """Ensure shared wheel cache is populated. Returns True if wheels are ready.
 
-    Checks /data/AutoResearch/ChenResearch/workspace/.shared/cache/wheels/ —
+    Checks workspace/.shared/cache/wheels/ —
     if empty, runs the download script (which auto-detects VPN if needed).
     This is called before SCO submission so containers install offline.
     """
-    shared_wheels = Path(DOWNLOAD_WHEELS_DIR) if DOWNLOAD_WHEELS_DIR else Path("/data/AutoResearch/ChenResearch/workspace/.shared/cache/wheels")
-    download_script = Path("/data/AutoResearch/ChenResearch/workspace/.shared/download_wheels.sh")
+    shared_wheels = Path(DOWNLOAD_WHEELS_DIR) if DOWNLOAD_WHEELS_DIR else _PROJECT_ROOT / "workspace/.shared/cache/wheels"
+    download_script = _PROJECT_ROOT / "workspace/.shared/download_wheels.sh"
 
     # Already populated?
     wheel_files = list(shared_wheels.glob("*.whl")) if shared_wheels.exists() else []
@@ -1331,7 +1333,7 @@ def _prepare_env_for_sco(experiment_dir: Path) -> bool:
     site-packages.  This MUST succeed before SCO submission so the container
     can run with CHENRESEARCH=1 (zero pip install at runtime).
     """
-    prepare_env_sh = Path("/data/AutoResearch/ChenResearch/workspace/.shared/prepare_env.sh")
+    prepare_env_sh = _PROJECT_ROOT / "workspace/.shared/prepare_env.sh"
     if not prepare_env_sh.exists():
         logger.warning("prepare_env.sh not found at %s — skipping env prep", prepare_env_sh)
         return False
@@ -1361,7 +1363,7 @@ def _prepare_env_for_sco(experiment_dir: Path) -> bool:
     # ── 2. Offline-first install from requirements.txt ──
     req_file = experiment_dir / "requirements.txt"
     if req_file.exists():
-        site_packages = "/data/AutoResearch/ChenResearch/env/site-packages"
+        site_packages = str(_PROJECT_ROOT / "env/site-packages")
         wheels_dir = str(Path(DOWNLOAD_CACHE_DIR) / "wheels")
         find_links = f"--find-links={wheels_dir}" if Path(wheels_dir).exists() else ""
         logger.info("Pre-installing from requirements.txt (offline-first)...")
@@ -1403,7 +1405,7 @@ def _prepare_env_for_sco(experiment_dir: Path) -> bool:
 
     # ── 4. Hard verification: are packages actually in site-packages? ──
     # Use directory check (NOT import — triggers torch CUDA loading).
-    site_packages = "/data/AutoResearch/ChenResearch/env/site-packages"
+    site_packages = str(_PROJECT_ROOT / "env/site-packages")
     missing = []
     for pkg, import_name in [("datasets", "datasets"), ("accelerate", "accelerate"),
                                ("scikit-learn", "sklearn")]:
@@ -1428,7 +1430,7 @@ def _ensure_critical_packages() -> None:
     like accelerate triggers torch CUDA loading which takes 60+ seconds
     on CPU-only machines and causes subprocess timeouts.
     """
-    site_packages = "/data/AutoResearch/ChenResearch/env/site-packages"
+    site_packages = str(_PROJECT_ROOT / "env/site-packages")
     critical = ["datasets", "accelerate", "sentence-transformers", "scikit-learn"]
 
     for pkg in critical:
@@ -1871,6 +1873,19 @@ def submit_job(
 
     cfg = config or SCOConfig()
 
+    if not cfg.image:
+        raise RuntimeError(
+            "SCO_IMAGE is not configured. "
+            "Set it in .env or via environment variable: "
+            "export SCO_IMAGE='registry.cn-sh-01.sensecore.cn/...'"
+        )
+    if not cfg.storage_mount:
+        raise RuntimeError(
+            "SCO_STORAGE_MOUNT is not configured. "
+            "Set it in .env or via environment variable: "
+            "export SCO_STORAGE_MOUNT='<uuid>:/data:<user_id>'"
+        )
+
     # Sanitize job name to comply with SCO API DisplayName validation
     job_name = _sanitize_job_name(job_name)
     logger.info("Sanitized job name: %s", job_name)
@@ -2003,7 +2018,10 @@ def list_jobs(limit: int = 20, config: SCOConfig | None = None) -> list[dict]:
 # Internal
 # ---------------------------------------------------------------------------
 
-AFS_BASE = "/data/250010008/chenresearch"
+AFS_BASE = os.environ.get(
+    "SLAIRESEARCH_AFS_BASE",
+    os.path.join("/data", os.environ.get("SCO_USER_ID", "research"), "slairesearch"),
+)
 
 
 def _build_remote_command(work_dir: str, script_name: str, extra_env: dict[str, str]) -> str:

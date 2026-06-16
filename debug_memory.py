@@ -1,5 +1,5 @@
 """
-Persistent debug memory for ChenResearch experiments.
+Persistent debug memory for SLAIResearch experiments.
 
 Stores debug records per project so that future debug sessions can learn from
 past fixes. Records are saved to workspace/<project>/debug_memory/records.jsonl.
@@ -308,7 +308,7 @@ def get_debug_memory(workspace_dir: Path | str) -> DebugMemoryStore:
 def main() -> None:
     import argparse
     parser = argparse.ArgumentParser(
-        description="Debug memory management for ChenResearch"
+        description="Debug memory management for SLAIResearch"
     )
     sub = parser.add_subparsers(dest="cmd")
 

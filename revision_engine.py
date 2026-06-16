@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Revision engine for ChenResearch — per-section LLM revision loop with
+Revision engine for SLAIResearch — per-section LLM revision loop with
 backpressure, convergence detection, meta-refine, and grounding protection.
 
 Key features (ported from NanoResearch review module):

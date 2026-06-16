@@ -1,5 +1,5 @@
 """
-JSON-file state manager for the ChenResearch pipeline.
+JSON-file state manager for the SLAIResearch pipeline.
 Each research topic gets its own state file under state/<topic_slug>/state.json.
 Thread-safe enough for a single-process orchestrator.
 
@@ -14,7 +14,7 @@ import os
 import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields
 from enum import Enum
 from typing import Any
 
@@ -112,7 +112,7 @@ class ResearchState:
     reviews: list[dict[str, Any]] = field(default_factory=list)
 
     # Email / Venue
-    email: str = "250010008@slai.edu.cn"
+    email: str = ""  # Set via PAPERREVIEW_EMAIL env var
     venue: str = "AAAI"
 
     # Stage-level review configuration
@@ -127,6 +127,10 @@ class StateManager:
 
     def __init__(self, state_dir: str | Path = "state"):
         self._base = Path(state_dir)
+        # 如果 state_dir 是具体的项目目录（非 state/ 根目录），
+        # state.json 直接放在该目录下，不再创建 slug 子目录
+        self._flat = (self._base.name != "state" and
+                      not str(state_dir).rstrip("/").endswith("state"))
 
     # ------------------------------------------------------------------
     # public
@@ -179,6 +183,10 @@ class StateManager:
                 k: StageState(**v) if isinstance(v, dict) else v
                 for k, v in data["stages"].items()
             }
+        # Filter to only known dataclass fields (defensive against stale/extra keys
+        # like _recovery_note from crash recovery handlers)
+        valid_fields = {f.name for f in fields(ResearchState)}
+        data = {k: v for k, v in data.items() if k in valid_fields}
         return ResearchState(**data)
 
     def save(self, state: ResearchState) -> None:
@@ -326,6 +334,9 @@ class StateManager:
     # ------------------------------------------------------------------
 
     def _path(self, slug: str) -> Path:
+        # flat 模式: state.json 直接在 base 目录下
+        if getattr(self, '_flat', False):
+            return self._base / "state.json"
         return self._base / slug / "state.json"
 
     def _save(self, slug: str, state: ResearchState) -> None:
@@ -395,11 +406,17 @@ class StateManager:
 
     @staticmethod
     def _first_pending_stage(state: ResearchState) -> str:
-        """Return the name of the first stage with 'pending' status."""
+        """Return the name of the first stage with 'pending' status.
+
+        Stage order must match _STAGE_ORDER in modules/continue_project.sh
+        and the new-project flow in start.sh.
+        """
         stage_order = [
             Stage.LITERATURE_SEARCH,
             Stage.HYPOTHESIS_GENERATION,
+            Stage.BASELINE_FETCHING,
             Stage.EXPERIMENT_DESIGN,
+            Stage.ENVIRONMENT_PREPARATION,
             Stage.EXPERIMENT_EXECUTION,
             Stage.PAPER_WRITING,
             Stage.SUBMIT_REVIEW,
@@ -411,7 +428,7 @@ class StateManager:
             st = state.stages.get(s.value)
             if isinstance(st, StageState) and st.status == "pending":
                 return s.value
-        return Stage.LITERATURE_SEARCH.value
+        return Stage.DONE.value
 
 
 # ------------------------------------------------------------------
@@ -423,13 +440,21 @@ def _now() -> str:
 
 
 def _slugify(text: str) -> str:
-    """Short deterministic slug for a topic string."""
+    """Short deterministic slug for a topic string.
+
+    Strips markdown formatting, special characters, and produces a safe
+    filesystem/SCO-compatible name.
+    """
     import re
-    # Use first 40 chars + hash suffix to keep paths manageable
-    prefix = text.strip().lower().replace(" ", "_")[:40]
+    # Strip common markdown formatting: **bold**, *italic*, `code`, [links](urls), # headers
+    cleaned = re.sub(r'\*+|_+|\b`|`\b|\[|\]|\(|\)|#', '', text)
+    # Replace whitespace with underscores, lowercase, truncate
+    prefix = cleaned.strip().lower().replace(" ", "_")[:40]
     # Strip characters not allowed in SCO job names and safe filenames
     prefix = re.sub(r'[^a-z0-9_-]', '', prefix)
     # Strip leading/trailing underscores and hyphens (keeps slug clean)
     prefix = prefix.strip('_-')
+    if not prefix:
+        prefix = "research"
     suffix = hashlib.md5(text.encode()).hexdigest()[:6]
     return f"{prefix}_{suffix}"

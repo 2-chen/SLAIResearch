@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Publication-quality figure and table generation for ChenResearch.
+Publication-quality figure and table generation for SLAIResearch.
 
 Standards ported from chen-research-skills write-skill (figure_table_design.md):
   - Figure Contract system (conclusion → evidence → export spec)

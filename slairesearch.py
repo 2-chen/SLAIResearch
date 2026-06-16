@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-ChenResearch — Lean automated research system.
+SLAIResearch — Lean automated research system.
 Claude Code is an execution TOOL of this project (not the controller).
 The project orchestrates: literature → experiment → paper → review → iterate.
 
 Usage:
-    python chenresearch.py run "Your research topic"
-    python chenresearch.py resume <topic_or_slug>
-    python chenresearch.py status [<topic_or_slug>]
-    python chenresearch.py list
+    python slairesearch.py run "Your research topic"
+    python slairesearch.py resume <topic_or_slug>
+    python slairesearch.py status [<topic_or_slug>]
+    python slairesearch.py list
 """
 
 import sys
@@ -59,7 +59,7 @@ try:
 except ImportError:
     _REVIEW_TOOLS_AVAILABLE = False
 
-logger = logging.getLogger("chenresearch")
+logger = logging.getLogger("slairesearch")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -101,7 +101,7 @@ _CLAUDE_TIMEOUT = 600               # seconds per call
 
 
 def cmd_run(topic: str, force: bool = False) -> None:
-    """Execute the full ChenResearch pipeline for *topic*."""
+    """Execute the full SLAIResearch pipeline for *topic*."""
     sm = StateManager(PROJECT_ROOT / "state")
 
     if sm.exists(topic):
@@ -137,7 +137,7 @@ def cmd_run(topic: str, force: bool = False) -> None:
             print(f"    {'✓' if found else '✗'} {name}")
 
     print(f"\n{'='*60}")
-    print(f"  ChenResearch Pipeline")
+    print(f"  SLAIResearch Pipeline")
     print(f"  Topic: {topic}")
     print(f"  Venue: {PAPERREVIEW_VENUE}  |  Max iterations: {MAX_ITERATIONS}")
     print(f"  Model: {CLAUDE_MODEL}")
@@ -1717,14 +1717,14 @@ def main() -> None:
 
     if cmd == "run":
         if not args:
-            print("Usage: python chenresearch.py run [--force] \"<topic>\"")
+            print("Usage: python slairesearch.py run [--force] \"<topic>\"")
             sys.exit(1)
         force = args[0] == "--force"
         topic = args[1] if force else args[0]
         cmd_run(topic, force=force)
     elif cmd == "resume":
         if not args:
-            print("Usage: python chenresearch.py resume <topic_or_slug>")
+            print("Usage: python slairesearch.py resume <topic_or_slug>")
             sys.exit(1)
         cmd_resume(args[0])
     elif cmd == "status":

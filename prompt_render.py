@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Prompt template renderer for ChenResearch.
+Prompt template renderer for SLAIResearch.
 
 Reads a template file with ${VAR} placeholders and renders it with values
 from environment variables and command-line arguments.

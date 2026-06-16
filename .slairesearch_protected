@@ -1,6 +1,6 @@
-# ChenResearch — 受保护的基础设施文件
+# SLAIResearch — 受保护的基础设施文件
 # 自动修复循环 (SCO debug loop) 绝对不允许修改这些文件。
-# 每个路径相对于 /data/AutoResearch/ChenResearch/
+# 每个路径相对于项目根目录
 # 空行和 # 开头的行被忽略。
 
 sco_runner.py

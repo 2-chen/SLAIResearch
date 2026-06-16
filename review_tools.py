@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Rule-based review tools for ChenResearch.
+Rule-based review tools for SLAIResearch.
 Pure-Python checks that run instantly without LLM calls:
 
   1. AI writing artifact detection  — 20 banned words, em-dash overuse,

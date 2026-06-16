@@ -41,7 +41,7 @@ Design a complete experimental plan that:
      - Uses the shared dependency module (works in local and SCO mode):
        ```bash
        PROJECT_DIR="$(dirname "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")"
-       source /data/AutoResearch/ChenResearch/workspace/.shared/install_deps.sh
+       source workspace/.shared/install_deps.sh
        install_dependencies
        ```
        This module automatically:
@@ -52,9 +52,9 @@ Design a complete experimental plan that:
      - **Environment separation rule**: Before submitting to SCO, pre-install missing
        packages locally:
        ```bash
-       bash /data/AutoResearch/ChenResearch/workspace/.shared/prepare_env.sh --from-imports experiment.py
+       bash workspace/.shared/prepare_env.sh --from-imports experiment.py
        ```
-       This installs to `/data/AutoResearch/ChenResearch/env/site-packages/` which
+       This installs to `env/site-packages/` which
        is mounted into the SCO container. No pip/conda/network in the SCO task itself.
      - Runs all experiments and saves results to a structured output directory
 

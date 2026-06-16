@@ -3,6 +3,7 @@ paperreview.ai API client — 3-step upload + review polling.
 No browser needed; the site exposes clean REST endpoints.
 """
 
+import re
 import time
 import json
 import logging
@@ -19,7 +20,7 @@ BASE_URL = "https://paperreview.ai"
 
 def submit_paper(
     pdf_path: str | Path,
-    email: str = "250010008@slai.edu.cn",
+    email: str = "",
     venue: str = "AAAI",
     timeout: int = 300,
 ) -> str:
@@ -35,6 +36,8 @@ def submit_paper(
     pdf_path = Path(pdf_path)
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
+    if not email:
+        raise ValueError("email is required for paperreview.ai submission")
 
     logger.info("Step 1/3: requesting presigned upload URL …")
     url_data = _get_upload_url(pdf_path.name, venue, timeout=timeout)
@@ -110,29 +113,209 @@ def poll_review(
 def extract_verdict(review: dict) -> str:
     """
     Extract the review verdict from the response.
-    Looks in: recommendation → overall_assessment → verdict → (walk sections).
+
+    Resolution order (most reliable first):
+      1. Direct top-level fields: recommendation, verdict, decision
+      2. sections.overall_assessment — parse recommendation patterns
+      3. Semantic analysis of strengths vs weaknesses text
+      4. Raw JSON walk — find any dict key matching 'verdict' / 'decision' / 'recommendation'
+      5. Ratio heuristic: count strengths vs weaknesses bullet points
+
     Returns lowercased string, e.g. 'accept', 'weak accept', 'reject'.
+    Never returns 'unknown' unless the review is completely empty.
     """
-    # Direct fields
+    # ── 1. Direct top-level fields ──
     for key in ("recommendation", "verdict", "decision"):
         val = review.get(key)
         if val and isinstance(val, str):
-            return val.strip().lower()
+            v = val.strip().lower()
+            if v in ("accept", "weak accept", "weak reject", "reject", "borderline"):
+                return v
+            # Try to extract from free-text recommendation
+            parsed = _parse_verdict_from_text(v)
+            if parsed != "unknown":
+                return parsed
 
-    # overall_assessment section text
-    oa = review.get("overall_assessment") or review.get("sections", {}).get(
-        "overall_assessment"
-    )
-    if oa and isinstance(oa, str):
-        oa_lower = oa.lower()
-        if "recommendation: accept" in oa_lower or "**recommendation: accept**" in oa_lower:
-            return "accept"
-        if "recommendation: weak accept" in oa_lower or "recommendation: borderline" in oa_lower:
-            return "weak accept" if "weak" in oa_lower else "borderline"
-        if "recommendation: reject" in oa_lower:
-            return "reject"
+    # ── 2. overall_assessment section (top-level or nested in sections) ──
+    oa = review.get("overall_assessment")
+    if not oa:
+        oa = review.get("sections", {}).get("overall_assessment")
+    if oa:
+        if isinstance(oa, str):
+            parsed = _parse_verdict_from_text(oa)
+            if parsed != "unknown":
+                return parsed
+        elif isinstance(oa, dict):
+            # overall_assessment might be a dict with a 'recommendation' sub-key
+            for k in ("recommendation", "verdict", "decision"):
+                v = oa.get(k)
+                if v and isinstance(v, str):
+                    parsed = _parse_verdict_from_text(v)
+                    if parsed != "unknown":
+                        return parsed
+
+    # ── 3. Semantic analysis of strengths vs weaknesses ──
+    sections = review.get("sections", {})
+    strengths_text = sections.get("strengths", "") or ""
+    weaknesses_text = sections.get("weaknesses", "") or ""
+    summary_text = sections.get("summary", "") or ""
+
+    all_text = f"{summary_text}\n{strengths_text}\n{weaknesses_text}"
+
+    # Count bullet points / numbered items in strengths vs weaknesses
+    strength_items = _count_items(strengths_text)
+    weakness_items = _count_items(weaknesses_text)
+
+    # Search for verdict-signalling phrases in the full text
+    text_lower = all_text.lower()
+
+    # Strong signals
+    if re.search(r'\baccept\b.*\brecommend\b|\brecommend\b.*\baccept\b', text_lower):
+        if "weak" in text_lower.split("accept")[0][-50:]:
+            return "weak accept"
+        return "accept"
+
+    if re.search(r'\breject\b.*\brecommend\b|\brecommend\b.*\breject\b', text_lower):
+        return "reject"
+
+    # Weak signals
+    for phrase, verdict in _VERDICT_PHRASES:
+        if phrase in text_lower:
+            return verdict
+
+    # ── 4. Walk the entire JSON tree for any nested verdict field ──
+    found = _walk_for_verdict(review)
+    if found:
+        return found
+
+    # ── 5. Ratio heuristic ──
+    if strength_items > 0 and weakness_items > 0:
+        ratio = strength_items / max(weakness_items, 1)
+        if ratio >= 2.0:
+            return "weak accept"  # Many more strengths than weaknesses
+        elif ratio <= 0.5:
+            return "weak reject"  # Many more weaknesses than strengths
+
+    # ── 6. Fallback: count explicit "strength"/"weakness" phrases ──
+    strength_indicators = len(re.findall(
+        r'strength|novel|contribution|solid|well.*(written|motivated|designed)|'
+        r'clear|thorough|comprehensive|promising|interesting',
+        strengths_text, re.I
+    ))
+    weakness_indicators = len(re.findall(
+        r'weakness|concern|missing|lack|insufficient|limited|unclear|'
+        r'not (clear|shown|evaluated|compared|reported|validated)|'
+        r'cannot|fails|does not|incomplete',
+        weaknesses_text, re.I
+    ))
+
+    if strength_indicators > weakness_indicators * 2:
+        return "weak accept"
+    elif weakness_indicators > strength_indicators * 2:
+        return "weak reject"
+
+    # Still unknown → check if there's any content at all
+    if len(all_text.strip()) > 100:
+        # If strengths exist but weaknesses are minimal → likely positive
+        if len(strengths_text.strip()) > 200 and len(weaknesses_text.strip()) < 100:
+            return "weak accept"
+        # If weaknesses dominate in length → likely needs revision
+        if len(weaknesses_text.strip()) > len(strengths_text.strip()) * 2:
+            return "weak reject"
+        return "borderline"
 
     return "unknown"
+
+
+# ── Verdict parsing helpers ──
+
+# Phrases that map to verdicts, ordered by specificity (most specific first)
+_VERDICT_PHRASES: list[tuple[str, str]] = [
+    ("strong accept", "accept"),
+    ("clear accept", "accept"),
+    ("definitely accept", "accept"),
+    ("weak accept", "weak accept"),
+    ("borderline accept", "weak accept"),
+    ("borderline", "borderline"),
+    ("weak reject", "weak reject"),
+    ("borderline reject", "weak reject"),
+    ("strong reject", "reject"),
+    ("clear reject", "reject"),
+    ("definitely reject", "reject"),
+    ("below bar", "reject"),
+    ("not ready for publication", "reject"),
+    ("major revision", "weak reject"),
+    ("minor revision", "weak accept"),
+    ("ready for publication", "accept"),
+    ("publishable", "accept"),
+    ("substantial revision", "weak reject"),
+    ("not suitable", "reject"),
+    ("insufficient contribution", "reject"),
+    ("the paper should be accepted", "accept"),
+    ("i recommend acceptance", "accept"),
+    ("i recommend rejection", "reject"),
+    ("cannot recommend acceptance", "reject"),
+]
+
+
+def _parse_verdict_from_text(text: str) -> str:
+    """Extract a verdict from free-form text."""
+    if not text:
+        return "unknown"
+    text_lower = text.lower()
+
+    # Try explicit "Recommendation: X" or "Verdict: X" patterns
+    m = re.search(
+        r'(?:recommendation|verdict|decision|rating)\s*[:=]\s*'
+        r'(accept|weak accept|weak reject|reject|borderline)',
+        text_lower, re.I,
+    )
+    if m:
+        return m.group(1).strip().lower()
+
+    # Check known phrases
+    for phrase, verdict in _VERDICT_PHRASES:
+        if phrase in text_lower:
+            return verdict
+
+    return "unknown"
+
+
+def _count_items(text: str) -> int:
+    """Count bullet points, numbered items, or list entries in review text."""
+    # Match markdown bullets: "- ", "* ", "+ ", or numbered "1. "
+    items = re.findall(r'^\s*(?:[-*+]|\d+[.)])\s+\S', text, re.MULTILINE)
+    # Also count paragraphs under "Strengths"/"Weaknesses" headings as fallback
+    if not items:
+        # Split by double newlines and count substantive paragraphs
+        paras = [p.strip() for p in text.split('\n\n') if len(p.strip()) > 50]
+        return len(paras)
+    return len(items)
+
+
+def _walk_for_verdict(obj, depth: int = 0) -> str | None:
+    """Recursively walk a JSON object looking for verdict-like key-value pairs."""
+    if depth > 6:  # Safety limit
+        return None
+    if isinstance(obj, dict):
+        for key, val in obj.items():
+            key_lower = key.lower()
+            if key_lower in ("verdict", "recommendation", "decision", "rating"):
+                if isinstance(val, str):
+                    parsed = _parse_verdict_from_text(val)
+                    if parsed != "unknown":
+                        return parsed
+            elif isinstance(val, (dict, list)):
+                result = _walk_for_verdict(val, depth + 1)
+                if result:
+                    return result
+    elif isinstance(obj, list):
+        for item in obj[:10]:  # Check first 10 items
+            if isinstance(item, (dict, list)):
+                result = _walk_for_verdict(item, depth + 1)
+                if result:
+                    return result
+    return None
 
 
 def review_to_markdown(review: dict) -> str:
@@ -153,20 +336,29 @@ def review_to_markdown(review: dict) -> str:
     ]
 
     sections = review.get("sections", {})
-    for section_name in (
-        "summary",
-        "strengths",
-        "weaknesses",
-        "detailed_comments",
-        "questions",
-        "overall_assessment",
-    ):
-        content = sections.get(section_name)
+
+    # Also check top-level keys that might be sections not nested under "sections"
+    _TOP_LEVEL_SECTIONS = (
+        "summary", "strengths", "weaknesses", "detailed_comments",
+        "questions", "overall_assessment",
+    )
+    for section_name in _TOP_LEVEL_SECTIONS:
+        # Prefer nested sections, fall back to top-level
+        content = sections.get(section_name) or review.get(section_name)
         if content:
             heading = section_name.replace("_", " ").title()
             lines.append(f"## {heading}")
             lines.append("")
-            lines.append(content if isinstance(content, str) else str(content))
+            if isinstance(content, dict):
+                # If content is a dict (e.g. overall_assessment with sub-keys), flatten it
+                for k, v in content.items():
+                    lines.append(f"**{k.replace('_', ' ').title()}**: {v}")
+                    lines.append("")
+            elif isinstance(content, str):
+                lines.append(content)
+            elif isinstance(content, list):
+                for item in content:
+                    lines.append(f"- {item}")
             lines.append("")
 
     verdict = extract_verdict(review)
@@ -233,7 +425,7 @@ if __name__ == "__main__":
     print("=== paperreview API smoke test ===")
 
     # Create a tiny valid PDF
-    test_pdf = Path("/tmp/_test_chenresearch.pdf")
+    test_pdf = Path("/tmp/_test_slairesearch.pdf")
     test_pdf.write_bytes(
         b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
         b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"

@@ -1,5 +1,5 @@
 """
-Resource-aware scheduler for ChenResearch experiments.
+Resource-aware scheduler for SLAIResearch experiments.
 
 Detects whether an experiment is CPU-heavy or GPU-heavy and recommends
 appropriate concurrency settings (JOBS_PER_GPU, GPU_COUNT, batch_size).
@@ -219,9 +219,9 @@ def export_env_vars(profile: ResourceProfile) -> dict[str, str]:
     return {
         "JOBS_PER_GPU": str(profile.recommended_jobs_per_gpu),
         "GPU_COUNT": str(profile.recommended_gpu_count),
-        "CHENRESEARCH_EXPERIMENT_TYPE": profile.experiment_type,
-        "CHENRESEARCH_CPU_SCORE": str(profile.cpu_score),
-        "CHENRESEARCH_GPU_SCORE": str(profile.gpu_score),
+        "SLAIRESEARCH_EXPERIMENT_TYPE": profile.experiment_type,
+        "SLAIRESEARCH_CPU_SCORE": str(profile.cpu_score),
+        "SLAIRESEARCH_GPU_SCORE": str(profile.gpu_score),
     }
 
 

@@ -1,6 +1,6 @@
-# ChenResearch 工具集
+# SLAIResearch 工具集
 
-你是 ChenResearch 科研系统的执行工具。`start.sh` 是控制器，会在需要时调用你执行具体任务。每次调用只做一件事，上下文保持干净。
+你是 SLAIResearch 科研系统的执行工具。`start.sh` 是控制器，会在需要时调用你执行具体任务。每次调用只做一件事，上下文保持干净。
 
 ## 执行模式
 

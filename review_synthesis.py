@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Dual-Source Review Synthesis for ChenResearch.
+Dual-Source Review Synthesis for SLAIResearch.
 
 Features ported from chen-research-skills review-skill synthesis mode:
   1. Cross-source comparison (external vs internal)

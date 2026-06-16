@@ -1,43 +1,76 @@
-你是一个机器学习研究员。请根据审稿意见中要求的补充实验编写完整的实验代码。
+# 补充实验执行 — 自主编码 + 资源准备 + 运行
+
+你是机器学习研究员。根据 revision_plan.json 中的实验需求，**自主决定需要什么资源、下载什么模型/数据、编写代码、提交运行**。
 
 研究主题: ${TOPIC}
-实验需求: ${REVISION_PLAN_JSON}
+实验计划: ${REVISION_PLAN_JSON}
+输出目录: ${REVISION_EXP_DIR}
 
-请阅读以下文件：
-1. 当前实验代码: ${WORKSPACE}/experiment/ (了解现有代码结构)
-2. 当前论文: ${WORKSPACE}/paper/paper.tex
-3. 修订计划: ${REVISION_EXP_DIR}/revision_plan.json
+## 可用资源
 
-## 共享基础设施（必须使用绝对路径，不可用相对路径拼接）
+### 共享基础设施（绝对路径）
+```
+workspace/.shared/
+├── cache/
+│   ├── models/          # 已缓存模型 (T5-base, T5-large 等)
+│   ├── datasets_cache.tar.gz  # 离线数据集 (468MB, 15个数据集)
+│   └── wheels/          # Python wheel 包 (100+ 个)
+├── env/site-packages/   # 预装 Python 包
+└── install_deps.sh      # 依赖安装脚本
+```
 
-- 全局共享缓存: /data/AutoResearch/ChenResearch/workspace/.shared/cache/
-  ├── models/google-t5--t5-base/   (T5-base 模型)
-  ├── models/google-t5--t5-large/  (T5-large 模型)
-  ├── datasets_cache.tar.gz        (所有15个数据集, 468MB)
-  └── wheels/                      (Python wheel 包, 100+ 个)
-- 预装包路径: /data/AutoResearch/ChenResearch/env/site-packages/ (datasets, accelerate, sklearn 等)
-- SCO 容器无网络，禁止 pip install 从网络下载，必须使用离线 wheel 缓存或 site-packages
-- 数据集: 从 tarball 解压到 ~/.cache/huggingface/ (AFS 不支持 flock，必须解压到本地 ext4)
+### 工具链
+| 需要 | 工具 |
+|------|------|
+| 下载新模型 | `python model_downloader.py download "org/model"` (自动直连→镜像→VPN) |
+| 下载数据集 | 先检查 datasets_cache.tar.gz → 如未覆盖则 `model_downloader.py` 或 `datasets` 库 |
+| 网络不通 | 启用 VPN 代理后再试 |
+| 检索 baseline 论文 | `python search_papers.py "query"` |
+| 提交 SCO GPU | `sco acp jobs create` 或通过 `sco_runner.py` |
+| 本地快速测试 | 直接 `python script.py --quick` |
+| 代码预检 | `python experiment_runner.py preflight <dir>` |
+| 错误诊断 | `python experiment_runner.py diagnose <dir> <log>` |
 
-**任务**：
-为每个补充实验编写代码和运行脚本。对于 revision_plan.json 中的每个实验：
+## 工作流程
 
-1. 在 ${REVISION_EXP_DIR}/<exp_id>/ 下创建独立的实验子目录
-2. 编写 Python 实验代码
-3. 编写 run_experiment.sh
-4. 创建 experiment_manifest.json：{"gpu_count": N, "estimated_runtime_hours": H}
+对 revision_plan.json 中的每个实验，自主判断并执行：
 
-**run_experiment.sh 规范（关键）**：
-- 第一行: GLOBAL_SHARED="/data/AutoResearch/ChenResearch/workspace/.shared" （绝对路径，不可用 ROOT_DIR 拼接）
-- 设置 PYTHONPATH 包含共享 site-packages: export PYTHONPATH="${GLOBAL_SHARED}/../env/site-packages:${PYTHONPATH:-}"
+### 1. 资源准备（按需）
+```
+if 需要新模型 and 不在缓存:
+    → model_downloader.py (自动三层下载)
+    → 如果网络失败 → VPN → 重试
+
+if 需要新数据集 and 不在 datasets_cache.tar.gz:
+    → 检查能否从缓存中的数据集构造
+    → 或 model_downloader.py 下载
+    → 或 datasets 库从 HF 下载 (必要时 VPN)
+
+if 需要了解 baseline 方法:
+    → search_papers.py 检索
+    → citation_tools.py 获取 BibTeX
+```
+
+### 2. 代码编写
+在 `${REVISION_EXP_DIR}/<exp_id>/` 下创建：
+- `experiment.py` — 实验主代码
+- `run_experiment.sh` — SCO 运行脚本 (遵循规范)
+- `experiment_manifest.json` — `{"gpu_count": N, "estimated_runtime_hours": H}`
+
+**run_experiment.sh 规范**：
+```
+- 使用绝对路径: GLOBAL_SHARED="./workspace/.shared"
+- 离线优先: pip install --no-index --find-links ${GLOBAL_SHARED}/cache/wheels/
 - 数据集: tar -xzf ${GLOBAL_SHARED}/cache/datasets_cache.tar.gz -C ~/.cache/huggingface/
-- 模型: 使用 ${GLOBAL_SHARED}/cache/models/google-t5--t5-large/ 等绝对路径
-- 依赖安装: 离线优先 — pip install --no-index --find-links ${GLOBAL_SHARED}/cache/wheels/ <packages>
-- 不需要的包(torch, transformers, numpy)从容器的系统路径加载，不要重复安装
-- 读取 $GPU_COUNT 设置 CUDA_VISIBLE_DEVICES
-- **复制主实验的 Python 模块**: cp ${主实验目录}/*.py ${SCRIPT_DIR}/ (models.py, data_utils.py 等)
-- 必要时在 shell 脚本开头设置 PYTHONPATH 包含主实验目录
+- 模型: 直接引用 ${GLOBAL_SHARED}/cache/models/ 下的绝对路径
+- 设置 PYTHONPATH 包含共享 site-packages
 - 结果保存到 ${SCRIPT_DIR}/results/
-- 用 echo "EXPERIMENT_DONE" 标记完成
+```
 
-完成后报告 'PHASE_B1_DONE'。
+### 3. 运行与验证
+- 本地快速测试 (--quick 模式, 小数据)
+- 预检: `experiment_runner.py preflight`
+- SCO 提交 + 获取日志
+- 确认 results.json 有效 (n_samples > 0, 非空)
+
+完成后报告 `PHASE_B1_DONE`，列出每个实验的状态。

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interactive arrow-key menu. Items as args. Selection to /tmp/cr_menu_result.txt."""
+"""Interactive arrow-key menu. Items as args. Selection to /tmp/slai_menu_result.txt."""
 
 import sys
 import tty
@@ -116,7 +116,7 @@ if __name__ == '__main__':
         import subprocess
         subprocess.run(['stty', 'sane'], capture_output=True)  # 终极恢复
 
-    outfile = "/tmp/cr_menu_result.txt"
+    outfile = "/tmp/slai_menu_result.txt"
     if result is None:
         with open(outfile, 'w') as f: f.write("__NEW__")
     elif result == -1:

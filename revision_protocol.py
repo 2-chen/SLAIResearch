@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TODO-Driven Revision Protocol for ChenResearch.
+TODO-Driven Revision Protocol for SLAIResearch.
 
 Features ported from chen-research-skills review-skill:
   1. Structured TODO list extraction from review feedback
@@ -357,14 +357,14 @@ class RevisionProtocol:
                 + ", ".join(i.id for i in unresolved_critical[:5])
             )
 
-        # At least 80% of major items must be resolved
+        # At least 90% of major items must be resolved
         if todo.major:
             major_completed = sum(1 for i in todo.major if i.status == "completed")
             major_pct = major_completed / len(todo.major) * 100
-            if major_pct < 80:
+            if major_pct < 90:
                 blocking.append(
                     f"Only {major_pct:.0f}% of major items resolved "
-                    f"({major_completed}/{len(todo.major)}) — need ≥80%"
+                    f"({major_completed}/{len(todo.major)}) — need ≥90%"
                 )
 
         # Quota awareness: must have at least one substantive change
@@ -408,7 +408,7 @@ class RevisionProtocol:
         checklist_items = [
             ("All Critical items resolved",
              not any(i.status != "completed" for i in todo.critical)),
-            ("≥80% Major items resolved",
+            ("≥90% Major items resolved",
              len([i for i in todo.major if i.status == "completed"]) >= len(todo.major) * 0.8
              if todo.major else True),
             ("Substantive changes made (not just text polish)",

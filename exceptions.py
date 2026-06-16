@@ -1,19 +1,19 @@
 """
-Custom exceptions for the ChenResearch pipeline.
+Custom exceptions for the SLAIResearch pipeline.
 """
 
 
-class ChenResearchError(Exception):
-    """Base exception for all ChenResearch errors."""
+class SLAIResearchError(Exception):
+    """Base exception for all SLAIResearch errors."""
     pass
 
 
-class CheckpointError(ChenResearchError):
+class CheckpointError(SLAIResearchError):
     """Error loading or saving checkpoint/state data."""
     pass
 
 
-class StageError(ChenResearchError):
+class StageError(SLAIResearchError):
     """Error in a specific pipeline stage."""
     def __init__(self, stage: str, message: str):
         self.stage = stage
@@ -21,6 +21,6 @@ class StageError(ChenResearchError):
         super().__init__(f"[{stage}] {message}")
 
 
-class LLMError(ChenResearchError):
+class LLMError(SLAIResearchError):
     """LLM call failed."""
     pass

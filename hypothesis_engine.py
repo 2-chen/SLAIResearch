@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ReAct-based hypothesis generation engine for ChenResearch.
+ReAct-based hypothesis generation engine for SLAIResearch.
 Given a literature review, iteratively searches for more papers,
 deep-reads highly relevant ones, and generates concrete research hypotheses.
 
@@ -1186,7 +1186,7 @@ def _slugify_query(query: str) -> str:
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        description="ReAct-based hypothesis generation engine for ChenResearch"
+        description="ReAct-based hypothesis generation engine for SLAIResearch"
     )
     parser.add_argument("--topic", "-t", required=True, help="Research topic")
     parser.add_argument("--literature-dir", "-l", required=True, help="Literature directory (from stage 1)")

@@ -92,7 +92,7 @@ class ThreeLayerDownloader:
         else:
             self.vpn_script = Path(__file__).resolve().parent / "env" / "vpn" / "proxy.sh"
             if not self.vpn_script.exists():
-                self.vpn_script = Path("/data/AutoResearch/ChenResearch/env/vpn/proxy.sh")
+                self.vpn_script = Path(__file__).resolve().parent / "env" / "vpn" / "proxy.sh"
 
         self._load_hf_token()
 
@@ -364,7 +364,7 @@ except Exception as e:
             try:
                 import urllib.request
                 req = urllib.request.Request(download_url)
-                req.add_header("User-Agent", "ChenResearch/1.0")
+                req.add_header("User-Agent", "SLAIResearch/1.0")
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     file_path.write_bytes(resp.read())
                 if file_path.exists():

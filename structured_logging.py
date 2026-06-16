@@ -1,5 +1,5 @@
 """
-Structured JSON-lines logging for ChenResearch pipeline.
+Structured JSON-lines logging for SLAIResearch pipeline.
 
 Every log line is a standalone JSON object with fields:
   timestamp, stage, level, message, metrics, error_type, session_id, source_file
@@ -64,7 +64,7 @@ _logger_lock = threading.Lock()
 
 
 def get_logger(
-    name: str = "chenresearch",
+    name: str = "slairesearch",
     log_path: str | None = None,
     session_id: str = "",
     stage: str = "",
@@ -75,7 +75,7 @@ def get_logger(
     Args:
         name: Logger name (used for caching).
         log_path: Path to JSON-lines log file. If None, no file output.
-        session_id: Current ChenResearch session ID.
+        session_id: Current SLAIResearch session ID.
         stage: Current pipeline stage.
         also_console: If True, also emit human-readable lines to stderr.
 

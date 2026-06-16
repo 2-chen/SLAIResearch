@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Stage-level review/approval gate for ChenResearch pipeline.
+Stage-level review/approval gate for SLAIResearch pipeline.
 After each stage produces output, an LLM reviewer (simulating a human
 reviewer) evaluates the output. If the review doesn't pass, the stage is
 re-executed with the review feedback, up to a configurable max retries.
@@ -136,7 +136,7 @@ STAGE_REVIEW_CONFIG = {
         """),
         "pass_threshold": 6.0,
     },
-    "paper_revision": {
+    "revise": {
         "stage_label": "Paper Revision",
         "reviewer_role": "资深论文修改审稿人",
         "criteria": textwrap.dedent("""\

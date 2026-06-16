@@ -62,7 +62,7 @@ Worker Spec 按 GPU 数量:
 - `config.py`
 - `workspace/.shared/` 下的所有文件
 - `install.sh`
-- `.chenresearch_protected` 中列出的所有文件
+- `.slairesearch_protected` 中列出的所有文件
 
 ## 开始
 
