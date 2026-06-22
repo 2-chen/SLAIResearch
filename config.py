@@ -45,6 +45,22 @@ CLAUDE_BASE_URL = os.environ.get(
 CLAUDE_CMD = os.environ.get("CLAUDE_CMD", "claude")
 
 # ---------------------------------------------------------------------------
+# Accelerator preference (NVIDIA CUDA vs Huawei Ascend NPU)
+# ---------------------------------------------------------------------------
+
+# Which accelerator to prefer: "auto" (detect), "cuda" (NVIDIA only),
+# "npu" (Ascend only), or "none" (CPU only, skip all accelerator detection).
+ACCELERATOR_PREFERENCE = os.environ.get(
+    "SLAIRESEARCH_ACCELERATOR", "auto",
+).lower()
+
+# When True, NPU is treated as a drop-in replacement for CUDA where possible.
+# The accelerator module will set ENABLE_NPU=1 and ASCEND_VISIBLE_DEVICES.
+NPU_ENABLED = os.environ.get(
+    "SLAIRESEARCH_NPU_ENABLED", "true",
+).lower() in ("1", "true", "yes")
+
+# ---------------------------------------------------------------------------
 # SCO / SenseCore defaults (user 2chen)
 # ---------------------------------------------------------------------------
 

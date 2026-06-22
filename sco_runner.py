@@ -31,6 +31,7 @@ from config import (
     SCO_WORKER_SPEC_MAP, DEFAULT_GPU_COUNT,
     MAX_COMPUTE_BUDGET_GPU_HOURS,
     DOWNLOAD_CACHE_DIR, DOWNLOAD_WHEELS_DIR, DOWNLOAD_DATASETS_DIR,
+    ACCELERATOR_PREFERENCE, NPU_ENABLED,
 )
 from fix_db import FixDatabase
 
@@ -91,7 +92,104 @@ def detect_gpu() -> dict:
     except Exception:
         pass
 
+    # Try NPU detection as final fallback (Huawei Ascend)
+    if NPU_ENABLED and ACCELERATOR_PREFERENCE in ("auto", "npu"):
+        npu_info = _try_detect_npu()
+        if npu_info["available"]:
+            logger.info(
+                "NPU detected as accelerator: %d device(s). "
+                "Note: CUDA-specific code paths will NOT work on NPU. "
+                "Set SLAIRESEARCH_ACCELERATOR=cuda to skip NPU detection."
+            )
+            # Merge NPU info into the GPU info dict so callers get visibility.
+            # Mark as NOT a CUDA GPU so SCO submission is blocked, but
+            # local NPU execution is possible.
+            info["npu_available"] = True
+            info["npu_count"] = npu_info["count"]
+            info["npu_devices"] = npu_info["devices"]
+            info["accelerator_type"] = "npu"
+
     logger.info("No local GPU detected")
+    return info
+
+
+def _try_detect_npu() -> dict:
+    """Try to detect Huawei Ascend NPU devices.
+
+    Uses npu-smi, ASCEND_VISIBLE_DEVICES env var, and torch_npu.
+    Returns same dict shape as detect_gpu(): {available, count, devices}.
+    If detection fails, returns {available: False, count: 0, devices: []}.
+    """
+    info: dict[str, Any] = {"available": False, "count": 0, "devices": []}
+
+    # Method 1: npu-smi info
+    try:
+        result = subprocess.run(
+            ["npu-smi", "info", "-m"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            npu_lines = [
+                l for l in result.stdout.strip().split("\n")
+                if "NPU" in l.upper() or "Ascend" in l
+            ]
+            if npu_lines:
+                info["available"] = True
+                info["count"] = len(npu_lines)
+                for _ in npu_lines:
+                    info["devices"].append({"name": "Ascend NPU", "memory": "unknown"})
+                logger.info("NPU detected via npu-smi: %d device(s)", info["count"])
+                return info
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # Method 1b: npu-smi info -t board (newer driver format)
+    try:
+        result = subprocess.run(
+            ["npu-smi", "info", "-t", "board", "-c", "chip Name"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            lines = [l for l in result.stdout.strip().split("\n")
+                    if l.strip() and not l.startswith("=") and not l.startswith("+-")]
+            if lines:
+                info["available"] = True
+                info["count"] = len(lines)
+                for line in lines:
+                    parts = [p.strip() for p in line.split()]
+                    name = parts[1] if len(parts) >= 2 else "Ascend NPU"
+                    info["devices"].append({"name": name, "memory": "unknown"})
+                logger.info("NPU detected via npu-smi: %d device(s)", info["count"])
+                return info
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # Method 2: ASCEND_VISIBLE_DEVICES
+    avd = os.environ.get("ASCEND_VISIBLE_DEVICES", "")
+    if avd and avd.strip():
+        count = len([x for x in avd.split(",") if x.strip()])
+        logger.info("ASCEND_VISIBLE_DEVICES=%s (no npu-smi, but env set)", avd)
+        info["available"] = True
+        info["count"] = count
+        return info
+
+    # Method 3: torch.npu via torch_npu
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import torch; import torch_npu; "
+             "print(torch.npu.device_count())"],
+            capture_output=True, text=True, timeout=15,
+        )
+        count = int(result.stdout.strip())
+        if count > 0:
+            info["available"] = True
+            info["count"] = count
+            logger.info("NPU detected via torch.npu: %d device(s)", count)
+            return info
+    except Exception:
+        pass
+
     return info
 
 
@@ -122,6 +220,11 @@ def needs_gpu_heuristic(script_path: Path, experiment_dir: Path | None = None) -
         r'deepspeed', r'FSDP', r'flash_attn',
         r'bf16', r'fp16.*training', r'amp',
     ]
+    # NPU keywords — treat NPU usage same as GPU requirement
+    npu_keywords = [
+        r'\.npu\(', r'torch\.npu', r'torch_npu',
+        r'ascend', r'ASCEND_VISIBLE_DEVICES',
+    ]
     try:
         text = script_path.read_text()
         # Also read .py files in same directory
@@ -134,6 +237,10 @@ def needs_gpu_heuristic(script_path: Path, experiment_dir: Path | None = None) -
         for kw in gpu_keywords:
             if re.search(kw, text, re.IGNORECASE):
                 logger.info("Heuristic: experiment likely needs GPU (matched '%s')", kw)
+                return True
+        for kw in npu_keywords:
+            if re.search(kw, text, re.IGNORECASE):
+                logger.info("Heuristic: experiment uses NPU (matched '%s') — treating as GPU-required", kw)
                 return True
     except Exception:
         pass
@@ -718,10 +825,33 @@ def run_experiment(
     # ── Step 1: GPU detection ──
     gpu_info = detect_gpu()
     has_gpu = gpu_info["available"]
+    has_npu = gpu_info.get("npu_available", False)
+    has_accelerator = has_gpu or has_npu
 
     # ── Step 2: Decide local vs SCO ──
     use_local = True
-    if not has_gpu:
+    if has_npu and not has_gpu:
+        # NPU-only environment: force local execution.
+        # SCO cloud uses NVIDIA GPUs — NPU containers are not available.
+        logger.warning(
+            "NPU detected but no CUDA GPU. Forcing local execution — "
+            "SCO cloud platform requires NVIDIA CUDA GPUs. "
+            "Experiments using CUDA-specific APIs (torch.cuda, etc.) "
+            "will fail on NPU unless they use device-agnostic code."
+        )
+        use_local = True
+        # Inject NPU environment variables so experiment code can adapt
+        if extra_env is None:
+            extra_env = {}
+        extra_env.setdefault("SLAIRESEARCH_ACCELERATOR_TYPE", "npu")
+        extra_env.setdefault("ENABLE_NPU", "1")
+        extra_env.setdefault("NPU_COUNT", str(gpu_info.get("npu_count", 1)))
+        if not os.environ.get("ASCEND_VISIBLE_DEVICES"):
+            extra_env.setdefault(
+                "ASCEND_VISIBLE_DEVICES",
+                ",".join(str(i) for i in range(gpu_info.get("npu_count", 1)))
+            )
+    elif not has_gpu:
         needs_gpu = needs_gpu_heuristic(script_path, experiment_dir=script_path.parent)
         if needs_gpu:
             logger.info("No local GPU + experiment needs GPU → will use SCO")
@@ -2053,7 +2183,9 @@ def _build_remote_command(work_dir: str, script_name: str, extra_env: dict[str, 
     lines.append("echo 'PWD:' $(pwd 2>/dev/null || echo unknown)")
     lines.append("echo 'Python:' $(python3 --version 2>&1 || python --version 2>&1 || echo 'NOT FOUND')")
     lines.append("echo 'CUDA:' $(nvidia-smi -L 2>/dev/null | head -1 || echo 'NOT DETECTED')")
+    lines.append("echo 'NPU:' $(npu-smi info -m 2>/dev/null | grep -c NPU || echo '0')")
     lines.append("echo 'GPU_COUNT env:' ${GPU_COUNT:-NOT SET}")
+    lines.append("echo 'NPU_COUNT env:' ${NPU_COUNT:-NOT SET}")
     lines.append("echo 'HF_DATASETS_OFFLINE:' ${HF_DATASETS_OFFLINE:-NOT SET}")
     # Handle cd failure explicitly so set -e doesn't hide the error
     lines.append(f"if cd {shlex.quote(work_dir)} 2>/dev/null; then")
@@ -2068,7 +2200,7 @@ def _build_remote_command(work_dir: str, script_name: str, extra_env: dict[str, 
     lines.append("fi")
     for k, v in (extra_env or {}).items():
         lines.append(f"export {shlex.quote(k)}={shlex.quote(v)}")
-    # Safety net: auto-detect GPU count if not explicitly set.
+    # Safety net: auto-detect GPU/NPU count if not explicitly set.
     # This prevents 4-GPU containers from running single-GPU experiments
     # when GPU_COUNT propagation is broken.
     lines.append(
@@ -2090,10 +2222,37 @@ def _build_remote_command(work_dir: str, script_name: str, extra_env: dict[str, 
         "  else"
     )
     lines.append(
-        "    export GPU_COUNT=1"
+        "    # Try NPU detection as fallback (Ascend environment)"
     )
     lines.append(
-        "    echo '[sco_runner] GPU_COUNT not set, no GPUs detected — defaulting to 1'"
+        "    _DETECTED_NPUS=$(npu-smi info -m 2>/dev/null | grep -c NPU || echo 0)"
+    )
+    lines.append(
+        "    if [ \"${_DETECTED_NPUS}\" -gt 0 ]; then"
+    )
+    lines.append(
+        "      export NPU_COUNT=\"${_DETECTED_NPUS}\""
+    )
+    lines.append(
+        "      export GPU_COUNT=\"${_DETECTED_NPUS}\""
+    )
+    lines.append(
+        "      export ENABLE_NPU=1"
+    )
+    lines.append(
+        "      echo '[sco_runner] NPU detected:' ${NPU_COUNT} 'device(s) — setting GPU_COUNT=' ${GPU_COUNT}"
+    )
+    lines.append(
+        "    else"
+    )
+    lines.append(
+        "      export GPU_COUNT=1"
+    )
+    lines.append(
+        "      echo '[sco_runner] GPU_COUNT not set, no GPUs/NPUs detected — defaulting to 1'"
+    )
+    lines.append(
+        "    fi"
     )
     lines.append(
         "  fi"

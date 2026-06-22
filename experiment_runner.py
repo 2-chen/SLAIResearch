@@ -267,13 +267,17 @@ def build_debug_prompt(
     lines.append("")
     lines.append("## 常见问题及修复")
     lines.append("- OOM / CUDA out of memory → 减小 batch_size, 减小模型, 加 gradient_accumulation")
+    lines.append("- NPU OOM (ACL memory exceeded) → 减小 batch_size, 减少 NPU 内存使用")
     lines.append("- ModuleNotFoundError → 检查 import，确认包在容器镜像中")
     lines.append("- CUDA / driver 不兼容 → 调整 CUDA_VISIBLE_DEVICES 或 worker spec")
+    lines.append("- NPU / Ascend driver 不兼容 → 检查 torch_npu 版本与 CANN 版本的兼容性")
+    lines.append("- torch_npu 未安装 → pip install torch_npu (需匹配 PyTorch 和 CANN 版本)")
     lines.append("- 脚本超时 → 减小数据量或增加 checkpoint 续跑")
     lines.append("- 配额耗尽 → 等待或切换 quota_type")
     lines.append("- 容器启动失败 (零输出) → 检查 worker spec 格式")
     lines.append("- SyntaxError → 修正 Python 语法")
     lines.append("- FileNotFoundError → 修正路径或先下载数据")
+    lines.append("- NPU 不支持 CUDA API → 使用 device-agnostic 代码 (torch.device), 或设置 SLAIRESEARCH_ACCELERATOR=cuda 使用 CUDA")
 
     return "\n".join(lines)
 
@@ -331,7 +335,7 @@ def save_debug_record(
 def _extract_error_key_lines(log_text: str) -> str:
     """Extract key error lines from log output."""
     pattern = re.compile(
-        r"error|fail|exception|traceback|killed|oom|cuda|abort|segfault|"
+        r"error|fail|exception|traceback|killed|oom|cuda|npu|abort|segfault|"
         r"module.*not found|no module|import error|command not found|"
         r"no such file|permission denied|cannot find|could not find|"
         r"timed out|connection refused|quota.*exhaust|forbid",

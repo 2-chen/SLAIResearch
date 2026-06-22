@@ -73,6 +73,9 @@ GPU_HEAVY_PATTERNS = [
     (3, re.compile(r"torch\.cuda\.amp|autocast|GradScaler", re.I)),
     (2, re.compile(r"pretrain|pretrained|finetune|fine_tune", re.I)),
     (2, re.compile(r"distributed|DataParallel|DistributedDataParallel|ddp", re.I)),
+    # NPU patterns — treat as GPU-heavy (Ascend accelerators)
+    (3, re.compile(r"torch_npu|torch\.npu|\.npu\(|ascend", re.I)),
+    (3, re.compile(r"npu.*device|device.*npu|ASCEND_VISIBLE_DEVICES", re.I)),
 ]
 
 
@@ -150,16 +153,39 @@ def analyze_experiment(experiment_dir: Path) -> ResourceProfile:
 
 
 def _detect_gpu_count() -> int:
-    """Detect available GPU count. Returns 1 if undetectable."""
+    """Detect available GPU count (CUDA + NPU). Returns 1 if undetectable."""
+    # Try NVIDIA CUDA first
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode == 0:
-            return max(1, len(result.stdout.strip().splitlines()))
+            count = len(result.stdout.strip().splitlines())
+            if count > 0:
+                return count
     except Exception:
         pass
+
+    # Try Ascend NPU
+    try:
+        result = subprocess.run(
+            ["npu-smi", "info", "-m"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            npu_lines = [l for l in result.stdout.strip().split("\n")
+                        if "NPU" in l.upper() or "Ascend" in l]
+            if npu_lines:
+                return len(npu_lines)
+    except Exception:
+        pass
+
+    # Try ASCEND_VISIBLE_DEVICES env var
+    avd = os.environ.get("ASCEND_VISIBLE_DEVICES", "")
+    if avd and avd.strip():
+        return max(1, len([x for x in avd.split(",") if x.strip()]))
+
     return 1
 
 

@@ -281,9 +281,9 @@ class PreflightChecker:
         if "trap" not in content or "ERR" not in content:
             issues.append('Missing ERR trap — no diagnostic output on failure')
 
-        # Check for GPU env var usage
-        if "CUDA_VISIBLE_DEVICES" not in content:
-            issues.append("No CUDA_VISIBLE_DEVICES handling — may not work on multi-GPU")
+        # Check for GPU/NPU env var usage
+        if "CUDA_VISIBLE_DEVICES" not in content and "ASCEND_VISIBLE_DEVICES" not in content:
+            issues.append("No CUDA_VISIBLE_DEVICES or ASCEND_VISIBLE_DEVICES handling — may not work on multi-GPU/NPU")
 
         # Check for essential phases
         if "pip install" not in content and "install_deps" not in content:
@@ -320,6 +320,8 @@ class PreflightChecker:
         "resnet50", "resnet101", "vit", "diffusion",
         "batch_size.*128", "batch_size.*256", "batch_size.*512",
         "gradient_accumulation",
+        # NPU-related patterns (Ascend accelerators)
+        "torch_npu", "torch\\.npu", "\\.npu\\(", "ascend",
     ]
 
     def _check_gpu_cpu_ratio(self) -> CheckResult:
@@ -393,6 +395,26 @@ class PreflightChecker:
         except Exception:
             pass
 
+        # Check NPU availability (Huawei Ascend via torch_npu)
+        npu_available = False
+        try:
+            import torch_npu  # noqa: F401
+            import torch
+            npu_available = torch.npu.is_available()
+        except Exception:
+            pass
+
+        # Build accelerator status string
+        accel_parts = []
+        if cuda_available:
+            accel_parts.append("CUDA: available")
+        else:
+            accel_parts.append("CUDA: not available")
+        if npu_available:
+            accel_parts.append("NPU: available")
+        else:
+            accel_parts.append("NPU: not detected")
+
         if missing:
             return CheckResult(
                 check_name="env_dependencies",
@@ -400,14 +422,21 @@ class PreflightChecker:
                 blocking=False,
                 message=f"Critical packages missing locally: {missing}",
                 suggestion="Install with pip before local execution. SCO container may differ.",
-                details={"missing": missing, "cuda_available": cuda_available},
+                details={
+                    "missing": missing,
+                    "cuda_available": cuda_available,
+                    "npu_available": npu_available,
+                },
             )
         return CheckResult(
             check_name="env_dependencies",
             passed=True,
             blocking=True,
-            message=f"Critical packages OK (CUDA: {cuda_available})",
-            details={"cuda_available": cuda_available},
+            message=f"Critical packages OK ({', '.join(accel_parts)})",
+            details={
+                "cuda_available": cuda_available,
+                "npu_available": npu_available,
+            },
         )
 
     # ------------------------------------------------------------------

@@ -33,6 +33,7 @@ from config import (
     REVISION_ENGINE_ENABLED, REVISION_MAX_ROUNDS,
     REVISION_MIN_SECTION_SCORE, REVISION_CONVERGENCE_THRESHOLD,
     GROUNDING_PROTECTION_ENABLED,
+    ACCELERATOR_PREFERENCE, NPU_ENABLED,
 )
 from state_manager import (
     StateManager, Stage, StageStatus, ResearchState, ReviewRecord,
@@ -766,7 +767,33 @@ def _do_experiment_design(sm: StateManager, state: ResearchState, retry_feedback
         EXPERIMENT_MAX_DEBUG_ROUNDS, EXPERIMENT_CLAUDE_TIMEOUT,
         LOCAL_EXECUTION_TIMEOUT, LOCAL_EXECUTION_MAX_RETRIES,
         DOWNLOAD_CACHE_DIR,
+        ACCELERATOR_PREFERENCE, NPU_ENABLED,
     )
+
+    # Detect NPU availability for context injection
+    npu_context = ""
+    try:
+        from accelerator import detect_accelerator, check_sco_npu_compatibility
+        accel_info = detect_accelerator()
+        if accel_info.npu_count > 0:
+            npu_context = (
+                f"\n\n## NPU 环境信息\n"
+                f"- NPU 设备数: {accel_info.npu_count}\n"
+                f"- 加速器类型: {accel_info.accelerator_type}\n"
+                f"- 使用 NPU 时，请使用 device-agnostic 代码 (torch.device)，避免直接调用 torch.cuda\n"
+                f"- torch_npu 包需要与 CANN 版本匹配\n"
+            )
+            if not accel_info.supports_cuda_api:
+                sco_compat = check_sco_npu_compatibility()
+                npu_context += (
+                    f"- SCO 云 GPU 兼容性: {sco_compat['compatible']}\n"
+                    f"- {sco_compat['recommendation']}\n"
+                )
+            logger.info("NPU environment detected — injecting context into experiment prompt")
+    except ImportError:
+        logger.info("accelerator module not available — skipping NPU context injection")
+    except Exception as exc:
+        logger.warning("NPU detection failed (non-fatal): %s", exc)
 
     # Read inputs
     lit = _read_or(state.literature_dir, "literature_review.md")
@@ -805,6 +832,10 @@ def _do_experiment_design(sm: StateManager, state: ResearchState, retry_feedback
         LOCAL_MAX_RETRIES=str(LOCAL_EXECUTION_MAX_RETRIES),
         MODEL_CACHE_DIR=str(Path(DOWNLOAD_CACHE_DIR) / "models"),
     )
+
+    # Inject NPU environment context
+    if npu_context:
+        task_prompt = task_prompt + npu_context
 
     # Inject previous execution trace as context for resume
     if trace_context:
@@ -865,7 +896,7 @@ def _diagnose_experiment_failure(result, state) -> str:
             error_lines = [l for l in tail_lines
                           if any(kw in l.lower() for kw in
                                  ["error", "fail", "exception", "traceback",
-                                  "killed", "oom", "cuda", "segfault", "abort"])]
+                                  "killed", "oom", "cuda", "npu", "segfault", "abort"])]
             if error_lines:
                 parts.append("Log errors (last 50 lines):")
                 parts.extend(f"  | {l}" for l in error_lines[-15:])  # Max 15 error lines

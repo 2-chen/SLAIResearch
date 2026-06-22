@@ -78,9 +78,11 @@ class DebugRecord:
 
 _ERROR_CLASSIFY_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("OOM", re.compile(r"out of memory|OOM|CUDA error.*out of memory|cannot allocate memory", re.I)),
+    ("NPU_OOM", re.compile(r"NPU out of memory|ACL.*memory|Ascend.*memory.*exceed|npu.*OOM", re.I)),
     ("ModuleNotFoundError", re.compile(r"ModuleNotFoundError|ImportError|No module named", re.I)),
     ("SyntaxError", re.compile(r"SyntaxError|invalid syntax", re.I)),
     ("CUDA_ERROR", re.compile(r"CUDA error|cudaError|CUDNN_STATUS", re.I)),
+    ("NPU_ERROR", re.compile(r"NPU error|npuError|ACL_ERROR|Ascend error|aclRet|ge::", re.I)),
     ("FileNotFoundError", re.compile(r"FileNotFoundError|No such file|cannot find", re.I)),
     ("PermissionError", re.compile(r"Permission denied|PermissionError|not permitted", re.I)),
     ("TimeoutError", re.compile(r"timed out|TimeoutError|time limit", re.I)),
@@ -94,6 +96,7 @@ _ERROR_CLASSIFY_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("QuotaExhausted", re.compile(r"quota.*exhausted|quota.*limit|insufficient.*quota|member_default|forbid", re.I)),
     ("DiskFull", re.compile(r"No space left|disk full|ENOSPC", re.I)),
     ("Segfault", re.compile(r"segfault|segmentation fault|SIGSEGV|core dumped", re.I)),
+    ("NPU_DriverError", re.compile(r"drvDevice|drvAscend|soc version|driver.*npu|npu.*driver", re.I)),
 ]
 
 
