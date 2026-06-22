@@ -12,6 +12,7 @@ Usage:
 """
 
 import sys
+import os
 import json
 import re
 import time
@@ -952,8 +953,10 @@ and fix the shell script. Only make minimal, targeted fixes — do NOT rewrite t
 
     logger.info("Calling LLM to auto-fix experiment script: %s", script)
     try:
-        cmd = [CLAUDE_CMD, "-p", "--model", CLAUDE_MODEL, "--output-format", "text", prompt]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        cmd = [CLAUDE_CMD, "-p", "--model", CLAUDE_MODEL, "--output-format", "text",
+               "--dangerously-skip-permissions", "--max-turns", "5"]
+        result = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
+                                timeout=300, env={**os.environ, "IS_SANDBOX": "1"})
         output = result.stdout or ""
 
         # Extract the fixed bash script
@@ -1455,6 +1458,7 @@ Please explicitly acknowledge how you've addressed each issue above.
         CLAUDE_CMD, "-p",
         "--output-format", "text",
         "--model", CLAUDE_MODEL,
+        "--dangerously-skip-permissions",
         "--system-prompt", system_prompt_path,
         "--max-turns", "100",  # Allow many turns for autonomous work
     ]
@@ -1474,6 +1478,7 @@ Please explicitly acknowledge how you've addressed each issue above.
                 text=True,
                 timeout=timeout,
                 cwd=str(state.work_dir),
+                env={**os.environ, "IS_SANDBOX": "1"},
             )
             output = result.stdout or ""
             if result.returncode != 0:
@@ -1571,6 +1576,76 @@ Please explicitly acknowledge how you've addressed each issue above.
     )
 
 
+def _check_claude_ready() -> None:
+    """Startup check: actually run `claude -p` with a tiny prompt (30s timeout).
+
+    This is more reliable than an HTTP ping — it validates the full stack:
+    CLI binary → config → auth → network → API → response.  On failure,
+    prints diagnostics and exits so the pipeline never enters the 600s hang.
+    """
+    settings_path = Path(PROJECT_ROOT) / ".claude" / "settings.json"
+
+    # ── Check 1: API key is configured ──
+    import json as _json
+    base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if settings_path.exists():
+        try:
+            s = _json.loads(settings_path.read_text())
+            base_url = base_url or (s.get("env", {}) or {}).get("ANTHROPIC_BASE_URL", "")
+            api_key = api_key or (s.get("env", {}) or {}).get("ANTHROPIC_API_KEY", "")
+        except Exception:
+            pass
+
+    if not api_key or api_key == "your-api-key-here":
+        print(f"\n  ✗ Claude API Key 未配置")
+        print(f"  配置文件: {settings_path}")
+        print(f"  设置: export ANTHROPIC_API_KEY='sk-...'")
+        sys.exit(1)
+
+    # ── Check 3: Run `claude -p "ping"` with 30s timeout ──
+    print(f"  [check] 测试 Claude CLI 连通性 (base_url={base_url})...", flush=True)
+    try:
+        result = subprocess.run(
+            [CLAUDE_CMD, "-p", "--output-format", "text",
+             "--model", CLAUDE_MODEL, "--max-turns", "1"],
+            input="say hello in one word, no explanation",
+            capture_output=True, text=True, timeout=30,
+            cwd=str(PROJECT_ROOT),
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            preview = result.stdout.strip()[:80]
+            logger.info("Claude CLI test OK: %s", preview)
+            return
+        # Non-zero exit or empty output
+        stderr_tail = (result.stderr or "")[-300:]
+        print(f"\n  ✗ Claude CLI 测试失败 (exit={result.returncode})")
+        print(f"  stderr: {stderr_tail}")
+        _print_claude_diagnostics(base_url, api_key, settings_path)
+
+    except subprocess.TimeoutExpired as exc:
+        stderr_tail = (exc.stderr or b"").decode(errors="replace")[-300:] if exc.stderr else ""
+        print(f"\n  ✗ Claude CLI 测试超时 (30s)")
+        if stderr_tail:
+            print(f"  stderr: {stderr_tail}")
+        _print_claude_diagnostics(base_url, api_key, settings_path)
+
+    except FileNotFoundError:
+        print(f"\n  ✗ '{CLAUDE_CMD}' 命令未找到")
+        sys.exit(1)
+
+
+def _print_claude_diagnostics(base_url: str, api_key: str, settings_path: Path) -> None:
+    """Print diagnostic information when claude CLI fails."""
+    print(f"\n  请检查以下项目:")
+    print(f"    1. 网络: curl -sS --max-time 5 {base_url}/v1/models")
+    print(f"    2. 代理: env | grep -i proxy")
+    print(f"    3. 配置: cat {settings_path}")
+    print(f"    4. NPU 环境网络隔离 → 在有网络的机器上运行或配置代理")
+    print(f"    5. 手动测试: echo 'hi' | claude -p --model {CLAUDE_MODEL} --max-turns 1")
+    sys.exit(1)
+
+
 def _call_claude(sm: StateManager, state: ResearchState, stage: Stage,
                  prompt: str, retry_feedback: str = "",
                  max_retries: int = _CLAUDE_MAX_RETRIES) -> ResearchState:
@@ -1603,20 +1678,31 @@ Please explicitly acknowledge how you've addressed each issue above.
 
     output_file = Path(state.work_dir) / f"{stage.value}_output.md"
 
-    cmd = [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL, prompt]
+    # NOTE: prompt passed via stdin (input=), NOT as a CLI argument.
+    # Large prompts exceed OS argv length limits and cause claude to hang.
+    # IS_SANDBOX=1 + --dangerously-skip-permissions: skip interactive permission
+    # prompts.  Without these, claude -p hangs indefinitely in subprocess.run
+    # (no TTY) whenever the prompt triggers tool calls (WebSearch, Bash, etc.).
+    cmd = [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL,
+           "--dangerously-skip-permissions"]
+
+    # Scale timeout with prompt size: base 600s + 60s per 4000 chars
+    effective_timeout = max(_CLAUDE_TIMEOUT, 600 + int(len(prompt) / 4000) * 60)
 
     last_error = ""
     for attempt in range(max_retries + 1):
         logger.info(
-            "Executing: %s (attempt %d/%d) ...",
-            " ".join(cmd[:4]), attempt + 1, max_retries + 1,
+            "Executing: %s (attempt %d/%d, timeout=%ds, prompt=%d chars) ...",
+            " ".join(cmd[:4]), attempt + 1, max_retries + 1, effective_timeout,
+            len(prompt),
         )
 
         try:
             result = subprocess.run(
-                cmd, capture_output=True, text=True,
-                timeout=_CLAUDE_TIMEOUT,
+                cmd, input=prompt, capture_output=True, text=True,
+                timeout=effective_timeout,
                 cwd=str(state.work_dir),
+                env={**os.environ, "IS_SANDBOX": "1"},
             )
             output = result.stdout or ""
             if result.returncode != 0:
@@ -1640,8 +1726,13 @@ Please explicitly acknowledge how you've addressed each issue above.
             raise
 
         except subprocess.TimeoutExpired as exc:
+            partial_stderr = (exc.stderr or b"").decode(errors="replace")[-500:] if exc.stderr else ""
             last_error = f"Timeout after {_CLAUDE_TIMEOUT}s"
-            logger.warning("Claude call timed out (attempt %d/%d)", attempt + 1, max_retries + 1)
+            if partial_stderr:
+                last_error += f" | stderr: {partial_stderr[:200]}"
+            logger.warning("Claude call timed out (attempt %d/%d): %s",
+                          attempt + 1, max_retries + 1,
+                          partial_stderr[:200] if partial_stderr else "(no stderr)")
 
         except subprocess.CalledProcessError as exc:
             last_error = f"Exit {exc.returncode}: {exc.stderr[:200] if exc.stderr else 'no stderr'}"
@@ -1750,6 +1841,7 @@ def main() -> None:
         if not args:
             print("Usage: python slairesearch.py run [--force] \"<topic>\"")
             sys.exit(1)
+        _check_claude_ready()
         force = args[0] == "--force"
         topic = args[1] if force else args[0]
         cmd_run(topic, force=force)
@@ -1757,6 +1849,7 @@ def main() -> None:
         if not args:
             print("Usage: python slairesearch.py resume <topic_or_slug>")
             sys.exit(1)
+        _check_claude_ready()
         cmd_resume(args[0])
     elif cmd == "status":
         cmd_status(args[0] if args else None)
