@@ -956,7 +956,7 @@ and fix the shell script. Only make minimal, targeted fixes — do NOT rewrite t
         cmd = [CLAUDE_CMD, "-p", "--model", CLAUDE_MODEL, "--output-format", "text",
                "--dangerously-skip-permissions", prompt]
         result = subprocess.run(cmd, capture_output=True, text=True,
-                                timeout=300, env={**os.environ, "IS_SANDBOX": "1"})
+                                timeout=300)
         output = result.stdout or ""
 
         # Extract the fixed bash script
@@ -1478,7 +1478,6 @@ Please explicitly acknowledge how you've addressed each issue above.
                 text=True,
                 timeout=timeout,
                 cwd=str(state.work_dir),
-                env={**os.environ, "IS_SANDBOX": "1"},
             )
             output = result.stdout or ""
             if result.returncode != 0:
@@ -1698,7 +1697,6 @@ Please explicitly acknowledge how you've addressed each issue above.
                 cmd, capture_output=True, text=True,
                 timeout=_CLAUDE_TIMEOUT,
                 cwd=str(state.work_dir),
-                env={**os.environ, "IS_SANDBOX": "1"},
             )
             output = result.stdout or ""
             if result.returncode != 0:
@@ -1837,6 +1835,7 @@ def main() -> None:
         if not args:
             print("Usage: python slairesearch.py run [--force] \"<topic>\"")
             sys.exit(1)
+        os.environ.setdefault("IS_SANDBOX", "1")
         _check_claude_ready()
         force = args[0] == "--force"
         topic = args[1] if force else args[0]
@@ -1845,6 +1844,7 @@ def main() -> None:
         if not args:
             print("Usage: python slairesearch.py resume <topic_or_slug>")
             sys.exit(1)
+        os.environ.setdefault("IS_SANDBOX", "1")
         _check_claude_ready()
         cmd_resume(args[0])
     elif cmd == "status":
