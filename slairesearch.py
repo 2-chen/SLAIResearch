@@ -1477,7 +1477,7 @@ Please explicitly acknowledge how you've addressed each issue above.
                 capture_output=True,
                 text=True,
                 timeout=timeout,
-                cwd=str(state.work_dir),
+                cwd=str(PROJECT_ROOT),
             )
             output = result.stdout or ""
             if result.returncode != 0:
@@ -1696,7 +1696,7 @@ Please explicitly acknowledge how you've addressed each issue above.
             result = subprocess.run(
                 cmd, capture_output=True, text=True,
                 timeout=_CLAUDE_TIMEOUT,
-                cwd=str(state.work_dir),
+                cwd=str(PROJECT_ROOT),
             )
             output = result.stdout or ""
             if result.returncode != 0:
