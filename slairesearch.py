@@ -710,11 +710,32 @@ def _do_baseline_fetching(sm: StateManager, state: ResearchState, retry_feedback
             hypo = json.loads(hypo_file.read_text())
             for h in hypo.get("hypotheses", []):
                 if isinstance(h, dict):
-                    baselines = h.get("baselines", []) or h.get("baseline_methods", [])
-                    if isinstance(baselines, list):
-                        method_names.extend(baselines)
+                    # Primary fields
+                    for key in ("baselines", "baseline_methods"):
+                        val = h.get(key, [])
+                        if isinstance(val, list):
+                            method_names.extend([v for v in val if isinstance(v, str)])
+                    # Fallback: extract from method_outline and key_references
+                    if not method_names:
+                        method_names.extend(
+                            _extract_baselines_from_text(h.get("method_outline", ""))
+                        )
+                        method_names.extend(
+                            _extract_baselines_from_text(h.get("rationale", ""))
+                        )
+                        refs = h.get("key_references", [])
+                        if isinstance(refs, list):
+                            for ref in refs:
+                                if isinstance(ref, dict):
+                                    method_names.extend(
+                                        _extract_baselines_from_text(ref.get("title", ""))
+                                    )
         except Exception:
             pass
+
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    method_names = [n for n in method_names if n and not (n in seen or seen.add(n))]
 
     # Also try to extract from experiment plan if it exists (from literature context)
     if not method_names and papers:
@@ -723,7 +744,10 @@ def _do_baseline_fetching(sm: StateManager, state: ResearchState, retry_feedback
     if not method_names:
         logger.info("No baseline method names found — skipping baseline fetching")
         (Path(state.experiment_dir) / "baseline_context.md").write_text("")
-        return sm.complete_stage(state, Stage.BASELINE_FETCHING, {"skipped": True, "reason": "no methods found"})
+        return sm.complete_stage(state, Stage.BASELINE_FETCHING, {
+            "skipped": True,
+            "reason": "no methods found (hypothesis output missing 'baselines' field; update prompt template to include it)",
+        })
 
     logger.info("Fetching baseline repos for %d methods...", len(method_names))
     try:
@@ -1783,6 +1807,49 @@ def _render_template_file(template_path: str, **kwargs: str) -> str:
     for key, value in kwargs.items():
         template = template.replace("${" + key + "}", value)
     return template
+
+
+def _extract_baselines_from_text(text: str) -> list[str]:
+    """Extract potential baseline method names from free-text fields.
+
+    Looks for patterns like:
+      - "outperforms X, Y, Z"
+      - "compared to X and Y"
+      - "baseline X / baseline method X"
+      - Capitalized acronyms (BERT, ResNet, DQN, etc.)
+    Returns a list of candidate baseline names.
+    """
+    import re
+    names: list[str] = []
+
+    if not text:
+        return names
+
+    # Pattern 1: "compared to / outperforms / against X, Y, Z"
+    for pat in [
+        r'(?:outperforms?|beats?|surpasses?|vs\.?|versus|against|compared\s*to)\s+([A-Z][\w\s,()-]+?)(?:\.|,|\s+by|\s+in|\s+on|\s+with|\s+and\s+[a-z]|\s*$)',
+        r'(?:baselines?|baseline\s*methods?)[:\s]+([A-Z][\w\s,()-]+?)(?:\.|,|\s*$)',
+        r'(?:such\s+as|like|e\.g\.|including)\s+([A-Z][\w\s,()-]+?)(?:\.|,|\s+and\s+[a-z]|\s*$)',
+    ]:
+        for m in re.finditer(pat, text, re.IGNORECASE):
+            segment = m.group(1).strip()
+            # Split on commas and "and"
+            for part in re.split(r',\s*|\s+and\s+', segment):
+                part = part.strip().rstrip(')')
+                if len(part) >= 2 and len(part) <= 60 and not part.lower().startswith(('the ', 'our ', 'this ')):
+                    names.append(part)
+
+    # Pattern 2: Known baseline acronyms/names
+    acronym_pat = re.compile(
+        r'\b(?:ResNet\d*|ViT|BERT|GPT\d*|LLaMA\d*|DQN|PPO|A2C|SAC|TD3|DDPG|'
+        r'Transformer|UNet|Diffusion|CLIP|DiT|MoE|MoD|LoRA|RAG|GRPO|'
+        r'AdamW?|SGD|CNN|RNN|LSTM|GRU|GAN|VAE|WGAN|StyleGAN)\b'
+    )
+    for m in acronym_pat.finditer(text):
+        if m.group() not in names:
+            names.append(m.group())
+
+    return names
 
 
 def _safe_dirname(text: str) -> str:
