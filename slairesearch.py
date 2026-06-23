@@ -1501,7 +1501,7 @@ Please explicitly acknowledge how you've addressed each issue above.
                 capture_output=True,
                 text=True,
                 timeout=timeout,
-                cwd=str(PROJECT_ROOT),
+                cwd=str(state.work_dir),
             )
             output = result.stdout or ""
             if result.returncode != 0:
@@ -1720,7 +1720,7 @@ Please explicitly acknowledge how you've addressed each issue above.
             result = subprocess.run(
                 cmd, capture_output=True, text=True,
                 timeout=_CLAUDE_TIMEOUT,
-                cwd=str(PROJECT_ROOT),
+                cwd=str(state.work_dir),
             )
             output = result.stdout or ""
             if result.returncode != 0:
@@ -1852,6 +1852,12 @@ def _extract_baselines_from_text(text: str) -> list[str]:
     return names
 
 
+def _contains_cjk(text: str) -> bool:
+    """Return True if text contains Chinese/CJK characters."""
+    import re
+    return bool(re.search(r'[一-鿿㐀-䶿豈-﫿]', text))
+
+
 def _safe_dirname(text: str) -> str:
     import re
     name = text.strip().replace(" ", "_")[:50]
@@ -1906,6 +1912,10 @@ def main() -> None:
         _check_claude_ready()
         force = args[0] == "--force"
         topic = args[1] if force else args[0]
+        if _contains_cjk(topic):
+            print(f"错误：研究主题不支持中文，请使用英文输入。", file=sys.stderr)
+            print(f"当前输入: {topic}", file=sys.stderr)
+            sys.exit(1)
         cmd_run(topic, force=force)
     elif cmd == "resume":
         if not args:
