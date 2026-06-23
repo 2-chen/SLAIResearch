@@ -954,8 +954,8 @@ and fix the shell script. Only make minimal, targeted fixes — do NOT rewrite t
     logger.info("Calling LLM to auto-fix experiment script: %s", script)
     try:
         cmd = [CLAUDE_CMD, "-p", "--model", CLAUDE_MODEL, "--output-format", "text",
-               "--dangerously-skip-permissions", "--max-turns", "5"]
-        result = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
+               "--dangerously-skip-permissions", prompt]
+        result = subprocess.run(cmd, capture_output=True, text=True,
                                 timeout=300, env={**os.environ, "IS_SANDBOX": "1"})
         output = result.stdout or ""
 
@@ -1603,7 +1603,7 @@ def _check_claude_ready() -> None:
         print(f"  设置: export ANTHROPIC_API_KEY='sk-...'")
         sys.exit(1)
 
-    # ── Check 3: Run `claude -p "ping"` with 30s timeout ──
+    # ── Check 2: Run `claude -p "ping"` with 30s timeout ──
     print(f"  [check] 测试 Claude CLI 连通性 (base_url={base_url})...", flush=True)
     try:
         result = subprocess.run(
@@ -1678,29 +1678,25 @@ Please explicitly acknowledge how you've addressed each issue above.
 
     output_file = Path(state.work_dir) / f"{stage.value}_output.md"
 
-    # NOTE: prompt passed via stdin (input=), NOT as a CLI argument.
-    # Large prompts exceed OS argv length limits and cause claude to hang.
-    # IS_SANDBOX=1 + --dangerously-skip-permissions: skip interactive permission
-    # prompts.  Without these, claude -p hangs indefinitely in subprocess.run
-    # (no TTY) whenever the prompt triggers tool calls (WebSearch, Bash, etc.).
+    # prompt as CLI argument (stdin causes hangs with multi-line content).
+    # --dangerously-skip-permissions + IS_SANDBOX=1: skip interactive
+    # permission prompts that hang in subprocess.run (no TTY).
+    # --max-turns: prevents infinite agent loops during tool-heavy stages.
     cmd = [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL,
-           "--dangerously-skip-permissions"]
-
-    # Scale timeout with prompt size: base 600s + 60s per 4000 chars
-    effective_timeout = max(_CLAUDE_TIMEOUT, 600 + int(len(prompt) / 4000) * 60)
+           "--dangerously-skip-permissions", "--max-turns", "30", prompt]
 
     last_error = ""
     for attempt in range(max_retries + 1):
         logger.info(
             "Executing: %s (attempt %d/%d, timeout=%ds, prompt=%d chars) ...",
-            " ".join(cmd[:4]), attempt + 1, max_retries + 1, effective_timeout,
+            " ".join(cmd[:5]), attempt + 1, max_retries + 1, _CLAUDE_TIMEOUT,
             len(prompt),
         )
 
         try:
             result = subprocess.run(
-                cmd, input=prompt, capture_output=True, text=True,
-                timeout=effective_timeout,
+                cmd, capture_output=True, text=True,
+                timeout=_CLAUDE_TIMEOUT,
                 cwd=str(state.work_dir),
                 env={**os.environ, "IS_SANDBOX": "1"},
             )
