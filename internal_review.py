@@ -425,7 +425,8 @@ Output ONLY your structured review section (no preamble, no meta-commentary)."""
     ]
 
     logger.info("  Reviewing: %s ...", reviewer["name"])
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
+                            cwd=str(PROJECT_ROOT))
 
     output = result.stdout or ""
     if result.returncode != 0 and not output:

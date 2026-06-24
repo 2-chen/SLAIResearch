@@ -983,7 +983,7 @@ and fix the shell script. Only make minimal, targeted fixes — do NOT rewrite t
 
     logger.info("Calling LLM to auto-fix experiment script: %s", script)
     try:
-        cmd = [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL, "--dangerously-skip-permissions",
+        cmd = [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL,
                "--max-turns", "5", prompt]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
                                 cwd=str(state.work_dir))
@@ -1706,7 +1706,7 @@ Please explicitly acknowledge how you've addressed each issue above.
     # prompt via stdin — avoids CLI arg-parsing conflicts when the prompt
     # prompt passed via stdin — avoids CLI arg limits for large prompts.
     # --max-turns: prevents infinite agent loops during tool-heavy stages.
-    cmd = [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL, "--dangerously-skip-permissions", 
+    cmd = [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL,
            "--max-turns", "30", prompt]
 
     last_error = ""
