@@ -206,6 +206,9 @@ def cmd_resume(topic_or_slug: str) -> None:
             state.stage = sm._first_pending_stage(state)
         sm.save(state)
 
+    # Ensure Claude can find settings (needed on Ascend)
+    _ensure_claude_config(Path(state.work_dir))
+
     # ── Step 3: Show what we're resuming ──
     completed = [
         k for k, v in state.stages.items()
@@ -980,7 +983,7 @@ and fix the shell script. Only make minimal, targeted fixes — do NOT rewrite t
 
     logger.info("Calling LLM to auto-fix experiment script: %s", script)
     try:
-        cmd = [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL,
+        cmd = [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL, "--dangerously-skip-permissions",
                "--max-turns", "5", prompt]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
                                 cwd=str(state.work_dir))
@@ -1703,7 +1706,7 @@ Please explicitly acknowledge how you've addressed each issue above.
     # prompt via stdin — avoids CLI arg-parsing conflicts when the prompt
     # prompt passed via stdin — avoids CLI arg limits for large prompts.
     # --max-turns: prevents infinite agent loops during tool-heavy stages.
-    cmd = [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL,
+    cmd = [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL, "--dangerously-skip-permissions", 
            "--max-turns", "30", prompt]
 
     last_error = ""
@@ -1801,9 +1804,16 @@ def _render_template_file(template_path: str, **kwargs: str) -> str:
     Unlike ``_load_prompt`` which uses ``str.format(**kwargs)``, this uses
     simple ``${VAR}`` substitution to match shell-style templates.
     """
-    template = Path(template_path).read_text()
+    tp = Path(template_path)
+    if not tp.exists():
+        logger.error("Template file not found: %s", template_path)
+        return ""
+    template = tp.read_text()
+    logger.info("Rendering template: %s (%d chars, %d placeholders)",
+                template_path, len(template), len(kwargs))
     for key, value in kwargs.items():
         template = template.replace("${" + key + "}", value)
+    logger.info("Rendered template: %d chars", len(template))
     return template
 
 
@@ -1857,23 +1867,38 @@ def _contains_cjk(text: str) -> bool:
 
 
 def _ensure_claude_config(work_dir: Path) -> None:
-    """Symlink .claude/ into work_dir so Claude can find settings.json on all
-    environments (especially Ascend where directory walk-up may not work)."""
-    src = PROJECT_ROOT / ".claude"
+    """Ensure Claude can find API config from work_dir.
+
+    Creates a minimal .claude/settings.json in work_dir if one doesn't exist,
+    pulling API key / base URL from the current environment. Claude Code reads
+    env.ANTHROPIC_API_KEY and env.ANTHROPIC_BASE_URL from settings.json."""
     dst = work_dir / ".claude"
     if dst.exists():
         return
-    try:
-        dst.symlink_to(src, target_is_directory=True)
-        logger.info("Symlinked .claude/ → %s", dst)
-    except OSError:
-        # Fallback: copy settings.json only
-        dst.mkdir(exist_ok=True)
-        settings_src = src / "settings.json"
-        if settings_src.exists():
-            import shutil
-            shutil.copy2(settings_src, dst / "settings.json")
-            logger.info("Copied settings.json → %s", dst)
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    base_url = os.environ.get("ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic")
+
+    if not api_key:
+        # Try reading from project .claude/settings.json
+        project_settings = PROJECT_ROOT / ".claude" / "settings.json"
+        if project_settings.exists():
+            try:
+                data = json.loads(project_settings.read_text())
+                api_key = (data.get("env", {}) or {}).get("ANTHROPIC_API_KEY", "")
+                base_url = (data.get("env", {}) or {}).get("ANTHROPIC_BASE_URL", base_url)
+            except Exception:
+                pass
+
+    dst.mkdir(exist_ok=True)
+    settings = {
+        "env": {
+            "ANTHROPIC_BASE_URL": base_url,
+            "ANTHROPIC_API_KEY": api_key,
+        }
+    }
+    (dst / "settings.json").write_text(json.dumps(settings, indent=2))
+    logger.info("Created .claude/settings.json in %s", work_dir)
 
 
 def _safe_dirname(text: str) -> str:
