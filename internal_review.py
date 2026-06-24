@@ -8,6 +8,7 @@ Usage:
     python internal_review.py paper.pdf -o review/
 """
 
+import os
 import sys
 import subprocess
 import json
@@ -426,7 +427,7 @@ Output ONLY your structured review section (no preamble, no meta-commentary)."""
 
     logger.info("  Reviewing: %s ...", reviewer["name"])
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
-                            cwd=str(PROJECT_ROOT))
+                            env={**os.environ})
 
     output = result.stdout or ""
     if result.returncode != 0 and not output:

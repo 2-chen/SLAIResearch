@@ -24,6 +24,7 @@ Modes:
   - "human" — prompts the user in the terminal for approval
 """
 
+import os
 import sys
 import subprocess
 import json
@@ -306,7 +307,7 @@ class StageReviewer:
         try:
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=300,
-                cwd=str(PROJECT_ROOT),
+                env={**os.environ},
             )
             raw = result.stdout or ""
             if result.returncode != 0 and not raw:

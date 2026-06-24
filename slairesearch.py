@@ -97,6 +97,22 @@ _CLAUDE_RETRY_MAX_DELAY = 120       # seconds cap
 _CLAUDE_TIMEOUT = 600               # seconds per call
 
 
+def _claude_subprocess_env() -> dict:
+    """Return env dict for Claude CLI subprocess calls.
+
+    Explicitly injects API key / base URL so Claude never needs to find
+    .claude/settings.json via cwd or directory walk-up.  Works on root,
+    Ascend, and any environment where file-based config resolution fails.
+    """
+    from config import CLAUDE_API_KEY, CLAUDE_BASE_URL
+    env = os.environ.copy()
+    if CLAUDE_API_KEY:
+        env["ANTHROPIC_API_KEY"] = CLAUDE_API_KEY
+    if CLAUDE_BASE_URL:
+        env["ANTHROPIC_BASE_URL"] = CLAUDE_BASE_URL
+    return env
+
+
 # ======================================================================
 # Main CLI
 # ======================================================================
@@ -986,7 +1002,7 @@ and fix the shell script. Only make minimal, targeted fixes — do NOT rewrite t
         cmd = [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL,
                "--max-turns", "5", prompt]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
-                                cwd=str(state.work_dir))
+                                cwd=str(state.work_dir), env=_claude_subprocess_env())
         output = result.stdout or ""
 
         # Extract the fixed bash script
@@ -1507,6 +1523,7 @@ Please explicitly acknowledge how you've addressed each issue above.
                 text=True,
                 timeout=timeout,
                 cwd=str(state.work_dir),
+                env=_claude_subprocess_env(),
             )
             output = result.stdout or ""
             if result.returncode != 0:
@@ -1636,7 +1653,7 @@ def _check_claude_ready() -> None:
              "--model", CLAUDE_MODEL, "--max-turns", "1"],
             input="say hello in one word, no explanation",
             capture_output=True, text=True, timeout=30,
-            cwd=str(PROJECT_ROOT),
+            cwd=str(PROJECT_ROOT), env=_claude_subprocess_env(),
         )
         if result.returncode == 0 and result.stdout.strip():
             preview = result.stdout.strip()[:80]
@@ -1722,6 +1739,7 @@ Please explicitly acknowledge how you've addressed each issue above.
                 cmd, capture_output=True, text=True,
                 timeout=_CLAUDE_TIMEOUT,
                 cwd=str(state.work_dir),
+                env=_claude_subprocess_env(),
             )
             output = result.stdout or ""
             if result.returncode != 0:

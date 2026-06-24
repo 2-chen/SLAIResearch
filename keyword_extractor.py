@@ -16,6 +16,7 @@
     }
 """
 
+import os
 import json
 import sys
 from pathlib import Path
@@ -52,8 +53,9 @@ Output ONLY valid JSON:
 
     try:
         result = subprocess.run(
-            ["claude", "-p", "--model", CLAUDE_MODEL, "--output-format", "text"],
+            [CLAUDE_CMD, "-p", "--model", CLAUDE_MODEL, "--output-format", "text"],
             input=prompt, capture_output=True, text=True, timeout=30,
+            env={**os.environ},
         )
         # Extract JSON from output
         text = result.stdout

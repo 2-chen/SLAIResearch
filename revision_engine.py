@@ -32,6 +32,7 @@ Usage:
 
 from __future__ import annotations
 
+import os
 import re
 import json
 import logging
@@ -1236,6 +1237,7 @@ class RevisionEngine:
                 capture_output=True,
                 text=True,
                 timeout=300,
+                env={**os.environ},
             )
             output = result.stdout or ""
             if result.returncode != 0 and not output:
