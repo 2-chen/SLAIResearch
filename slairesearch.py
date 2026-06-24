@@ -129,6 +129,9 @@ def cmd_run(topic: str, force: bool = False) -> None:
     state.stage_review_model = STAGE_REVIEW_MODEL or CLAUDE_MODEL
     sm.save(state)
 
+    # Ensure Claude can find .claude/settings.json from work_dir (needed on Ascend)
+    _ensure_claude_config(work_dir)
+
     # ── Mid-Entry Detection ──
     cc = ContextCompressor(work_dir)
     entry = cc.detect_entry_point()
@@ -977,10 +980,10 @@ and fix the shell script. Only make minimal, targeted fixes — do NOT rewrite t
 
     logger.info("Calling LLM to auto-fix experiment script: %s", script)
     try:
-        cmd = [CLAUDE_CMD, "-p", "--model", CLAUDE_MODEL, "--output-format", "text",
-               "--dangerously-skip-permissions", prompt]
-        result = subprocess.run(cmd, capture_output=True, text=True,
-                                timeout=300)
+        cmd = [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL,
+               "--max-turns", "5", prompt]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
+                                cwd=str(state.work_dir))
         output = result.stdout or ""
 
         # Extract the fixed bash script
@@ -1482,7 +1485,6 @@ Please explicitly acknowledge how you've addressed each issue above.
         CLAUDE_CMD, "-p",
         "--output-format", "text",
         "--model", CLAUDE_MODEL,
-        "--dangerously-skip-permissions",
         "--system-prompt", system_prompt_path,
         "--max-turns", "100",  # Allow many turns for autonomous work
     ]
@@ -1572,10 +1574,7 @@ Please explicitly acknowledge how you've addressed each issue above.
             )
 
         except subprocess.CalledProcessError as exc:
-            last_error = (
-                f"Exit {exc.returncode}: "
-                f"{exc.stderr[:200] if exc.stderr else 'no stderr'}"
-            )
+            last_error = f"Exit {exc.returncode}: stderr={stderr_info} | stdout={stdout_info}"
             logger.warning(
                 "Experiment scientist failed (attempt %d/%d): %s",
                 attempt + 1, max_retries + 1, last_error,
@@ -1701,12 +1700,11 @@ Please explicitly acknowledge how you've addressed each issue above.
 
     output_file = Path(state.work_dir) / f"{stage.value}_output.md"
 
-    # prompt as CLI argument (stdin causes hangs with multi-line content).
-    # --dangerously-skip-permissions + IS_SANDBOX=1: skip interactive
-    # permission prompts that hang in subprocess.run (no TTY).
+    # prompt via stdin — avoids CLI arg-parsing conflicts when the prompt
+    # prompt passed via stdin — avoids CLI arg limits for large prompts.
     # --max-turns: prevents infinite agent loops during tool-heavy stages.
     cmd = [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL,
-           "--dangerously-skip-permissions", "--max-turns", "30", prompt]
+           "--max-turns", "30", prompt]
 
     last_error = ""
     for attempt in range(max_retries + 1):
@@ -1753,7 +1751,7 @@ Please explicitly acknowledge how you've addressed each issue above.
                           partial_stderr[:200] if partial_stderr else "(no stderr)")
 
         except subprocess.CalledProcessError as exc:
-            last_error = f"Exit {exc.returncode}: {exc.stderr[:200] if exc.stderr else 'no stderr'}"
+            last_error = f"Exit {exc.returncode}: stderr={stderr_info} | stdout={stdout_info}"
             logger.warning("Claude call failed (attempt %d/%d): %s", attempt + 1, max_retries + 1, last_error)
 
         except Exception as exc:
@@ -1856,6 +1854,26 @@ def _contains_cjk(text: str) -> bool:
     """Return True if text contains Chinese/CJK characters."""
     import re
     return bool(re.search(r'[一-鿿㐀-䶿豈-﫿]', text))
+
+
+def _ensure_claude_config(work_dir: Path) -> None:
+    """Symlink .claude/ into work_dir so Claude can find settings.json on all
+    environments (especially Ascend where directory walk-up may not work)."""
+    src = PROJECT_ROOT / ".claude"
+    dst = work_dir / ".claude"
+    if dst.exists():
+        return
+    try:
+        dst.symlink_to(src, target_is_directory=True)
+        logger.info("Symlinked .claude/ → %s", dst)
+    except OSError:
+        # Fallback: copy settings.json only
+        dst.mkdir(exist_ok=True)
+        settings_src = src / "settings.json"
+        if settings_src.exists():
+            import shutil
+            shutil.copy2(settings_src, dst / "settings.json")
+            logger.info("Copied settings.json → %s", dst)
 
 
 def _safe_dirname(text: str) -> str:
