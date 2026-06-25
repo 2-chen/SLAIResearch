@@ -1698,6 +1698,8 @@ Please explicitly acknowledge how you've addressed each issue above.
             )
 
         except subprocess.CalledProcessError as exc:
+            stderr_info = exc.stderr[:300] if exc.stderr else "no stderr"
+            stdout_info = exc.output[:500] if exc.output else "no stdout"
             last_error = f"Exit {exc.returncode}: stderr={stderr_info} | stdout={stdout_info}"
             logger.warning(
                 "Experiment scientist failed (attempt %d/%d): %s",
@@ -1876,6 +1878,8 @@ Please explicitly acknowledge how you've addressed each issue above.
                           partial_stderr[:200] if partial_stderr else "(no stderr)")
 
         except subprocess.CalledProcessError as exc:
+            stderr_info = exc.stderr[:300] if exc.stderr else "no stderr"
+            stdout_info = exc.output[:500] if exc.output else "no stdout"
             last_error = f"Exit {exc.returncode}: stderr={stderr_info} | stdout={stdout_info}"
             logger.warning("Claude call failed (attempt %d/%d): %s", attempt + 1, max_retries + 1, last_error)
 
