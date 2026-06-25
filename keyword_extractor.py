@@ -22,6 +22,9 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 
@@ -55,7 +58,7 @@ Output ONLY valid JSON:
         result = subprocess.run(
             [CLAUDE_CMD, "-p", "--model", CLAUDE_MODEL, "--output-format", "text"],
             input=prompt, capture_output=True, text=True, timeout=30,
-            env={**os.environ},
+            cwd=str(PROJECT_ROOT), env={**os.environ},
         )
         # Extract JSON from output
         text = result.stdout

@@ -307,7 +307,7 @@ class StageReviewer:
         try:
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=300,
-                env={**os.environ},
+                cwd=str(PROJECT_ROOT), env={**os.environ},
             )
             raw = result.stdout or ""
             if result.returncode != 0 and not raw:

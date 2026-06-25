@@ -39,6 +39,8 @@ import logging
 import subprocess
 import textwrap
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -1237,7 +1239,7 @@ class RevisionEngine:
                 capture_output=True,
                 text=True,
                 timeout=300,
-                env={**os.environ},
+                cwd=str(PROJECT_ROOT), env={**os.environ},
             )
             output = result.stdout or ""
             if result.returncode != 0 and not output:

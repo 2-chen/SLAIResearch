@@ -383,7 +383,7 @@ def _call_claude(prompt: str, timeout: int = 300) -> str:
     cmd = [CLAUDE_CMD, "-p", "--model", CLAUDE_MODEL, "--output-format", "text", prompt]
     logger.info("Calling Claude Code ...")
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                            env={**os.environ})
+                            cwd=str(PROJECT_ROOT), env={**os.environ})
     output = result.stdout or ""
     if result.returncode != 0 and not output:
         logger.warning("claude exited %d: %s", result.returncode, result.stderr[:300])
