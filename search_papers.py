@@ -88,7 +88,7 @@ def search_arxiv(query: str, max_results: int = 20) -> list[dict]:
                 continue
             resp.raise_for_status()
             break
-        except requests.RequestException:
+        except (requests.RequestException, UnicodeError):
             if attempt == 2:
                 raise
             time.sleep(3)
@@ -137,7 +137,7 @@ def search_semantic_scholar(query: str, max_results: int = 20) -> list[dict]:
             logger.warning("Semantic Scholar rate limited, skipping")
             return []
         resp.raise_for_status()
-    except requests.RequestException as e:
+    except (requests.RequestException, UnicodeError) as e:
         logger.warning("Semantic Scholar error: %s", e)
         return []
 
@@ -175,7 +175,7 @@ def search_openalex(query: str, max_results: int = 20) -> list[dict]:
     try:
         resp = requests.get(url, params=params, timeout=30)
         resp.raise_for_status()
-    except requests.RequestException as e:
+    except (requests.RequestException, UnicodeError) as e:
         logger.warning("OpenAlex error: %s", e)
         return []
 
@@ -397,7 +397,7 @@ def _download_url(url: str, pdf_path: Path, timeout: int, source: str = "") -> P
                 return None
         logger.info("PDF saved: %s (%d bytes)", pdf_path.name, pdf_path.stat().st_size)
         return pdf_path
-    except requests.RequestException as e:
+    except (requests.RequestException, UnicodeError) as e:
         logger.warning("PDF download error [%s]: %s", source, e)
         return None
 
