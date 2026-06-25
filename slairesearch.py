@@ -130,6 +130,7 @@ def _claude_subprocess_env() -> dict:
         env["ANTHROPIC_API_KEY"] = api_key
     if base_url:
         env["ANTHROPIC_BASE_URL"] = base_url
+    env["IS_SANDBOX"] = "1"
     return env
 
 
