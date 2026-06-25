@@ -100,16 +100,36 @@ _CLAUDE_TIMEOUT = 600               # seconds per call
 def _claude_subprocess_env() -> dict:
     """Return env dict for Claude CLI subprocess calls.
 
-    Explicitly injects API key / base URL so Claude never needs to find
-    .claude/settings.json via cwd or directory walk-up.  Works on root,
-    Ascend, and any environment where file-based config resolution fails.
+    Resolves API key / base URL from multiple sources (in priority order):
+    1. ANTHROPIC_API_KEY / CLAUDE_API_KEY env vars
+    2. PROJECT_ROOT/.claude/settings.json
+    The result is injected into the child env so Claude never depends on
+    cwd-based settings.json lookup.
     """
-    from config import CLAUDE_API_KEY, CLAUDE_BASE_URL
+    from config import CLAUDE_BASE_URL
     env = os.environ.copy()
-    if CLAUDE_API_KEY:
-        env["ANTHROPIC_API_KEY"] = CLAUDE_API_KEY
-    if CLAUDE_BASE_URL:
-        env["ANTHROPIC_BASE_URL"] = CLAUDE_BASE_URL
+
+    api_key = (
+        os.environ.get("ANTHROPIC_API_KEY", "")
+        or os.environ.get("CLAUDE_API_KEY", "")
+    )
+    base_url = os.environ.get("ANTHROPIC_BASE_URL", "") or CLAUDE_BASE_URL
+
+    # Fallback: read from project .claude/settings.json
+    if not api_key:
+        settings_file = PROJECT_ROOT / ".claude" / "settings.json"
+        if settings_file.exists():
+            try:
+                data = json.loads(settings_file.read_text())
+                api_key = (data.get("env", {}) or {}).get("ANTHROPIC_API_KEY", "")
+                base_url = (data.get("env", {}) or {}).get("ANTHROPIC_BASE_URL", base_url)
+            except Exception:
+                pass
+
+    if api_key:
+        env["ANTHROPIC_API_KEY"] = api_key
+    if base_url:
+        env["ANTHROPIC_BASE_URL"] = base_url
     return env
 
 
