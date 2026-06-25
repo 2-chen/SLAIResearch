@@ -1995,14 +1995,26 @@ def _ensure_claude_config(work_dir: Path) -> None:
     pulling API key / base URL from the current environment. Claude Code reads
     env.ANTHROPIC_API_KEY and env.ANTHROPIC_BASE_URL from settings.json."""
     dst = work_dir / ".claude"
-    if dst.exists():
-        return
+    dst.mkdir(exist_ok=True)
+    settings_path = dst / "settings.json"
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    base_url = os.environ.get("ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic")
+    # Load existing settings if present (preserve user modifications)
+    existing: dict = {}
+    if settings_path.exists():
+        try:
+            existing = json.loads(settings_path.read_text())
+        except Exception:
+            pass
 
+    # Resolve API key (env → project settings → existing)
+    api_key = (
+        os.environ.get("ANTHROPIC_API_KEY", "")
+        or os.environ.get("CLAUDE_API_KEY", "")
+    )
+    base_url = os.environ.get("ANTHROPIC_BASE_URL", "") or os.environ.get(
+        "CLAUDE_BASE_URL", "https://api.deepseek.com/anthropic"
+    )
     if not api_key:
-        # Try reading from project .claude/settings.json
         project_settings = PROJECT_ROOT / ".claude" / "settings.json"
         if project_settings.exists():
             try:
@@ -2011,24 +2023,34 @@ def _ensure_claude_config(work_dir: Path) -> None:
                 base_url = (data.get("env", {}) or {}).get("ANTHROPIC_BASE_URL", base_url)
             except Exception:
                 pass
+    if not api_key:
+        api_key = (existing.get("env", {}) or {}).get("ANTHROPIC_API_KEY", "")
+        base_url = (existing.get("env", {}) or {}).get("ANTHROPIC_BASE_URL", base_url) or base_url
 
-    dst.mkdir(exist_ok=True)
+    # Merge: preserve existing config, ensure critical keys are present
+    env = existing.get("env", {}) if existing.get("env") else {}
+    if api_key:
+        env["ANTHROPIC_API_KEY"] = api_key
+    if base_url:
+        env["ANTHROPIC_BASE_URL"] = base_url
+
+    permissions = existing.get("permissions", {}) if existing.get("permissions") else {}
+    perms_allow: list = permissions.get("allow", [])
+    required_perms = [
+        "WebSearch(*)", "WebFetch(*)", "Bash(*)", "Read(*)",
+        "Write(*)", "Edit(*)", "NotebookEdit(*)", "Task(*)",
+        "Agent(*)", "Skill(*)", "Search(*)", "Grep(*)", "Glob(*)", "List(*)",
+    ]
+    for p in required_perms:
+        if p not in perms_allow:
+            perms_allow.append(p)
+
     settings = {
-        "env": {
-            "ANTHROPIC_BASE_URL": base_url,
-            "ANTHROPIC_API_KEY": api_key,
-        },
-        "permissions": {
-            "allow": [
-                "WebSearch(*)", "WebFetch(*)", "Bash(*)", "Read(*)",
-                "Write(*)", "Edit(*)", "NotebookEdit(*)", "Task(*)",
-                "Agent(*)", "Skill(*)", "Search(*)", "Grep(*)", "Glob(*)", "List(*)",
-            ],
-            "deny": [],
-        },
+        "env": env,
+        "permissions": {"allow": perms_allow, "deny": permissions.get("deny", [])},
     }
-    (dst / "settings.json").write_text(json.dumps(settings, indent=2))
-    logger.info("Created .claude/settings.json in %s", work_dir)
+    settings_path.write_text(json.dumps(settings, indent=2))
+    logger.info("Ensured .claude/settings.json in %s (permissions=%d)", work_dir, len(perms_allow))
 
 
 def _safe_dirname(text: str) -> str:
