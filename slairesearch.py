@@ -1029,6 +1029,83 @@ and fix the shell script. Only make minimal, targeted fixes — do NOT rewrite t
     return False
 
 
+def _extract_latex_from_output(output_text: str) -> str | None:
+    """Try to extract LaTeX source from Claude's paper writing output.
+
+    Handles the case where Claude generates TeX but the Write tool fails
+    (e.g. root environment without pre-approved permissions)."""
+    # Pattern 1: ```latex ... ``` fenced block (most common)
+    m = re.search(r'```(?:latex|tex)\s*\n(.*?)```', output_text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+
+    # Pattern 2: \documentclass ... \end{document}
+    m = re.search(
+        r'(\\documentclass\[.*?\]\{.*?\}.*?\\end\{document\})',
+        output_text, re.DOTALL,
+    )
+    if m:
+        return m.group(1).strip()
+
+    # Pattern 3: large ``` block containing \documentclass
+    for m in re.finditer(r'```\s*\n(.*?)```', output_text, re.DOTALL):
+        block = m.group(1)
+        if r'\documentclass' in block and r'\begin{document}' in block:
+            return block.strip()
+
+    return None
+
+
+def _compile_paper_pdf(paper_dir: Path, claude_output: str = "") -> bool:
+    """Compile paper.tex to PDF.  If .tex is missing, attempts to extract
+    LaTeX from *claude_output* (the paper_writing output.md text) first.
+
+    Returns True if PDF exists after compilation."""
+    existing = sorted(paper_dir.rglob("*.pdf"))
+    if existing:
+        logger.info("PDF already exists: %s", existing[0].name)
+        return True
+
+    tex = paper_dir / "paper.tex"
+    if not tex.exists():
+        # Check if Claude wrote .tex elsewhere
+        tex_candidates = sorted(paper_dir.rglob("*.tex"))
+        if tex_candidates:
+            tex = tex_candidates[0]
+        elif claude_output:
+            latex = _extract_latex_from_output(claude_output)
+            if latex:
+                tex.write_text(latex)
+                logger.info("Extracted LaTeX from Claude output → %s", tex)
+    if not tex.exists():
+        logger.warning("No .tex file found in %s — cannot compile PDF", paper_dir)
+        return False
+
+    # Copy AAAI template files
+    for fname in ("aaai2026.sty", "aaai2026.bst"):
+        src = PROJECT_ROOT / "templates" / fname
+        if src.exists():
+            import shutil
+            shutil.copy2(src, paper_dir / fname)
+
+    logger.info("Compiling %s → PDF …", tex.name)
+    for _ in range(2):
+        r = subprocess.run(
+            ["pdflatex", "-interaction=nonstopmode", tex.name],
+            capture_output=True, text=True, timeout=120, cwd=str(paper_dir),
+        )
+        if r.returncode != 0:
+            tail = (r.stderr or r.stdout or "")[-500:]
+            logger.warning("pdflatex failed: %s", tail)
+
+    pdf = paper_dir / "paper.pdf"
+    if pdf.exists():
+        logger.info("PDF compiled: %s", pdf)
+        return True
+    logger.warning("PDF compilation failed — no paper.pdf produced")
+    return False
+
+
 def _do_paper_writing(sm: StateManager, state: ResearchState, retry_feedback: str = "") -> ResearchState:
     exp = _read_or(state.experiment_dir, "experiment_report.md")
     lit = _read_or(state.literature_dir, "literature_review.md")
@@ -1039,8 +1116,15 @@ def _do_paper_writing(sm: StateManager, state: ResearchState, retry_feedback: st
         OUTPUT_DIR=state.paper_dir,
         VENUE=state.venue,
     )
-    logger.info("Calling Claude Code for paper writing + LaTeX compilation …")
-    return _call_claude(sm, state, Stage.PAPER_WRITING, prompt, retry_feedback)
+    logger.info("Calling Claude Code for paper writing …")
+    state = _call_claude(sm, state, Stage.PAPER_WRITING, prompt, retry_feedback)
+
+    # Auto-compile TeX → PDF.  If .tex is missing (e.g. Write tool permission
+    # denied on root), try extracting LaTeX from Claude's stdout output.
+    output_text = _read_or(state.work_dir, "paper_writing_output.md")
+    _compile_paper_pdf(Path(state.paper_dir), claude_output=output_text)
+
+    return state
 
 
 def _format_revision_report(report: RevisionReport) -> str:
@@ -1913,7 +1997,15 @@ def _ensure_claude_config(work_dir: Path) -> None:
         "env": {
             "ANTHROPIC_BASE_URL": base_url,
             "ANTHROPIC_API_KEY": api_key,
-        }
+        },
+        "permissions": {
+            "allow": [
+                "WebSearch(*)", "WebFetch(*)", "Bash(*)", "Read(*)",
+                "Write(*)", "Edit(*)", "NotebookEdit(*)", "Task(*)",
+                "Agent(*)", "Skill(*)", "Search(*)", "Grep(*)", "Glob(*)", "List(*)",
+            ],
+            "deny": [],
+        },
     }
     (dst / "settings.json").write_text(json.dumps(settings, indent=2))
     logger.info("Created .claude/settings.json in %s", work_dir)
