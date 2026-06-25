@@ -301,12 +301,11 @@ class StageReviewer:
             CLAUDE_CMD, "-p",
             "--model", self.model,
             "--output-format", "text",
-            prompt,
         ]
 
         try:
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=300,
+                cmd, input=prompt, capture_output=True, text=True, timeout=300,
                 cwd=str(PROJECT_ROOT), env={**os.environ},
             )
             raw = result.stdout or ""

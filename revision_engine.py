@@ -1231,11 +1231,9 @@ class RevisionEngine:
         if json_mode:
             cmd.extend(["--json"])
 
-        cmd.append(prompt)
-
         try:
             result = subprocess.run(
-                cmd,
+                cmd, input=prompt,
                 capture_output=True,
                 text=True,
                 timeout=300,

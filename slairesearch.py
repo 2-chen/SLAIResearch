@@ -1020,9 +1020,10 @@ and fix the shell script. Only make minimal, targeted fixes — do NOT rewrite t
     logger.info("Calling LLM to auto-fix experiment script: %s", script)
     try:
         cmd = [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL,
-               "--max-turns", "5", prompt]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
-                                cwd=str(state.work_dir), env=_claude_subprocess_env())
+               "--max-turns", "5"]
+        result = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
+                                timeout=300, cwd=str(state.work_dir),
+                                env=_claude_subprocess_env())
         output = result.stdout or ""
 
         # Extract the fixed bash script
@@ -1826,11 +1827,10 @@ Please explicitly acknowledge how you've addressed each issue above.
 
     output_file = Path(state.work_dir) / f"{stage.value}_output.md"
 
-    # prompt via stdin — avoids CLI arg-parsing conflicts when the prompt
-    # prompt passed via stdin — avoids CLI arg limits for large prompts.
+    # Large prompts go via stdin — avoids OS argv limits and CLI arg-parsing issues.
     # --max-turns: prevents infinite agent loops during tool-heavy stages.
     cmd = [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL,
-           "--max-turns", "30", prompt]
+           "--max-turns", "30"]
 
     last_error = ""
     for attempt in range(max_retries + 1):
@@ -1842,7 +1842,7 @@ Please explicitly acknowledge how you've addressed each issue above.
 
         try:
             result = subprocess.run(
-                cmd, capture_output=True, text=True,
+                cmd, input=prompt, capture_output=True, text=True,
                 timeout=_CLAUDE_TIMEOUT,
                 cwd=str(state.work_dir),
                 env=_claude_subprocess_env(),
