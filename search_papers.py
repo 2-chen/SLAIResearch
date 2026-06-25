@@ -485,9 +485,21 @@ def download_top_pdfs(papers: list[dict], output_dir: Path, top_k: int = 5) -> l
     return downloaded
 
 
+def _extract_pdf_text_pdfplumber(pdf_path: Path) -> str:
+    """Fallback: extract PDF text via pdfplumber."""
+    try:
+        import pdfplumber
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            parts = [p.extract_text() or "" for p in pdf.pages]
+        return "\n".join(parts).strip()
+    except Exception:
+        return ""
+
+
 def extract_pdf_text(pdf_path: Path) -> str:
-    """Extract text from a PDF file using pdftotext. Returns empty string on failure."""
+    """Extract text from a PDF using pdftotext, with pdfplumber fallback."""
     import subprocess
+    # Try pdftotext first (fastest)
     try:
         result = subprocess.run(
             ["pdftotext", "-layout", str(pdf_path), "-"],
@@ -495,10 +507,17 @@ def extract_pdf_text(pdf_path: Path) -> str:
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout
-        return ""
     except (FileNotFoundError, subprocess.TimeoutExpired):
-        logger.warning("pdftotext not available, cannot extract text from %s", pdf_path.name)
-        return ""
+        pass
+
+    # Fallback to pdfplumber (pure Python, no system dependency)
+    logger.info("pdftotext unavailable — trying pdfplumber for %s", pdf_path.name)
+    text = _extract_pdf_text_pdfplumber(pdf_path)
+    if text:
+        return text
+
+    logger.warning("Cannot extract text from %s (pdftotext + pdfplumber both unavailable)", pdf_path.name)
+    return ""
 
 
 # ---------------------------------------------------------------------------

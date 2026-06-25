@@ -571,7 +571,7 @@ def save_review(merged: dict, output_dir: str | Path) -> Path:
 def _read_paper(paper_path: Path) -> str:
     """Read paper content from PDF or tex file."""
     if paper_path.suffix == ".pdf":
-        # Try pdftotext
+        # Try pdftotext first
         try:
             result = subprocess.run(
                 ["pdftotext", "-layout", str(paper_path), "-"],
@@ -581,8 +581,17 @@ def _read_paper(paper_path: Path) -> str:
                 return result.stdout
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
-        # Fallback: just note we can't read PDFs
-        logger.warning("Cannot extract text from PDF (pdftotext not available)")
+        # Fallback: pdfplumber
+        try:
+            import pdfplumber
+            with pdfplumber.open(str(paper_path)) as pdf:
+                parts = [p.extract_text() or "" for p in pdf.pages]
+            text = "\n".join(parts).strip()
+            if text:
+                return text
+        except Exception:
+            pass
+        logger.warning("Cannot extract text from PDF (pdftotext + pdfplumber both unavailable)")
         return f"[PDF file: {paper_path.name} — please review the PDF directly]"
     else:
         return paper_path.read_text()
