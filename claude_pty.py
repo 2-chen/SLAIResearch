@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""PTY wrapper — run a command in a pseudo-terminal to eliminate pipe buffering.
+"""PTY wrapper — run a command in a pseudo-terminal to eliminate pipe buffering
+and TTY detection issues.
 
-When Node.js (or any program) writes to a pipe, it enables full buffering (~4-16 KB
-chunks), causing multi-second delays before output appears.  This wrapper creates a
-pseudo-terminal (PTY) so the child process believes it's writing to a real terminal,
-triggering line-buffered or unbuffered mode — every line appears instantly.
+Claude Code detects non-TTY (subprocess.PIPE) and behaves differently — wasting
+turns on permission prompts or refusing to proceed.  A PTY makes it believe it's
+in an interactive session, solving the recurring \"Claude call timed out\" issue
+on root / Ascend / headless containers.
 
 Usage:
+    # CLI wrapper
     echo "prompt" | python claude_pty.py claude -p --model deepseek-v4-pro --verbose
-    python claude_pty.py claude -p < prompt.txt
 
-Exit code is forwarded from the child process.  Signals (SIGINT, SIGTERM) are
-passed through so Ctrl-C works as expected.
+    # Python API (recommended for subprocess replacement)
+    from claude_pty import run_in_pty
+    rc, stdout = run_in_pty(["claude", "-p", ...], prompt, timeout=600, cwd=".", env={})
 """
 
 import os
@@ -23,6 +25,11 @@ import errno
 import fcntl
 import struct
 import termios
+import subprocess
+import time as _time_module
+import logging
+
+logger = logging.getLogger("claude_pty")
 
 
 def _set_winsize(fd: int, rows: int, cols: int) -> None:
@@ -151,6 +158,82 @@ def _spawn_with_eof(cmd: list[str]) -> int:
             raise
 
     return status
+
+
+def run_in_pty(
+    cmd: list[str],
+    prompt: str,
+    timeout: int = 600,
+    cwd: str = ".",
+    env: dict | None = None,
+) -> tuple[int, str]:
+    """Run *cmd* in a PTY, feed *prompt* via stdin, return (returncode, stdout).
+
+    Prompt is passed as the final positional argument (``-p "prompt"`` style),
+    stdin is /dev/null.  The PTY makes the child process believe it has a real
+    terminal, avoiding TTY-detection behaviours that cause hangs in pipe mode.
+    """
+    full_cmd = list(cmd) + [prompt]
+    if env is None:
+        env = {}
+
+    master_fd, slave_fd = pty.openpty()
+    # Disable echo so prompt text doesn't appear in output
+    try:
+        attrs = termios.tcgetattr(slave_fd)
+        attrs[3] = attrs[3] & ~termios.ECHO
+        termios.tcsetattr(slave_fd, termios.TCSANOW, attrs)
+    except termios.error:
+        pass
+
+    try:
+        proc = subprocess.Popen(
+            full_cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            cwd=cwd,
+            env=env,
+            close_fds=True,
+        )
+        os.close(slave_fd)
+
+        output_chunks: list[bytes] = []
+        deadline = _time_module.time() + timeout
+        while _time_module.time() < deadline:
+            r, _, _ = select.select([master_fd], [], [], 1.0)
+            if r:
+                try:
+                    chunk = os.read(master_fd, 65536)
+                    if not chunk:
+                        break
+                    output_chunks.append(chunk)
+                except OSError:
+                    break
+            if proc.poll() is not None:
+                break
+
+        # Drain any remaining output
+        while True:
+            r, _, _ = select.select([master_fd], [], [], 0.1)
+            if not r:
+                break
+            try:
+                chunk = os.read(master_fd, 65536)
+                if not chunk:
+                    break
+                output_chunks.append(chunk)
+            except OSError:
+                break
+
+        proc.wait(timeout=5)
+        stdout = b"".join(output_chunks).decode("utf-8", errors="replace")
+        return proc.returncode, stdout
+    finally:
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
 
 
 def main() -> None:

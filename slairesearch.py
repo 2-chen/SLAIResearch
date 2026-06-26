@@ -52,6 +52,7 @@ from revision_engine import RevisionEngine, RevisionReport, apply_grounding_prot
 from revision_protocol import RevisionProtocol, TODOList, should_reiterate_pipeline
 from context_compressor import ContextCompressor, PipelineState as CompressorState
 from review_synthesis import ReviewSynthesizer, SynthesisResult
+from claude_pty import run_in_pty
 from exceptions import CheckpointError
 from progress import ProgressEmitter
 
@@ -190,6 +191,78 @@ def cmd_run(topic: str, force: bool = False) -> None:
     _run_pipeline(sm, state)
 
 
+def _sync_state_from_progress(state: ResearchState) -> ResearchState:
+    """If progress.json recorded a later stage than state.json, trust progress.json.
+
+    state.json can lag behind when a stage times out mid-write. progress.json is
+    updated atomically via ProgressEmitter, so its last \"stage_complete\" is the
+    ground truth for what actually finished."""
+    progress_path = Path(state.work_dir) / "progress.json"
+    if not progress_path.exists():
+        return state
+
+    try:
+        data = json.loads(progress_path.read_text())
+        events = data.get("events", [])
+    except Exception:
+        return state
+
+    # Collect completed stages from progress.json
+    progress_completed: list[str] = []
+    for ev in events:
+        if ev.get("type") == "stage_complete":
+            progress_completed.append(ev.get("stage", ""))
+
+    if not progress_completed:
+        return state
+
+    last_progress_stage = progress_completed[-1]
+    stage_order = [s.value for s in _PROCESSING_STAGES]
+    try:
+        progress_idx = stage_order.index(last_progress_stage)
+    except ValueError:
+        return state
+
+    # Find the furthest completed stage from state.json
+    state_completed_idx = -1
+    for s_val in stage_order:
+        st = state.stages.get(s_val)
+        if isinstance(st, StageState) and st.status == StageStatus.COMPLETED.value:
+            try:
+                state_completed_idx = stage_order.index(s_val)
+            except ValueError:
+                pass
+
+    # If progress.json knows about a LATER stage than state.json, use it
+    if progress_idx > state_completed_idx:
+        print(f"  progress.json last complete: {last_progress_stage} "
+              f"(state.json: {stage_order[state_completed_idx] if state_completed_idx >= 0 else 'none'}) → "
+              f"updating state")
+        # Mark all stages up to progress_idx as completed
+        for i in range(progress_idx + 1):
+            s_val = stage_order[i]
+            st = state.stages.get(s_val)
+            if isinstance(st, StageState):
+                st.status = StageStatus.COMPLETED.value
+                st.review_passed = True
+
+        # Set next stage
+        next_idx = progress_idx + 1
+        if next_idx < len(stage_order):
+            state.stage = stage_order[next_idx]
+        else:
+            state.stage = Stage.DONE.value
+
+        # Mark remaining as pending
+        for s_val in stage_order[next_idx:]:
+            st = state.stages.get(s_val)
+            if isinstance(st, StageState):
+                st.status = StageStatus.PENDING.value
+                st.review_passed = False
+
+    return state
+
+
 def cmd_resume(topic_or_slug: str) -> None:
     """Resume pipeline from last saved state with full crash recovery.
 
@@ -198,7 +271,8 @@ def cmd_resume(topic_or_slug: str) -> None:
     2. Reset any stages stuck in "in_progress" (from hard crash / SIGKILL)
     3. If current_stage is "done", report and exit
     4. If current_stage is "failed", find the first failed stage, reset it to "pending"
-    5. Run pipeline — completed stages are skipped automatically
+    5. Cross-check with progress.json — correct state if it diverged
+    6. Run pipeline — completed stages are skipped automatically
     """
     sm = StateManager(PROJECT_ROOT / "state")
     if not sm.exists(topic_or_slug):
@@ -242,6 +316,9 @@ def cmd_resume(topic_or_slug: str) -> None:
             print("No failed stage found. Starting from the first pending stage.")
             state.stage = sm._first_pending_stage(state)
         sm.save(state)
+
+    # ── Step 3: Cross-check with progress.json for divergence ──
+    state = _sync_state_from_progress(state)
 
     # Ensure Claude can find settings (needed on Ascend)
     _ensure_claude_config(Path(state.work_dir))
@@ -1022,10 +1099,10 @@ and fix the shell script. Only make minimal, targeted fixes — do NOT rewrite t
     try:
         cmd = [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL,
                "--max-turns", "5"]
-        result = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
-                                timeout=300, cwd=str(state.work_dir),
+        rc, output = run_in_pty(cmd, prompt, timeout=300,
+                                cwd=str(state.work_dir),
                                 env=_claude_subprocess_env())
-        output = result.stdout or ""
+        output = output or ""
 
         # Extract the fixed bash script
         m = re.search(r'```bash\s*\n(.*?)```', output, re.DOTALL)
@@ -1622,24 +1699,14 @@ Please explicitly acknowledge how you've addressed each issue above.
         )
 
         try:
-            result = subprocess.run(
-                cmd,
-                input=task_prompt,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                cwd=str(state.work_dir),
-                env=_claude_subprocess_env(),
+            rc, output = run_in_pty(
+                cmd, task_prompt, timeout=timeout,
+                cwd=str(state.work_dir), env=_claude_subprocess_env(),
             )
-            output = result.stdout or ""
-            if result.returncode != 0:
-                error_msg = (
-                    result.stderr[:300] if result.stderr
-                    else f"exit code {result.returncode}"
-                )
-                raise subprocess.CalledProcessError(
-                    result.returncode, cmd,
-                    output=output, stderr=result.stderr,
+            output = output or ""
+            if rc != 0 and not output.strip():
+                raise RuntimeError(
+                    f"Experiment scientist exited {rc} with no output"
                 )
 
             output_file.write_text(output)
@@ -1842,18 +1909,12 @@ Please explicitly acknowledge how you've addressed each issue above.
         )
 
         try:
-            result = subprocess.run(
-                cmd, input=prompt, capture_output=True, text=True,
-                timeout=_CLAUDE_TIMEOUT,
-                cwd=str(state.work_dir),
-                env=_claude_subprocess_env(),
+            rc, output = run_in_pty(
+                cmd, prompt, _CLAUDE_TIMEOUT,
+                str(state.work_dir), _claude_subprocess_env(),
             )
-            output = result.stdout or ""
-            if result.returncode != 0:
-                error_msg = result.stderr[:300] if result.stderr else f"exit code {result.returncode}"
-                raise subprocess.CalledProcessError(
-                    result.returncode, cmd, output=output, stderr=result.stderr,
-                )
+            if rc != 0 and not output.strip():
+                raise RuntimeError(f"Claude exited {rc} with no output (prompt saved to {prompt_file})")
 
             output_file.write_text(output)
             logger.info("Claude output → %s (%d chars)", output_file, len(output))
@@ -1869,20 +1930,10 @@ Please explicitly acknowledge how you've addressed each issue above.
             )
             raise
 
-        except subprocess.TimeoutExpired as exc:
-            partial_stderr = (exc.stderr or b"").decode(errors="replace")[-500:] if exc.stderr else ""
+        except subprocess.TimeoutExpired:
             last_error = f"Timeout after {_CLAUDE_TIMEOUT}s"
-            if partial_stderr:
-                last_error += f" | stderr: {partial_stderr[:200]}"
-            logger.warning("Claude call timed out (attempt %d/%d): %s",
-                          attempt + 1, max_retries + 1,
-                          partial_stderr[:200] if partial_stderr else "(no stderr)")
-
-        except subprocess.CalledProcessError as exc:
-            stderr_info = exc.stderr[:300] if exc.stderr else "no stderr"
-            stdout_info = exc.output[:500] if exc.output else "no stdout"
-            last_error = f"Exit {exc.returncode}: stderr={stderr_info} | stdout={stdout_info}"
-            logger.warning("Claude call failed (attempt %d/%d): %s", attempt + 1, max_retries + 1, last_error)
+            logger.warning("Claude call timed out (attempt %d/%d): (no stderr — PTY mode)",
+                          attempt + 1, max_retries + 1)
 
         except Exception as exc:
             last_error = str(exc)

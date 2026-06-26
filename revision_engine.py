@@ -45,6 +45,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from config import CLAUDE_CMD, CLAUDE_MODEL
+from claude_pty import run_in_pty
 
 logger = logging.getLogger("revision_engine")
 
@@ -1232,23 +1233,15 @@ class RevisionEngine:
             cmd.extend(["--json"])
 
         try:
-            result = subprocess.run(
-                cmd, input=prompt,
-                capture_output=True,
-                text=True,
-                timeout=300,
-                cwd=str(PROJECT_ROOT), env={**os.environ},
-            )
-            output = result.stdout or ""
-            if result.returncode != 0 and not output:
-                logger.warning("LLM call failed: %s", result.stderr[:300])
+            rc, output = run_in_pty(cmd, prompt, timeout=300,
+                                    cwd=str(PROJECT_ROOT), env={**os.environ})
+            output = output or ""
+            if rc != 0 and not output:
+                logger.warning("LLM call failed: rc=%d", rc)
                 return ""
             return output
-        except subprocess.TimeoutExpired:
-            logger.warning("LLM call timed out")
-            return ""
-        except FileNotFoundError:
-            logger.warning("claude CLI not found")
+        except OSError as e:
+            logger.warning("LLM call failed: %s", e)
             return ""
 
     # ------------------------------------------------------------------

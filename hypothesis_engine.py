@@ -37,6 +37,7 @@ from config import (
     CLAUDE_CMD, CLAUDE_MODEL,
     HYPOTHESIS_MAX_REACT_ROUNDS, HYPOTHESIS_TOP_K_PDFS, HYPOTHESIS_MAX_PAPERS,
 )
+from claude_pty import run_in_pty
 from search_papers import (
     search_arxiv, search_semantic_scholar, search_openalex,
     merge_results, papers_to_json, load_papers_json,
@@ -382,13 +383,12 @@ def _call_claude(prompt: str, timeout: int = 300) -> str:
     """Call claude -p and return stdout."""
     cmd = [CLAUDE_CMD, "-p", "--model", CLAUDE_MODEL, "--output-format", "text"]
     logger.info("Calling Claude Code ...")
-    result = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
-                            timeout=timeout, cwd=str(PROJECT_ROOT),
-                            env={**os.environ})
-    output = result.stdout or ""
-    if result.returncode != 0 and not output:
-        logger.warning("claude exited %d: %s", result.returncode, result.stderr[:300])
-        return result.stderr or ""
+    rc, output = run_in_pty(cmd, prompt, timeout=timeout,
+                            cwd=str(PROJECT_ROOT), env={**os.environ})
+    output = output or ""
+    if rc != 0 and not output:
+        logger.warning("claude exited %d (PTY mode)", rc)
+        return ""
     return output
 
 

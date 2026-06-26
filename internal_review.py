@@ -23,6 +23,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from config import CLAUDE_CMD, CLAUDE_MODEL
+from claude_pty import run_in_pty
 
 try:
     from review_tools import (
@@ -425,13 +426,11 @@ Output ONLY your structured review section (no preamble, no meta-commentary)."""
     ]
 
     logger.info("  Reviewing: %s ...", reviewer["name"])
-    result = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
-                            timeout=600, cwd=str(PROJECT_ROOT),
-                            env={**os.environ})
-
-    output = result.stdout or ""
-    if result.returncode != 0 and not output:
-        raise RuntimeError(f"claude -p failed: {result.stderr[:300]}")
+    rc, output = run_in_pty(cmd, prompt, timeout=600,
+                            cwd=str(PROJECT_ROOT), env={**os.environ})
+    output = output or ""
+    if rc != 0 and not output:
+        raise RuntimeError(f"claude -p failed: rc={rc}")
 
     # Save individual review
     review_file = output_dir / f"reviewer_{reviewer['name'].replace(' ', '_').lower()}.md"
