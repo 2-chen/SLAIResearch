@@ -200,30 +200,34 @@ def run_in_pty(
 
         output_chunks: list[bytes] = []
         deadline = _time_module.time() + timeout
+        seen_eof = False
         while _time_module.time() < deadline:
             r, _, _ = select.select([master_fd], [], [], 1.0)
             if r:
                 try:
                     chunk = os.read(master_fd, 65536)
                     if not chunk:
-                        break
+                        seen_eof = True
+                        break  # PTY master closed
                     output_chunks.append(chunk)
                 except OSError:
                     break
-            if proc.poll() is not None:
-                break
-
-        # Drain any remaining output
-        while True:
-            r, _, _ = select.select([master_fd], [], [], 0.1)
-            if not r:
-                break
-            try:
-                chunk = os.read(master_fd, 65536)
-                if not chunk:
-                    break
-                output_chunks.append(chunk)
-            except OSError:
+            if not seen_eof and proc.poll() is not None:
+                # Process exited — give it 2 more seconds for buffered output
+                flush_deadline = _time_module.time() + 2
+                while _time_module.time() < flush_deadline:
+                    r2, _, _ = select.select([master_fd], [], [], 0.2)
+                    if r2:
+                        try:
+                            chunk = os.read(master_fd, 65536)
+                            if not chunk:
+                                seen_eof = True
+                                break
+                            output_chunks.append(chunk)
+                        except OSError:
+                            break
+                    elif not r2:
+                        break  # nothing more to read
                 break
 
         try:
