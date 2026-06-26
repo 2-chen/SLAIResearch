@@ -226,9 +226,13 @@ def run_in_pty(
             except OSError:
                 break
 
-        proc.wait(timeout=5)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            # Process still flushing — return what we have
+            pass
         stdout = b"".join(output_chunks).decode("utf-8", errors="replace")
-        return proc.returncode, stdout
+        return proc.returncode or 0, stdout
     finally:
         try:
             os.close(master_fd)
