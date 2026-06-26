@@ -1746,6 +1746,15 @@ Please explicitly acknowledge how you've addressed each issue above.
                     ", ".join(missing),
                 )
                 meta["missing_artifacts"] = missing
+                # If core artifacts (manifest + results) are both missing, treat
+                # as a hard failure — retrying without code/product changes is
+                # pointless and wastes compute.
+                if "experiment_manifest.json" in missing and "experiment_results.json" in missing:
+                    raise RuntimeError(
+                        f"Experiment scientist produced no core artifacts "
+                        f"({', '.join(missing)}). "
+                        f"Check Claude Code permissions or experiment design."
+                    )
 
             # Save execution trace for future resume
             _save_execution_trace(state, stage, output, meta)
