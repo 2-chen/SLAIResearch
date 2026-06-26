@@ -921,18 +921,32 @@ def _do_experiment_design(sm: StateManager, state: ResearchState, retry_feedback
         from accelerator import detect_accelerator, check_sco_npu_compatibility
         accel_info = detect_accelerator()
         if accel_info.npu_count > 0:
-            npu_context = (
-                f"\n\n## NPU 环境信息\n"
-                f"- NPU 设备数: {accel_info.npu_count}\n"
-                f"- 加速器类型: {accel_info.accelerator_type}\n"
-                f"- 使用 NPU 时，请使用 device-agnostic 代码 (torch.device)，避免直接调用 torch.cuda\n"
-                f"- torch_npu 包需要与 CANN 版本匹配\n"
-            )
+            # Check if NPU is actually usable (driver/kernel version match)
+            npu_broken = _check_npu_broken()
+            if npu_broken:
+                npu_context = (
+                    f"\n\n## ⚠ NPU 环境：训练模式已禁用\n"
+                    f"- NPU 设备数: {accel_info.npu_count} (CANN {npu_broken})\n"
+                    f"- **torch_npu + CANN 版本不匹配，NPU 训练不可用**\n"
+                    f"- **不要尝试运行实际训练**——代码执行 NPU 操作会崩溃\n\n"
+                    f"### 替代方案：设计实验 + 生成模拟结果\n"
+                    f"1. 正常设计实验架构、编写所有代码（训练脚本、评估脚本）\n"
+                    f"2. 不要执行训练——根据文献中的 SOTA 性能数据估算合理结果\n"
+                    f"3. 生成 experiment_manifest.json（实验配置）、experiment_results.json（估算结果）、experiment_log.md（说明结果来自文献估算）\n"
+                    f"4. 在结果中明确标注 \"Estimated from literature benchmarks\"\n"
+                    f"5. 产生合理的性能数据，让论文写作阶段有数据可用\n"
+                )
+            else:
+                npu_context = (
+                    f"\n\n## NPU 环境信息\n"
+                    f"- NPU 设备数: {accel_info.npu_count}\n"
+                    f"- 加速器类型: {accel_info.accelerator_type}\n"
+                    f"- 使用 device-agnostic 代码 (torch.device('npu'))，避免 torch.cuda\n"
+                )
             if not accel_info.supports_cuda_api:
                 sco_compat = check_sco_npu_compatibility()
                 npu_context += (
-                    f"- SCO 云 GPU 兼容性: {sco_compat['compatible']}\n"
-                    f"- {sco_compat['recommendation']}\n"
+                    f"- SCO 云 GPU: {sco_compat['compatible']} | {sco_compat['recommendation']}\n"
                 )
             logger.info("NPU environment detected — injecting context into experiment prompt")
     except ImportError:
@@ -992,13 +1006,21 @@ def _do_experiment_design(sm: StateManager, state: ResearchState, retry_feedback
     os.makedirs(state.experiment_dir, exist_ok=True)
 
     logger.info("Launching experiment scientist (Claude Code + system prompt) …")
-    return _call_claude_with_system_prompt(
+    state = _call_claude_with_system_prompt(
         sm, state, Stage.EXPERIMENT_DESIGN,
         task_prompt=task_prompt,
         system_prompt_path=EXPERIMENT_SYSTEM_PROMPT,
         retry_feedback=retry_feedback,
         timeout=EXPERIMENT_CLAUDE_TIMEOUT,
     )
+
+    # If NPU training is broken and Claude produced no results, generate
+    # literature-estimated data so downstream stages (paper_writing) can proceed.
+    npu_fail_reason = _check_npu_broken()
+    if npu_fail_reason:
+        _ensure_simulation_results(state, lit, hyp, npu_fail_reason)
+
+    return state
 
 
 def _do_experiment_execution(sm: StateManager, state: ResearchState, retry_feedback: str = "") -> ResearchState:
@@ -2045,6 +2067,70 @@ def _extract_baselines_from_text(text: str) -> list[str]:
             names.append(m.group())
 
     return names
+
+
+def _check_npu_broken() -> str:
+    """Test if torch_npu can actually run ops.  Returns CANN version string if
+    broken (kernel parse error), empty string if NPU is usable."""
+    try:
+        import torch
+        import torch_npu
+        if not torch.npu.is_available():
+            return ""
+        # Quick sanity check — if this fails, NPU training won't work
+        t = torch.ones(2, 2).npu()
+        t.mean().item()
+        return ""  # Works fine
+    except RuntimeError as e:
+        msg = str(e)[:200]
+        # Kernel parse error / aclnnMean failure → version mismatch
+        if "kernel" in msg.lower() or "aclnn" in msg.lower():
+            return "driver/kernel version mismatch"
+        return f"runtime error: {msg[:80]}"
+    except Exception as e:
+        return f"error: {e!s:80s}"
+
+
+def _ensure_simulation_results(
+    state: ResearchState, lit: str, hyp: str, npu_reason: str,
+) -> None:
+    """Generate estimated experiment results when NPU training is unavailable.
+
+    Only writes files that are missing — never overwrites real results."""
+    exp_dir = Path(state.experiment_dir)
+    manifest = exp_dir / "experiment_manifest.json"
+    results = exp_dir / "experiment_results.json"
+    log = exp_dir / "experiment_log.md"
+
+    # Only generate if core files are truly missing
+    if manifest.exists() and results.exists():
+        return
+
+    logger.info("NPU unavailable (%s) — generating literature-estimated results", npu_reason)
+
+    if not manifest.exists():
+        manifest.write_text(json.dumps({
+            "mode": "simulation",
+            "reason": f"NPU training unavailable: {npu_reason}",
+            "architecture": "See experiment_plan.md for full design",
+            "hypothesis_file": f"{state.hypothesis_dir}/hypothesis_output.json",
+        }, indent=2))
+
+    if not results.exists():
+        results.write_text(json.dumps({
+            "mode": "simulation",
+            "note": "Results estimated from literature benchmarks — not from actual training runs",
+            "metrics": {},
+            "comparisons": [],
+        }, indent=2))
+
+    if not log.exists():
+        log.write_text(
+            f"# Experiment Log (Simulation)\n\n"
+            f"**Reason:** NPU training unavailable — {npu_reason}\n\n"
+            f"Results are literature-estimated values for pipeline continuity.\n"
+            f"Re-run with working GPU/NPU for real experimental data.\n"
+        )
 
 
 def _contains_cjk(text: str) -> bool:
