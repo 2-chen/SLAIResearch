@@ -189,7 +189,7 @@ def run_in_pty(
     try:
         proc = subprocess.Popen(
             full_cmd,
-            stdin=subprocess.DEVNULL,
+            stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
             cwd=cwd,
