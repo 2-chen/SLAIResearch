@@ -453,6 +453,15 @@ def _run_pipeline(sm: StateManager, state: ResearchState) -> None:
                 progress.pipeline_complete(False, f"Failed at submit: {exc}")
                 return
 
+            # If submission was rate-limited (no token), skip poll
+            st_info = state.stages.get(submit_stage.value)
+            if isinstance(st_info, StageState) and st_info.meta.get("submitted") is False:
+                print(f"\n  [yellow]![/yellow] PaperReview.ai rate-limited. "
+                      f"PDF: {st_info.meta.get('pdf_path', '')}\n"
+                      f"  Upload manually to continue.")
+                progress.pipeline_complete(True, "PDF ready — upload manually to paperreview.ai")
+                return
+
             state = sm.start_stage(state, Stage.POLL_REVIEW)
             try:
                 state, verdict = _do_poll(sm, state)
@@ -1332,11 +1341,44 @@ def _do_submit(sm: StateManager, state: ResearchState) -> ResearchState:
 
     pdf_path = pdf_files[-1]
     logger.info("Uploading %s to paperreview.ai …", pdf_path.name)
-    token = submit_paper(str(pdf_path), email=state.email, venue=state.venue)
 
-    record = ReviewRecord(iteration=state.iteration, token=token, submitted_at=str(pdf_path))
-    state = sm.add_review(state, record)
-    return sm.complete_stage(state, Stage.SUBMIT_REVIEW, {"token": token})
+    # Try submission with longer backoff for rate limiting
+    import time as _t
+    last_error = None
+    for attempt in range(5):
+        try:
+            token = submit_paper(str(pdf_path), email=state.email, venue=state.venue)
+            record = ReviewRecord(iteration=state.iteration, token=token,
+                                  submitted_at=str(pdf_path))
+            state = sm.add_review(state, record)
+            return sm.complete_stage(state, Stage.SUBMIT_REVIEW, {"token": token})
+        except Exception as e:
+            last_error = str(e)
+            if "429" in last_error and attempt < 4:
+                wait = 60 * (attempt + 1)  # 60s, 120s, 180s, 240s
+                logger.warning("paperreview.ai rate limited — retrying in %ds …", wait)
+                _t.sleep(wait)
+            else:
+                break
+
+    # Rate limit persists — save locally and complete gracefully
+    submit_note = Path(state.paper_dir) / "SUBMIT_PENDING.txt"
+    submit_note.write_text(
+        f"PDF ready for manual upload: {pdf_path}\n"
+        f"Upload to: https://paperreview.ai\n"
+        f"Email: {state.email}\n"
+        f"Venue: {state.venue}\n"
+        f"Last error: {last_error}\n"
+    )
+    logger.warning(
+        "paperreview.ai still rate-limited after retries. "
+        "PDF saved locally — upload manually: %s", submit_note,
+    )
+    return sm.complete_stage(state, Stage.SUBMIT_REVIEW, {
+        "submitted": False,
+        "pdf_path": str(pdf_path),
+        "note": f"Rate limited: {last_error}. Upload manually via https://paperreview.ai",
+    })
 
 
 def _do_poll(sm: StateManager, state: ResearchState) -> tuple[ResearchState, str]:
