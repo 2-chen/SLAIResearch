@@ -373,16 +373,25 @@ def review_to_markdown(review: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def _get_upload_url(filename: str, venue: str, timeout: int) -> dict:
-    resp = requests.post(
-        f"{BASE_URL}/api/get-upload-url",
-        json={"filename": filename, "venue": venue},
-        timeout=timeout,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if not data.get("success"):
-        raise RuntimeError(f"get-upload-url failed: {data}")
-    return data
+    import time as _t
+    for attempt in range(3):
+        resp = requests.post(
+            f"{BASE_URL}/api/get-upload-url",
+            json={"filename": filename, "venue": venue},
+            timeout=timeout,
+        )
+        if resp.status_code == 429:
+            wait = 10 * (attempt + 1)
+            logger.warning("Rate limited (429), retrying in %ds …", wait)
+            _t.sleep(wait)
+            continue
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("success"):
+            raise RuntimeError(f"get-upload-url failed: {data}")
+        return data
+    resp.raise_for_status()  # Re-raise last 429 after exhausting retries
+    return {}  # unreachable
 
 
 def _upload_to_s3(url_data: dict, pdf_path: Path, timeout: int) -> None:
@@ -404,16 +413,25 @@ def _upload_to_s3(url_data: dict, pdf_path: Path, timeout: int) -> None:
 
 
 def _confirm_upload(s3_key: str, venue: str, email: str, timeout: int) -> str:
-    resp = requests.post(
-        f"{BASE_URL}/api/confirm-upload",
-        data={"s3_key": s3_key, "venue": venue, "email": email},
-        timeout=timeout,
-    )
+    import time as _t
+    for attempt in range(3):
+        resp = requests.post(
+            f"{BASE_URL}/api/confirm-upload",
+            data={"s3_key": s3_key, "venue": venue, "email": email},
+            timeout=timeout,
+        )
+        if resp.status_code == 429:
+            wait = 10 * (attempt + 1)
+            logger.warning("Rate limited (429), retrying in %ds …", wait)
+            _t.sleep(wait)
+            continue
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("success"):
+            raise RuntimeError(f"confirm-upload failed: {data}")
+        return data["token"]
     resp.raise_for_status()
-    data = resp.json()
-    if not data.get("success"):
-        raise RuntimeError(f"confirm-upload failed: {data}")
-    return data["token"]
+    return ""  # unreachable
 
 
 # ---------------------------------------------------------------------------
