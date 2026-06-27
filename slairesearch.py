@@ -536,6 +536,21 @@ def _run_pipeline(sm: StateManager, state: ResearchState) -> None:
                 progress.pipeline_complete(False, f"Failed at revise: {exc}")
                 return
 
+            # Check for revision stall — no improvement means further
+            # iterations are pointless
+            rev_meta = state.stages.get(Stage.REVISE.value)
+            if isinstance(rev_meta, StageState):
+                rm = rev_meta.meta or {}
+                if (rm.get("revision_rounds", 0) >= 2
+                        and rm.get("final_avg_score", 0) <= rm.get("initial_avg_score", 0) + 0.1):
+                    print(f"\n  [yellow]![/yellow] Revision stalled "
+                          f"(score {rm['initial_avg_score']}→{rm['final_avg_score']}) — "
+                          f"further iterations would produce no improvement")
+                    state.stage = Stage.DONE.value
+                    sm.save(state)
+                    progress.pipeline_complete(True, f"Revision stalled — stopping at iteration {state.iteration}")
+                    return
+
         print(f"\n[!] Reached max iterations ({state.max_iterations}) without target verdict.")
         state.stage = Stage.DONE.value
         sm.save(state)
