@@ -48,6 +48,7 @@ class BaselineContext:
     method_name: str
     repo_url: str
     slug: str
+    local_path: str = ""     # filesystem path where repo is cloned
     file_tree: str = ""
     readme_summary: str = ""
     requirements: str = ""
@@ -318,6 +319,7 @@ class BaselineFinder:
             method_name=source.method_name,
             repo_url=source.repo_url,
             slug=slug,
+            local_path=str(repo_dir),
         )
 
         try:
@@ -439,7 +441,7 @@ class BaselineFinder:
 
         for ctx in contexts:
             header = f"### {ctx.method_name} — {ctx.repo_url}"
-            parts = [header, ""]
+            parts = [header, "", f"**本地路径**: `{ctx.local_path}`", ""]
 
             if ctx.entry_points:
                 parts.append(f"**Entry points**: {ctx.entry_points}")

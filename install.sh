@@ -124,16 +124,73 @@ if [[ ":$PATH:" != *":${HOME}/.sco/bin:"* ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 5. 验证
+# 5. NPU / 昇腾环境检查
 # ---------------------------------------------------------------------------
-echo "[5/5] 验证安装 …"
+echo "[5/6] 检查 NPU / 昇腾环境 …"
+IS_NPU=false
+if command -v npu-smi &>/dev/null || [[ -n "${ASCEND_VISIBLE_DEVICES:-}" ]]; then
+    IS_NPU=true
+    echo "  检测到昇腾 NPU 环境"
+    # NPU 专用包
+    for pkg in scholarly pdfplumber; do
+        if python3 -c "import ${pkg}" 2>/dev/null; then
+            echo "  ${pkg}: OK"
+        else
+            echo "  [WARN] 昇腾环境缺少 ${pkg} — 安装: pip install ${pkg}"
+        fi
+    done
+else
+    echo "  非 NPU 环境，跳过 NPU 检查"
+fi
 
-# Python
-python -c "import requests; print('  requests: OK')"
+# ---------------------------------------------------------------------------
+# 6. 验证
+# ---------------------------------------------------------------------------
+echo "[6/6] 验证安装 …"
 
-# 配置
-python -c "from config import SEMANTIC_SCHOLAR_API_KEY, CLAUDE_API_KEY; print(f'  S2 API Key: {\"***\" + SEMANTIC_SCHOLAR_API_KEY[-4:]}'); print(f'  Claude API Key: {\"***\" + CLAUDE_API_KEY[-4:]}')" 2>/dev/null || \
-python3 -c "import sys; sys.path.insert(0, '${SCRIPT_DIR}'); from config import SEMANTIC_SCHOLAR_API_KEY, CLAUDE_API_KEY; print(f'  S2 API Key: {\"***\" + SEMANTIC_SCHOLAR_API_KEY[-4:]}'); print(f'  Claude API Key: {\"***\" + CLAUDE_API_KEY[-4:]}')"
+# Python 依赖
+PYTHON_DEPS="requests pyyaml torch matplotlib"
+MISSING_DEPS=""
+for dep in $PYTHON_DEPS; do
+    if python3 -c "import ${dep}" 2>/dev/null; then
+        echo "  ${dep}: OK"
+    else
+        echo "  [WARN] 缺少 ${dep} — 安装: pip install ${dep}"
+        MISSING_DEPS="${MISSING_DEPS} ${dep}"
+    fi
+done
+if [[ -n "${MISSING_DEPS}" ]]; then
+    echo ""
+    echo "  提示: 一键安装缺失依赖: pip install${MISSING_DEPS}"
+fi
+
+# API Keys
+echo ""
+echo "  ── API Keys ──"
+python3 -c "
+import sys; sys.path.insert(0, '${SCRIPT_DIR}')
+from config import SEMANTIC_SCHOLAR_API_KEY, CLAUDE_API_KEY, PAPERREVIEW_EMAIL
+
+# Claude
+if CLAUDE_API_KEY:
+    print(f'  ANTHROPIC_API_KEY: ***{CLAUDE_API_KEY[-8:]}')
+else:
+    print('  [WARN] ANTHROPIC_API_KEY 未设置 — Claude Code 无法使用')
+
+# Semantic Scholar
+if SEMANTIC_SCHOLAR_API_KEY and 's2k-' in SEMANTIC_SCHOLAR_API_KEY:
+    print(f'  SEMANTIC_SCHOLAR_API_KEY: ***{SEMANTIC_SCHOLAR_API_KEY[-8:]}')
+else:
+    print('  [WARN] SEMANTIC_SCHOLAR_API_KEY 未设置 — 文献搜索将被限流')
+    print('         免费申请: https://api.semanticscholar.org/')
+
+# PaperReview
+if PAPERREVIEW_EMAIL:
+    print(f'  PAPERREVIEW_EMAIL: {PAPERREVIEW_EMAIL}')
+else:
+    print('  [WARN] PAPERREVIEW_EMAIL 未设置 — paperreview.ai 提交需要 email')
+    print('         设置: export PAPERREVIEW_EMAIL=\"your-email@example.com\"')
+"
 
 # Claude Code
 if command -v claude &>/dev/null; then
