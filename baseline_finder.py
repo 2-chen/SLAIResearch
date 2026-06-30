@@ -130,9 +130,17 @@ class BaselineFinder:
             slug = self._repo_slug(src.repo_url, src.method_name)
             target_dir = self.cache_dir / slug
 
-            if target_dir.exists():
+            # Only use cache if it contains files beyond .git (failed clones
+            # often leave an empty directory or a bare .git with no source).
+            if target_dir.exists() and any(
+                p.name != ".git" for p in target_dir.iterdir()
+            ):
                 logger.info("Using cached repo: %s", target_dir)
             else:
+                # Clean up empty/stale directory before cloning
+                if target_dir.exists():
+                    import shutil
+                    shutil.rmtree(target_dir, ignore_errors=True)
                 ok = self._clone_repo(src.repo_url, target_dir)
                 if not ok:
                     continue
