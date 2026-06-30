@@ -213,10 +213,10 @@ def run_in_pty(
                 except OSError:
                     break
             if not seen_eof and proc.poll() is not None:
-                # Process exited — give it 2 more seconds for buffered output
-                flush_deadline = _time_module.time() + 2
+                # Process exited — flush buffered PTY output (up to 15 s)
+                flush_deadline = _time_module.time() + 15
                 while _time_module.time() < flush_deadline:
-                    r2, _, _ = select.select([master_fd], [], [], 0.2)
+                    r2, _, _ = select.select([master_fd], [], [], 0.5)
                     if r2:
                         try:
                             chunk = os.read(master_fd, 65536)
@@ -226,8 +226,9 @@ def run_in_pty(
                             output_chunks.append(chunk)
                         except OSError:
                             break
-                    elif not r2:
-                        break  # nothing more to read
+                    if not r2 and proc.poll() is not None:
+                        # No data + process still dead → done flushing
+                        break
                 break
 
         try:
