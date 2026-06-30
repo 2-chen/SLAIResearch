@@ -737,6 +737,14 @@ def _run_stage_with_review(
 
         # Review failed — check retries
         if sm.stage_review_retries_exhausted(state, stage):
+            # If score is critically low (< 2.0), the output is fundamentally wrong
+            # (e.g. wrong repo, empty results).  Proceeding would poison downstream.
+            if verdict.score < 2.0 and not verdict.passed:
+                msg = (f"Stage '{stage.value}' review score {verdict.score:.1f} "
+                       f"is critically low after {max_retries} retries — "
+                       f"output is unusable. Aborting pipeline.")
+                logger.error(msg)
+                raise RuntimeError(msg)
             logger.warning(
                 "Stage '%s' exceeded max review retries (%d). Proceeding anyway.",
                 stage.value, max_retries,
@@ -858,35 +866,24 @@ def _do_baseline_fetching(sm: StateManager, state: ResearchState, retry_feedback
         logger.warning("Could not parse literature for baselines: %s", e)
         papers = []
 
-    # Extract baseline method names from hypothesis output
+    # Extract baseline method names: prefer selected hypothesis, fall back to all
     method_names: list[str] = []
     hypo_file = Path(state.hypothesis_dir) / "hypothesis_output.json"
     if hypo_file.exists():
         try:
             import json
             hypo = json.loads(hypo_file.read_text())
-            for h in hypo.get("hypotheses", []):
-                if isinstance(h, dict):
-                    # Primary fields
-                    for key in ("baselines", "baseline_methods"):
-                        val = h.get(key, [])
-                        if isinstance(val, list):
-                            method_names.extend([v for v in val if isinstance(v, str)])
-                    # Fallback: extract from method_outline and key_references
-                    if not method_names:
-                        method_names.extend(
-                            _extract_baselines_from_text(h.get("method_outline", ""))
-                        )
-                        method_names.extend(
-                            _extract_baselines_from_text(h.get("rationale", ""))
-                        )
-                        refs = h.get("key_references", [])
-                        if isinstance(refs, list):
-                            for ref in refs:
-                                if isinstance(ref, dict):
-                                    method_names.extend(
-                                        _extract_baselines_from_text(ref.get("title", ""))
-                                    )
+            hypotheses = hypo.get("hypotheses", [])
+            # Sort by score descending, prefer selected hypothesis as tiebreaker
+            selected_id = hypo.get("selected_hypothesis", "")
+            hypotheses.sort(key=lambda h: (
+                0 if h.get("id", "") == selected_id else 1,
+                -(h.get("score", 0) if isinstance(h, dict) else 0),
+            ))
+            # Extract baseline method names from the best hypothesis via LLM
+            best = hypotheses[0] if hypotheses else {}
+            if isinstance(best, dict):
+                method_names = _extract_baselines_via_llm(best, state.topic)
         except Exception:
             pass
 
@@ -2112,6 +2109,66 @@ def _render_template_file(template_path: str, **kwargs: str) -> str:
         template = template.replace("${" + key + "}", value)
     logger.info("Rendered template: %d chars", len(template))
     return template
+
+
+def _extract_baselines_via_llm(best_hypothesis: dict, topic: str) -> list[str]:
+    """Use Claude to intelligently extract baseline method names from a hypothesis.
+
+    Unlike regex-based ``_extract_baselines_from_text``, this understands the
+    research context and returns method names that actually make sense for the
+    topic (e.g. FlashAttention, Linformer for long-sequence attention)."""
+    import json as _json
+    # Build summary from ALL fields in the hypothesis (dynamic, not hardcoded)
+    fields = []
+    for k, v in best_hypothesis.items():
+        if k.startswith("_") or k in ("id", "score", "selected"):
+            continue
+        if isinstance(v, str) and v.strip():
+            fields.append(f"## {k}\n{v}")
+        elif isinstance(v, list) and v:
+            # List of strings or list of dicts with title
+            items = []
+            for item in v:
+                if isinstance(item, str):
+                    items.append(f"- {item}")
+                elif isinstance(item, dict):
+                    title = item.get("title") or item.get("name") or _json.dumps(item)[:200]
+                    items.append(f"- {title}")
+            if items:
+                fields.append(f"## {k}\n" + "\n".join(items[:15]))
+        elif isinstance(v, dict) and v:
+            fields.append(f"## {k}\n{_json.dumps(v, ensure_ascii=False)[:2000]}")
+
+    hypothesis_text = "\n\n".join(fields)
+    if not hypothesis_text.strip():
+        return []
+
+    prompt = (
+        f"Given this research hypothesis about \"{topic}\", identify the baseline "
+        f"methods / models / frameworks that should be compared against.\n\n"
+        f"{hypothesis_text[:6000]}\n\n"
+        f"Output ONLY a JSON array of method name strings. Include well-known "
+        f"names (FlashAttention, Linformer, Longformer, Reformer, Performer, "
+        f"BigBird, Mamba, RetNet, etc.) plus any methods explicitly mentioned in "
+        f"the hypothesis. No explanation, just the JSON array.\n"
+        f'Example: ["FlashAttention", "Linformer", "Reformer"]'
+    )
+    try:
+        rc, raw = run_in_pty(
+            [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL],
+            prompt, timeout=120, cwd=str(PROJECT_ROOT),
+            env=_claude_subprocess_env(),
+        )
+        raw = raw or ""
+        # Extract JSON array
+        m = re.search(r'\[.*?\]', raw, re.DOTALL)
+        if m:
+            names = _json.loads(m.group(0))
+            if isinstance(names, list):
+                return [n for n in names if isinstance(n, str) and len(n) > 1]
+    except Exception as e:
+        logger.warning("LLM baseline extraction failed: %s", e)
+    return []
 
 
 def _extract_baselines_from_text(text: str) -> list[str]:
