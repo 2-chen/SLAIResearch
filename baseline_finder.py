@@ -16,6 +16,7 @@ Usage:
 
 from __future__ import annotations
 
+import os
 import hashlib
 import json
 import logging
@@ -70,6 +71,9 @@ class BaselineFinder:
 
     GITHUB_SEARCH_URL = "https://api.github.com/search/repositories"
 
+    # Known GitHub mirrors (tried in order when direct clone fails)
+    _GIT_MIRRORS: list[str] = []
+
     def __init__(
         self,
         cache_dir: str | Path = "",
@@ -87,6 +91,16 @@ class BaselineFinder:
         self.clone_timeout = clone_timeout
         self.github_token = github_token or self._load_github_token()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # Build mirror list: env override + built-in fallbacks
+        custom_mirror = os.environ.get("GIT_MIRROR_PREFIX", "")
+        self._GIT_MIRRORS = []
+        if custom_mirror:
+            self._GIT_MIRRORS.append(custom_mirror)
+        self._GIT_MIRRORS.extend([
+            "https://gitclone.com/github.com",
+            "https://ghproxy.com/https://github.com",
+        ])
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -285,25 +299,34 @@ class BaselineFinder:
     # ------------------------------------------------------------------
 
     def _clone_repo(self, url: str, target_dir: Path) -> bool:
-        """Shallow clone a single branch, with timeout."""
-        try:
-            subprocess.run(
-                [
-                    "git", "clone", "--depth", "1", "--single-branch",
-                    "--no-tags", url, str(target_dir),
-                ],
-                capture_output=True, text=True,
-                timeout=self.clone_timeout,
-                check=True,
-            )
-            logger.info("Cloned %s → %s", url, target_dir)
-            return True
-        except subprocess.TimeoutExpired:
-            logger.warning("Clone timed out (%ss): %s", self.clone_timeout, url)
-        except subprocess.CalledProcessError as e:
-            logger.warning("Clone failed for %s: %s", url, e.stderr[:200])
-        except Exception as e:
-            logger.warning("Clone error for %s: %s", url, e)
+        """Shallow clone a single branch, with mirror fallback.
+
+        Tries direct clone first, then known GitHub mirrors.  Set
+        ``GIT_MIRROR_PREFIX`` env var to use a custom mirror (must end with
+        ``github.com``, e.g. ``https://gitee.com/mirrors/github.com``)."""
+        urls_to_try = [url]
+        if "github.com" in url:
+            for mirror in self._GIT_MIRRORS:
+                urls_to_try.append(url.replace("https://github.com", mirror))
+        for attempt_url in urls_to_try:
+            try:
+                subprocess.run(
+                    [
+                        "git", "clone", "--depth", "1", "--single-branch",
+                        "--no-tags", attempt_url, str(target_dir),
+                    ],
+                    capture_output=True, text=True,
+                    timeout=self.clone_timeout,
+                    check=True,
+                )
+                logger.info("Cloned %s → %s", attempt_url, target_dir)
+                return True
+            except subprocess.TimeoutExpired:
+                logger.warning("Clone timed out (%ss): %s", self.clone_timeout, attempt_url)
+            except subprocess.CalledProcessError as e:
+                logger.warning("Clone failed for %s: %s", attempt_url, e.stderr[:200])
+            except Exception as e:
+                logger.warning("Clone error for %s: %s", attempt_url, e)
         return False
 
     # ------------------------------------------------------------------

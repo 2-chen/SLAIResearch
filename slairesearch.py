@@ -480,6 +480,19 @@ def _run_pipeline(sm: StateManager, state: ResearchState) -> None:
                 progress.pipeline_complete(False, f"Failed at poll: {exc}")
                 return
 
+            # Detect stale review — same content as previous iteration.
+            # Happens when resubmit fails (429) and poll reuses an old token.
+            prev_reviews = sorted(Path(state.review_dir).glob("review_iter*.md"))
+            if len(prev_reviews) >= 2:
+                if prev_reviews[-1].read_text() == prev_reviews[-2].read_text():
+                    print(f"\n  [yellow]![/yellow] Review unchanged from iteration "
+                          f"{state.iteration - 1} — reviewer did not re-evaluate "
+                          f"(likely stale token). Stopping.")
+                    state.stage = Stage.DONE.value
+                    sm.save(state)
+                    progress.pipeline_complete(True, "Review unchanged — stopping")
+                    return
+
             if verdict in ("accept", "weak accept"):
                 print(f"\n{'='*60}")
                 print(f"  TARGET VERDICT REACHED: {verdict}")
@@ -1413,6 +1426,18 @@ def _do_poll(sm: StateManager, state: ResearchState) -> tuple[ResearchState, str
     md_path = Path(state.review_dir) / f"review_iter{state.iteration:02d}.md"
     md_path.write_text(review_md)
 
+    # Also save focused version with only actionable sections
+    from paperreview_api import extract_review_key_feedback
+    feedback_md, found_map = extract_review_key_feedback(review_data)
+    fb_path = Path(state.review_dir) / f"review_feedback{state.iteration:02d}.md"
+    fb_path.write_text(feedback_md)
+    found_summary = ", ".join(k for k, v in found_map.items() if v) or "none"
+    missing_summary = ", ".join(k for k, v in found_map.items() if not v) or "none"
+    logger.info(
+        "Review feedback saved (%d chars) → %s | found: [%s] | missing: [%s]",
+        len(feedback_md), fb_path, found_summary, missing_summary,
+    )
+
     verdict = extract_verdict(review_data)
     state.reviews[-1]["verdict"] = verdict
     state.reviews[-1]["review_md_path"] = str(md_path)
@@ -1447,9 +1472,15 @@ def _do_poll(sm: StateManager, state: ResearchState) -> tuple[ResearchState, str
 
 def _do_revise(sm: StateManager, state: ResearchState, retry_feedback: str = "") -> ResearchState:
     """Revise paper using the RevisionEngine with per-section loop and grounding protection."""
-    reviews = []
-    for rf in sorted(Path(state.review_dir).glob("review_iter*.md")):
+    # Prefer focused feedback (Weaknesses / Detailed Comments / Questions / Assessment)
+    # over full review markdown — gives the revision engine concentrated, actionable input
+    reviews: list[str] = []
+    for rf in sorted(Path(state.review_dir).glob("review_feedback*.md")):
         reviews.append(rf.read_text())
+    if not reviews:
+        # Fallback to full review if no focused feedback exists
+        for rf in sorted(Path(state.review_dir).glob("review_iter*.md")):
+            reviews.append(rf.read_text())
     combined = "\n\n---\n\n".join(reviews[-3:])
 
     # Find the paper tex

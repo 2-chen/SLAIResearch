@@ -983,7 +983,7 @@ class RevisionEngine:
             - Method: {method_name}
 
             ## Reviewer Feedback (from prior review)
-            {review_feedback[:3000]}
+            {review_feedback[:8000]}
 
             ## Instructions
             Score this section 1-10 using this rubric:
@@ -1007,6 +1007,8 @@ class RevisionEngine:
             raw = self._call_llm(prompt, json_mode=True)
             data = self._parse_json(raw)
             if not data:
+                logger.warning("_score_section '%s': LLM returned no parseable JSON (raw=%s)",
+                              heading, raw[:200] if raw else "(empty)")
                 return {"score": 5.0, "issues": [], "suggestions": [], "strengths": []}
 
             score = data.get("score", 5)

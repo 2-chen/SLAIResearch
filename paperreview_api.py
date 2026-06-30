@@ -318,6 +318,75 @@ def _walk_for_verdict(obj, depth: int = 0) -> str | None:
     return None
 
 
+def extract_review_key_feedback(review: dict) -> tuple[str, dict[str, bool]]:
+    """Extract actionable review sections for revision guidance.
+
+    Returns ``(feedback_md, found_map)`` where *feedback_md* is a focused
+    Markdown string and *found_map* records which sections were present.
+
+    Sections extracted (in priority order):
+    - Weaknesses
+    - Detailed Comments
+    - Questions for Authors
+    - Overall Assessment
+
+    If all four sections are missing, *feedback_md* falls back to the full
+    ``review_to_markdown()`` output.
+    """
+    sections = review.get("sections", {})
+    source = {**review, **sections}
+
+    section_map = [
+        ("weaknesses", "Weaknesses"),
+        ("detailed_comments", "Detailed Comments"),
+        ("questions", "Questions for Authors"),
+        ("overall_assessment", "Overall Assessment"),
+    ]
+
+    found: dict[str, bool] = {}
+    parts: list[str] = []
+
+    for key, heading in section_map:
+        content = source.get(key)
+        if not content:
+            found[key] = False
+            continue
+
+        # Check if content is non-empty
+        has_content = False
+        if isinstance(content, str) and content.strip():
+            has_content = True
+        elif isinstance(content, (list, dict)) and len(content) > 0:
+            has_content = True
+
+        found[key] = has_content
+        if not has_content:
+            continue
+
+        parts.append(f"## {heading}")
+        if isinstance(content, dict):
+            for k, v in content.items():
+                parts.append(f"- **{k.replace('_', ' ').title()}**: {v}")
+        elif isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            for item in content:
+                parts.append(f"- {item}")
+        parts.append("")
+
+    any_found = any(found.values())
+
+    if any_found:
+        return "\n".join(parts), found
+
+    # Fallback: use full review
+    logger.warning(
+        "No key sections (weaknesses/detailed_comments/questions/overall_assessment) "
+        "found in review — falling back to full review content"
+    )
+    return review_to_markdown(review), found
+
+
 def review_to_markdown(review: dict) -> str:
     """Convert review JSON to a clean Markdown string."""
     title = review.get("title", "Untitled")
