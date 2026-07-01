@@ -306,35 +306,44 @@ class BaselineFinder:
     # Clone
     # ------------------------------------------------------------------
 
-    def _clone_repo(self, url: str, target_dir: Path) -> bool:
-        """Shallow clone a single branch, with mirror fallback.
+    @staticmethod
+    def _is_valid_clone(target_dir: Path) -> bool:
+        """Check that a cloned dir has real source files, not just .git."""
+        return target_dir.exists() and any(
+            p.name != ".git" for p in target_dir.iterdir()
+        )
 
-        Tries direct clone first, then known GitHub mirrors.  Set
-        ``GIT_MIRROR_PREFIX`` env var to use a custom mirror (must end with
-        ``github.com``, e.g. ``https://gitee.com/mirrors/github.com``)."""
+    def _clone_repo(self, url: str, target_dir: Path) -> bool:
+        """Shallow clone with mirror fallback + integrity check.
+
+        Cleans partial clones before each retry.  Verifies the result has
+        source files (not just a bare .git from a timed-out clone)."""
         urls_to_try = [url]
         if "github.com" in url:
             for mirror in self._GIT_MIRRORS:
                 urls_to_try.append(url.replace("https://github.com", mirror))
+        import shutil
         for attempt_url in urls_to_try:
+            if target_dir.exists():
+                shutil.rmtree(target_dir, ignore_errors=True)
             try:
                 subprocess.run(
-                    [
-                        "git", "clone", "--depth", "1", "--single-branch",
-                        "--no-tags", attempt_url, str(target_dir),
-                    ],
-                    capture_output=True, text=True,
-                    timeout=self.clone_timeout,
+                    ["git", "clone", "--depth", "1", "--single-branch",
+                     "--no-tags", attempt_url, str(target_dir)],
+                    capture_output=True, text=True, timeout=self.clone_timeout,
                     check=True,
+                    env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
                 )
-                logger.info("Cloned %s → %s", attempt_url, target_dir)
-                return True
+                if self._is_valid_clone(target_dir):
+                    logger.info("Cloned %s → %s", attempt_url, target_dir)
+                    return True
+                else:
+                    logger.warning("Clone incomplete (no source files): %s", attempt_url)
+                    shutil.rmtree(target_dir, ignore_errors=True)
             except subprocess.TimeoutExpired:
                 logger.warning("Clone timed out (%ss): %s", self.clone_timeout, attempt_url)
             except subprocess.CalledProcessError as e:
-                logger.warning("Clone failed for %s: %s", attempt_url, e.stderr[:200])
-            except Exception as e:
-                logger.warning("Clone error for %s: %s", attempt_url, e)
+                logger.warning("Clone failed: %s — %s", attempt_url, e.stderr[:150])
         return False
 
     # ------------------------------------------------------------------
