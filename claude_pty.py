@@ -187,6 +187,9 @@ def run_in_pty(
         attrs = termios.tcgetattr(slave_fd)
         attrs[3] = attrs[3] & ~termios.ECHO
         termios.tcsetattr(slave_fd, termios.TCSANOW, attrs)
+        # Set terminal size — some programs (including Node.js/Claude) hang
+        # or misbehave with the default 0×0 PTY window
+        _set_winsize(slave_fd, rows=50, cols=200)
     except termios.error:
         pass
 
@@ -214,7 +217,7 @@ def run_in_pty(
     try:
         proc = subprocess.Popen(
             full_cmd,
-            stdin=subprocess.DEVNULL,
+            stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
             cwd=cwd,
