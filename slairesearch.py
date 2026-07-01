@@ -2076,6 +2076,32 @@ Please explicitly acknowledge how you've addressed each issue above.
             if rc != 0 and not output.strip():
                 raise RuntimeError(f"Claude exited {rc} with no output (prompt saved to {prompt_file})")
 
+            # PTY pseudo-terminal can lose buffered output when the child
+            # process exits before `os.read()` drains the master fd.  This
+            # is a known race condition in claude_pty.py — the process
+            # finished successfully (rc=0) but stdout was not captured.
+            # Retry immediately instead of waiting for the stage review loop.
+            if rc == 0 and not output.strip():
+                if attempt < 2:
+                    logger.warning(
+                        "Claude exited 0 but stdout is empty (PTY buffer flush "
+                        "race).  prompt=%d chars, cwd=%s.  Retrying immediately "
+                        "(attempt %d/%d) …",
+                        len(prompt), str(state.work_dir), attempt + 1, max_retries + 1,
+                    )
+                    continue
+                logger.error(
+                    "Claude returned empty output on all %d attempts.  "
+                    "Prompt saved to %s for manual debugging.  "
+                    "Possible causes: (1) PTY flush race on slow I/O, "
+                    "(2) claude -p produced only stderr, (3) prompt or API issue.",
+                    attempt + 1, prompt_file,
+                )
+                output = (
+                    f"[Empty output from Claude after {attempt + 1} attempts. "
+                    f"Prompt saved to {prompt_file}]"
+                )
+
             output_file.write_text(output)
             logger.info("Claude output → %s (%d chars)", output_file, len(output))
             return sm.complete_stage(state, stage, {

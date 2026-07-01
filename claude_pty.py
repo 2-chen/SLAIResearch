@@ -167,24 +167,45 @@ def run_in_pty(
     cwd: str = ".",
     env: dict | None = None,
 ) -> tuple[int, str]:
-    """Run *cmd* in a PTY, feed *prompt* via stdin, return (returncode, stdout).
+    """Run *cmd* in a PTY with a background reader thread.
 
-    Prompt is passed as the final positional argument (``-p "prompt"`` style),
-    stdin is /dev/null.  The PTY makes the child process believe it has a real
-    terminal, avoiding TTY-detection behaviours that cause hangs in pipe mode.
+    Uses a dedicated thread to continuously drain the PTY master fd.  This
+    avoids the kernel PTY buffer (64 KB) overflowing when the child produces
+    high-volume output (e.g. Ascend CANN/HCCL logs), and eliminates the
+    select()-based polling gap that causes \"empty output (PTY buffer flush
+    race)\" on slow / bursty I/O.
     """
+    import threading
+    import io as _io
+
     full_cmd = list(cmd) + [prompt]
     if env is None:
         env = {}
 
     master_fd, slave_fd = pty.openpty()
-    # Disable echo so prompt text doesn't appear in output
     try:
         attrs = termios.tcgetattr(slave_fd)
         attrs[3] = attrs[3] & ~termios.ECHO
         termios.tcsetattr(slave_fd, termios.TCSANOW, attrs)
     except termios.error:
         pass
+
+    out_buf = _io.BytesIO()
+    read_done = threading.Event()
+    read_error: list[Exception | None] = [None]
+
+    def _reader() -> None:
+        """Continuously drain master_fd → out_buf until EOF or error."""
+        try:
+            while True:
+                chunk = os.read(master_fd, 65536)
+                if not chunk:
+                    break
+                out_buf.write(chunk)
+        except OSError as e:
+            read_error[0] = e
+        finally:
+            read_done.set()
 
     try:
         proc = subprocess.Popen(
@@ -198,46 +219,40 @@ def run_in_pty(
         )
         os.close(slave_fd)
 
-        output_chunks: list[bytes] = []
-        deadline = _time_module.time() + timeout
-        seen_eof = False
-        while _time_module.time() < deadline:
-            r, _, _ = select.select([master_fd], [], [], 1.0)
-            if r:
-                try:
-                    chunk = os.read(master_fd, 65536)
-                    if not chunk:
-                        seen_eof = True
-                        break  # PTY master closed
-                    output_chunks.append(chunk)
-                except OSError:
-                    break
-            if not seen_eof and proc.poll() is not None:
-                # Process exited — flush buffered PTY output (up to 15 s)
-                flush_deadline = _time_module.time() + 15
-                while _time_module.time() < flush_deadline:
-                    r2, _, _ = select.select([master_fd], [], [], 0.5)
-                    if r2:
-                        try:
-                            chunk = os.read(master_fd, 65536)
-                            if not chunk:
-                                seen_eof = True
-                                break
-                            output_chunks.append(chunk)
-                        except OSError:
-                            break
-                    if not r2 and proc.poll() is not None:
-                        # No data + process still dead → done flushing
-                        break
-                break
+        reader = threading.Thread(target=_reader, daemon=True)
+        reader.start()
 
+        # Wait for process OR timeout
         try:
-            proc.wait(timeout=5)
+            proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            # Process still flushing — return what we have
-            pass
-        stdout = b"".join(output_chunks).decode("utf-8", errors="replace")
-        return proc.returncode or 0, stdout
+            pass  # Timeout — kill + collect partial output below
+
+        # Give the reader thread up to 30 s to drain remaining data
+        read_done.wait(timeout=30)
+
+        # If process is still alive after timeout, kill it
+        if proc.poll() is None:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+
+        stdout_bytes = out_buf.getvalue()
+        stdout = stdout_bytes.decode("utf-8", errors="replace")
+        rc = proc.returncode or 0
+        if read_error[0] is not None:
+            logger.warning("PTY reader thread error: %s", read_error[0])
+        if not stdout_bytes:
+            logger.warning(
+                "PTY captured 0 bytes from claude (rc=%d, timeout=%ds). "
+                "Possible causes: (1) process exited before writing, "
+                "(2) PTY slave closed early, (3) CANN/HCCL log flood "
+                "if running on Ascend.",
+                rc, timeout,
+            )
+        return rc, stdout
     finally:
         try:
             os.close(master_fd)
