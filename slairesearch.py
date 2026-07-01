@@ -818,10 +818,62 @@ def _do_literature_search(sm: StateManager, state: ResearchState, retry_feedback
 
 
 def _do_hypothesis_generation(sm: StateManager, state: ResearchState, retry_feedback: str = "") -> ResearchState:
-    """Run ReAct-based hypothesis generation using hypothesis_engine.py."""
+    """Run ReAct-based hypothesis generation using hypothesis_engine.py.
+
+    On first run the full ReAct engine runs.  On retry with feedback, the
+    existing output is patched via Claude Code to address specific reviewer
+    issues — this is faster and more targeted than re-running the full engine."""
     from hypothesis_engine import HypothesisEngine
     from config import HYPOTHESIS_MAX_REACT_ROUNDS, HYPOTHESIS_TOP_K_PDFS, HYPOTHESIS_MAX_PAPERS
 
+    hypo_file = Path(state.hypothesis_dir) / "hypothesis_output.json"
+
+    # ── Retry with feedback: patch existing output via Claude ──
+    if retry_feedback and hypo_file.exists():
+        logger.info("Patching hypothesis output with review feedback via Claude …")
+        existing = hypo_file.read_text()
+        prompt = (
+            f"You are fixing a hypothesis generation output based on reviewer feedback.\n\n"
+            f"## Current hypothesis_output.json\n```json\n{existing[:15000]}\n```\n\n"
+            f"## Reviewer Feedback (MUST address every issue)\n{retry_feedback}\n\n"
+            f"## Instructions\n"
+            f"1. Fix ALL issues identified in the feedback\n"
+            f"2. If a hypothesis is truncated, complete it based on the topic context\n"
+            f"3. If papers_analyzed count is too low, add more paper analyses from the "
+            f"literature_review.md in {state.literature_dir}\n"
+            f"4. Keep valid hypotheses unchanged — only fix broken/incomplete ones\n"
+            f"5. Output the COMPLETE fixed JSON (same structure), no extra text\n"
+            f"6. Ensure every hypothesis has: title, description, method_outline, "
+            f"rationale, key_references, expected_outcome, feasibility, and score\n"
+            f"\nResearch topic: {state.topic}\n"
+        )
+        # Also include literature for papers_analyzed fix
+        lit = _read_or(state.literature_dir, "literature_review.md")
+        if lit:
+            prompt += f"\n## Literature Review (for supplementing paper analyses)\n{lit[:10000]}\n"
+
+        cmd = [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL,
+               "--max-turns", "5"]
+        rc, raw = run_in_pty(cmd, prompt, timeout=600,
+                             cwd=str(state.work_dir), env=_claude_subprocess_env())
+        raw = raw or ""
+        # Extract JSON
+        m = re.search(r'(\{.*\})', raw, re.DOTALL)
+        if m:
+            fixed = m.group(1).strip()
+            try:
+                json.loads(fixed)  # Validate JSON
+                hypo_file.write_text(fixed)
+                logger.info("Hypothesis output patched (%d chars → %d chars)",
+                            len(existing), len(fixed))
+            except json.JSONDecodeError:
+                logger.warning("Claude returned invalid JSON for hypothesis fix")
+        return sm.complete_stage(state, Stage.HYPOTHESIS_GENERATION, {
+            "hypotheses_count": len(json.loads(hypo_file.read_text()).get("hypotheses", [])),
+            "patched": True,
+        })
+
+    # ── First run: full ReAct engine ──
     logger.info("Starting hypothesis generation (ReAct engine) ...")
     engine = HypothesisEngine(
         topic=state.topic,
@@ -831,14 +883,6 @@ def _do_hypothesis_generation(sm: StateManager, state: ResearchState, retry_feed
         top_k_pdfs=HYPOTHESIS_TOP_K_PDFS,
         max_papers_per_search=HYPOTHESIS_MAX_PAPERS,
     )
-
-    # If retrying with feedback, inject it into the engine state
-    if retry_feedback:
-        react_state = engine.state
-        react_state.add_facts([f"[Previous review feedback] {retry_feedback}"])
-        # Mark previous hypotheses as needing revision
-        (Path(state.hypothesis_dir) / "review_feedback.md").write_text(retry_feedback)
-
     result = engine.run()
     logger.info("Hypothesis generation complete. %d hypotheses, %d papers analyzed.",
                 len(result.get("hypotheses", [])), result.get("total_papers_analyzed", 0))
