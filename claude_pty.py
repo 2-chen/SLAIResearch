@@ -195,22 +195,26 @@ def run_in_pty(
     read_error: list[Exception | None] = [None]
 
     def _reader() -> None:
-        """Continuously drain master_fd → out_buf until EOF or error."""
+        """Continuously drain master_fd → out_buf until EOF or PTY closes."""
         try:
             while True:
-                chunk = os.read(master_fd, 65536)
-                if not chunk:
+                try:
+                    chunk = os.read(master_fd, 65536)
+                    if not chunk:
+                        break  # EOF — PTY master closed cleanly
+                    out_buf.write(chunk)
+                except OSError as e:
+                    if e.errno == errno.EIO:
+                        break  # Slave closed (child exited) — normal
+                    read_error[0] = e
                     break
-                out_buf.write(chunk)
-        except OSError as e:
-            read_error[0] = e
         finally:
             read_done.set()
 
     try:
         proc = subprocess.Popen(
             full_cmd,
-            stdin=slave_fd,
+            stdin=subprocess.DEVNULL,
             stdout=slave_fd,
             stderr=slave_fd,
             cwd=cwd,
