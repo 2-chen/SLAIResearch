@@ -854,9 +854,11 @@ def _do_hypothesis_generation(sm: StateManager, state: ResearchState, retry_feed
 
         cmd = [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL,
                "--max-turns", "5"]
-        rc, raw = run_in_pty(cmd, prompt, timeout=600,
-                             cwd=str(state.work_dir), env=_claude_subprocess_env())
-        raw = raw or ""
+        result = subprocess.run(
+            cmd + [prompt], capture_output=True, text=True, timeout=600,
+            cwd=str(state.work_dir), env=_claude_subprocess_env(),
+        )
+        raw = result.stdout or ""
         # Extract JSON
         m = re.search(r'(\{.*\})', raw, re.DOTALL)
         if m:
@@ -1199,10 +1201,11 @@ and fix the shell script. Only make minimal, targeted fixes — do NOT rewrite t
     try:
         cmd = [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL,
                "--max-turns", "5"]
-        rc, output = run_in_pty(cmd, prompt, timeout=300,
-                                cwd=str(state.work_dir),
-                                env=_claude_subprocess_env())
-        output = output or ""
+        result = subprocess.run(
+            cmd + [prompt], capture_output=True, text=True, timeout=300,
+            cwd=str(state.work_dir), env=_claude_subprocess_env(),
+        )
+        output = result.stdout or ""
 
         # Extract the fixed bash script
         m = re.search(r'```bash\s*\n(.*?)```', output, re.DOTALL)
@@ -2057,8 +2060,10 @@ Please explicitly acknowledge how you've addressed each issue above.
 
     # Large prompts go via stdin — avoids OS argv limits and CLI arg-parsing issues.
     # --max-turns: prevents infinite agent loops during tool-heavy stages.
+    # Use PIPE mode (not PTY) for text-heavy stages.  PTY is only needed
+    # for experiment scientist which issues heavy tool calls.
     cmd = [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL,
-           "--max-turns", "30"]
+           "--max-turns", "30", prompt]
 
     last_error = ""
     for attempt in range(max_retries + 1):
@@ -2069,37 +2074,21 @@ Please explicitly acknowledge how you've addressed each issue above.
         )
 
         try:
-            rc, output = run_in_pty(
-                cmd, prompt, _CLAUDE_TIMEOUT,
-                str(state.work_dir), _claude_subprocess_env(),
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=_CLAUDE_TIMEOUT,
+                cwd=str(state.work_dir),
+                env=_claude_subprocess_env(),
             )
-            if rc != 0 and not output.strip():
-                raise RuntimeError(f"Claude exited {rc} with no output (prompt saved to {prompt_file})")
-
-            # PTY pseudo-terminal can lose buffered output when the child
-            # process exits before `os.read()` drains the master fd.  This
-            # is a known race condition in claude_pty.py — the process
-            # finished successfully (rc=0) but stdout was not captured.
-            # Retry immediately instead of waiting for the stage review loop.
-            if rc == 0 and not output.strip():
-                if attempt < 2:
-                    logger.warning(
-                        "Claude exited 0 but stdout is empty (PTY buffer flush "
-                        "race).  prompt=%d chars, cwd=%s.  Retrying immediately "
-                        "(attempt %d/%d) …",
-                        len(prompt), str(state.work_dir), attempt + 1, max_retries + 1,
-                    )
-                    continue
-                logger.error(
-                    "Claude returned empty output on all %d attempts.  "
-                    "Prompt saved to %s for manual debugging.  "
-                    "Possible causes: (1) PTY flush race on slow I/O, "
-                    "(2) claude -p produced only stderr, (3) prompt or API issue.",
-                    attempt + 1, prompt_file,
+            output = result.stdout or ""
+            if result.returncode != 0 and not output.strip():
+                error_msg = (
+                    result.stderr[:300] if result.stderr
+                    else f"exit code {result.returncode}"
                 )
-                output = (
-                    f"[Empty output from Claude after {attempt + 1} attempts. "
-                    f"Prompt saved to {prompt_file}]"
+                raise subprocess.CalledProcessError(
+                    result.returncode, cmd,
+                    output=output, stderr=result.stderr,
                 )
 
             output_file.write_text(output)
@@ -2118,8 +2107,15 @@ Please explicitly acknowledge how you've addressed each issue above.
 
         except subprocess.TimeoutExpired:
             last_error = f"Timeout after {_CLAUDE_TIMEOUT}s"
-            logger.warning("Claude call timed out (attempt %d/%d): (no stderr — PTY mode)",
-                          attempt + 1, max_retries + 1)
+            logger.warning("Claude call timed out (attempt %d/%d): %s",
+                          attempt + 1, max_retries + 1, last_error)
+
+        except subprocess.CalledProcessError as exc:
+            stderr_info = exc.stderr[:300] if exc.stderr else "no stderr"
+            stdout_info = exc.output[:500] if exc.output else "no stdout"
+            last_error = f"Exit {exc.returncode}: stderr={stderr_info} | stdout={stdout_info}"
+            logger.warning("Claude call failed (attempt %d/%d): %s",
+                          attempt + 1, max_retries + 1, last_error)
 
         except Exception as exc:
             last_error = str(exc)
@@ -2224,12 +2220,13 @@ def _extract_baselines_via_llm(best_hypothesis: dict, topic: str) -> list[str]:
         f'Example: ["FlashAttention", "Linformer", "Reformer"]'
     )
     try:
-        rc, raw = run_in_pty(
-            [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL],
-            prompt, timeout=120, cwd=str(PROJECT_ROOT),
-            env=_claude_subprocess_env(),
+        result = subprocess.run(
+            [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL,
+             prompt],
+            capture_output=True, text=True, timeout=120,
+            cwd=str(PROJECT_ROOT), env=_claude_subprocess_env(),
         )
-        raw = raw or ""
+        raw = result.stdout or ""
         # Extract JSON array
         m = re.search(r'\[.*?\]', raw, re.DOTALL)
         if m:

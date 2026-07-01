@@ -39,7 +39,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from config import CLAUDE_CMD, CLAUDE_MODEL
-from claude_pty import run_in_pty
 
 logger = logging.getLogger("stage_reviewer")
 
@@ -305,12 +304,14 @@ class StageReviewer:
         ]
 
         try:
-            rc, raw = run_in_pty(cmd, prompt, timeout=300,
-                                 cwd=str(PROJECT_ROOT), env={**os.environ})
-            raw = raw or ""
-            if rc != 0 and not raw:
+            result = subprocess.run(
+                cmd + [prompt], capture_output=True, text=True,
+                timeout=300, cwd=str(PROJECT_ROOT), env={**os.environ},
+            )
+            raw = result.stdout or ""
+            if result.returncode != 0 and not raw:
                 # LLM call failed — treat as "needs revision" rather than crashing
-                logger.warning("LLM review call failed: rc=%d (PTY mode — no stderr)", rc)
+                logger.warning("LLM review call failed: %s", result.stderr[:300])
                 return ReviewVerdict(
                     stage=stage_name,
                     passed=False,
