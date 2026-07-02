@@ -106,6 +106,33 @@ BASELINE_MAX_REPOS = int(os.environ.get("SLAIRESEARCH_BASELINE_MAX_REPOS", "5"))
 BASELINE_CACHE_SIZE_MB = int(os.environ.get("SLAIRESEARCH_BASELINE_CACHE_MB", "500"))
 BASELINE_CLONE_TIMEOUT = int(os.environ.get("SLAIRESEARCH_BASELINE_CLONE_TIMEOUT", "60"))
 
+# Comma-separated GitHub mirror URLs (tried in order).  Used as a PREFIX:
+#   "https://gitclone.com/github.com" + "/user/repo" = correct URL
+#   "https://ghproxy.com/https://github.com" + "/user/repo" = correct URL
+# Built-in fallbacks are tried after these.
+_BASELINE_GIT_MIRRORS_ENV = os.environ.get("SLAIRESEARCH_GIT_MIRRORS", "")
+BASELINE_GIT_MIRRORS = [
+    m.strip() for m in _BASELINE_GIT_MIRRORS_ENV.split(",") if m.strip()
+] if _BASELINE_GIT_MIRRORS_ENV else [
+    # ── 国内常用 GitHub 加速镜像（无代理环境自动启用）──
+    "https://gitclone.com/github.com",
+    "https://ghproxy.com/https://github.com",
+    "https://mirror.ghproxy.com/https://github.com",
+    "https://gh.con.sh/https://github.com",
+    "https://hub.yzuu.cf/https://github.com",
+    "https://gh.api.99988866.xyz/https://github.com",
+    "https://kgithub.com",
+    "https://git.homegu.com",
+]
+
+# When true, try mirrors BEFORE direct GitHub clone (for networks where
+# direct access is blocked, e.g. NPU/昇腾 environments without proxy).
+BASELINE_MIRROR_FIRST = os.environ.get(
+    "SLAIRESEARCH_GIT_MIRROR_FIRST", "",
+).lower() in ("1", "true", "yes") or os.environ.get(
+    "SLAIRESEARCH_NPU_ENABLED", "true",
+).lower() in ("1", "true", "yes")
+
 GITHUB_API_TOKEN = os.environ.get("GITHUB_API_TOKEN", "")
 
 # ---------------------------------------------------------------------------

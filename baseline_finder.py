@@ -21,6 +21,7 @@ import hashlib
 import json
 import logging
 import re
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -92,15 +93,27 @@ class BaselineFinder:
         self.github_token = github_token or self._load_github_token()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # Build mirror list: env override + built-in fallbacks
+        # ── Mirror list: single source of truth is config.py ──
+        self._GIT_MIRRORS: list[str] = []
+        try:
+            from config import BASELINE_GIT_MIRRORS, BASELINE_MIRROR_FIRST, NPU_ENABLED
+            self._mirror_first = BASELINE_MIRROR_FIRST or NPU_ENABLED
+            self._GIT_MIRRORS.extend(BASELINE_GIT_MIRRORS)
+        except ImportError:
+            self._mirror_first = False
+
+        # Env override — prepend so it's tried first
         custom_mirror = os.environ.get("GIT_MIRROR_PREFIX", "")
-        self._GIT_MIRRORS = []
-        if custom_mirror:
-            self._GIT_MIRRORS.append(custom_mirror)
-        self._GIT_MIRRORS.extend([
-            "https://gitclone.com/github.com",
-            "https://ghproxy.com/https://github.com",
-        ])
+        if custom_mirror and custom_mirror not in self._GIT_MIRRORS:
+            self._GIT_MIRRORS.insert(0, custom_mirror)
+
+        if self._mirror_first or self._GIT_MIRRORS:
+            logger.info("Git mirrors%s: %s",
+                         " (mirror-first mode)" if self._mirror_first else "",
+                         ", ".join(self._GIT_MIRRORS[:3]) + (
+                             f" (+{len(self._GIT_MIRRORS) - 3} more)"
+                             if len(self._GIT_MIRRORS) > 3 else ""
+                         ))
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -314,36 +327,75 @@ class BaselineFinder:
         )
 
     def _clone_repo(self, url: str, target_dir: Path) -> bool:
-        """Shallow clone with mirror fallback + integrity check.
+        """Shallow clone with mirror fallback + proxy support.
+
+        In NPU/China environments, mirrors are tried BEFORE direct GitHub clone
+        (mirror-first mode).  Proxy environment variables (http_proxy, https_proxy,
+        all_proxy) are passed through to git.
 
         Cleans partial clones before each retry.  Verifies the result has
         source files (not just a bare .git from a timed-out clone)."""
-        urls_to_try = [url]
-        if "github.com" in url:
+        # ── Build clone URL list ──
+        urls_to_try: list[tuple[str, str]] = []  # (url, label)
+        is_github = "github.com" in url
+
+        if is_github and self._mirror_first:
+            # Mirror-first: try all mirrors, keep direct as fallback
             for mirror in self._GIT_MIRRORS:
-                urls_to_try.append(url.replace("https://github.com", mirror))
-        import shutil
-        for attempt_url in urls_to_try:
+                mirrored = url.replace("https://github.com", mirror)
+                urls_to_try.append((mirrored, mirror.split("/")[2][:30]))
+            urls_to_try.append((url, "direct"))
+        elif is_github:
+            # Direct-first: try direct, then mirrors
+            urls_to_try.append((url, "direct"))
+            for mirror in self._GIT_MIRRORS:
+                mirrored = url.replace("https://github.com", mirror)
+                urls_to_try.append((mirrored, mirror.split("/")[2][:30]))
+        else:
+            urls_to_try.append((url, "direct"))
+
+        # ── Build git env with proxy support ──
+        clone_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        # Pass through proxy settings
+        for proxy_var in ("http_proxy", "https_proxy", "all_proxy",
+                          "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                          "no_proxy", "NO_PROXY"):
+            if proxy_var in os.environ:
+                clone_env.setdefault(proxy_var, os.environ[proxy_var])
+
+        # ── Build git -c proxy args ──
+        proxy_args: list[str] = []
+        https_proxy = clone_env.get("https_proxy") or clone_env.get("HTTPS_PROXY") or clone_env.get("all_proxy") or clone_env.get("ALL_PROXY") or ""
+        http_proxy = clone_env.get("http_proxy") or clone_env.get("HTTP_PROXY") or clone_env.get("all_proxy") or clone_env.get("ALL_PROXY") or ""
+        if https_proxy:
+            proxy_args.extend(["-c", f"https.proxy={https_proxy}"])
+        if http_proxy and http_proxy != https_proxy:
+            proxy_args.extend(["-c", f"http.proxy={http_proxy}"])
+
+        for attempt_idx, (attempt_url, label) in enumerate(urls_to_try):
             if target_dir.exists():
                 shutil.rmtree(target_dir, ignore_errors=True)
             try:
+                cmd = ["git", "clone", "--depth", "1", "--single-branch",
+                       "--no-tags"] + proxy_args + [attempt_url, str(target_dir)]
                 subprocess.run(
-                    ["git", "clone", "--depth", "1", "--single-branch",
-                     "--no-tags", attempt_url, str(target_dir)],
-                    capture_output=True, text=True, timeout=self.clone_timeout,
-                    check=True,
-                    env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                    cmd, capture_output=True, text=True,
+                    timeout=self.clone_timeout, check=True, env=clone_env,
                 )
                 if self._is_valid_clone(target_dir):
-                    logger.info("Cloned %s → %s", attempt_url, target_dir)
+                    logger.info("Cloned %s → %s (%s)", label, target_dir, attempt_url)
                     return True
                 else:
-                    logger.warning("Clone incomplete (no source files): %s", attempt_url)
+                    logger.warning("Clone incomplete (no source files) [%s]: %s",
+                                   label, attempt_url)
                     shutil.rmtree(target_dir, ignore_errors=True)
             except subprocess.TimeoutExpired:
-                logger.warning("Clone timed out (%ss): %s", self.clone_timeout, attempt_url)
+                logger.warning("Clone timed out (%ss) [%s]: %s",
+                               self.clone_timeout, label, attempt_url)
             except subprocess.CalledProcessError as e:
-                logger.warning("Clone failed: %s — %s", attempt_url, e.stderr[:150])
+                stderr_tail = (e.stderr or "")[-150:].strip()
+                logger.warning("Clone failed [%s]: %s — %s",
+                               label, attempt_url, stderr_tail)
         return False
 
     # ------------------------------------------------------------------

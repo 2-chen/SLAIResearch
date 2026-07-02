@@ -484,6 +484,7 @@ class HypothesisEngine:
         max_react_rounds: int = 3,
         top_k_pdfs: int = 5,
         max_papers_per_search: int = 15,
+        review_feedback: str = "",
     ):
         self.topic = topic
         self.literature_dir = Path(literature_dir)
@@ -491,6 +492,7 @@ class HypothesisEngine:
         self.max_react_rounds = max_react_rounds
         self.top_k_pdfs = top_k_pdfs
         self.max_papers_per_search = max_papers_per_search
+        self.review_feedback = review_feedback
 
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.state = ReactState(work_dir)
@@ -586,8 +588,18 @@ class HypothesisEngine:
 
             # 2a: Deepen gap analysis with accumulated papers
             if round_num == 0:
+                gap_context = self.state.get_context()
+                # Inject reviewer feedback into gap analysis so the loop targets
+                # the specific gaps the reviewer flagged
+                if self.review_feedback:
+                    gap_context += (
+                        "\n\n## Reviewer Feedback (from previous failed attempt)\n"
+                        f"{self.review_feedback[:3000]}\n\n"
+                        "The reviewer identified critical gaps in the previous run. "
+                        "Your search queries MUST target these specific gaps.\n"
+                    )
                 deepen_prompt = _build_gap_deepening_prompt(
-                    self.topic, self.state.data["all_papers"], self.state.get_context()
+                    self.topic, self.state.data["all_papers"], gap_context
                 )
                 deepen_output = _call_claude(deepen_prompt)
                 new_gaps = _parse_gaps(deepen_output)
@@ -1089,7 +1101,23 @@ HYPOTHESIS_SUPPORT:
         logger.info("Phase 4: Hypothesis Generation")
         logger.info("=" * 50)
 
-        prompt = _build_hypothesis_gen_prompt(self.topic, self.state.get_context())
+        context = self.state.get_context()
+        # Inject reviewer feedback so the LLM knows what was wrong previously
+        if self.review_feedback:
+            context += (
+                f"\n\n## Reviewer Feedback from Previous Failed Attempt\n"
+                f"The previous hypothesis output did NOT pass review. "
+                f"You MUST address ALL of the following issues:\n\n"
+                f"{self.review_feedback[:4000]}\n\n"
+                f"CRITICAL REMINDERS:\n"
+                f"- All hypotheses must be COMPLETE (no truncated fields)\n"
+                f"- Include cross-comparison between hypotheses (strengths/weaknesses/tradeoffs)\n"
+                f"- Every hypothesis needs: title, description, method_outline, rationale, "
+                f"key_references, expected_outcome, feasibility, score\n"
+                f"- total_papers_analyzed must reflect actual papers from literature review\n"
+            )
+
+        prompt = _build_hypothesis_gen_prompt(self.topic, context)
         output = _call_claude(prompt, timeout=600)
         (self.work_dir / "hypothesis_raw_output.md").write_text(output)
 

@@ -815,7 +815,15 @@ def _do_literature_search(sm: StateManager, state: ResearchState, retry_feedback
         OUTPUT_DIR=state.literature_dir,
     )
     logger.info("Calling Claude Code for literature search …")
-    return _call_claude(sm, state, Stage.LITERATURE_SEARCH, prompt, retry_feedback)
+    state = _call_claude(sm, state, Stage.LITERATURE_SEARCH, prompt, retry_feedback)
+
+    # ── Ensure structured paper metadata exists for downstream hypothesis_engine ──
+    # The literature review is free-form markdown, but hypothesis_engine needs
+    # papers_metadata.json with structured title/authors/year/abstract/url fields.
+    # Without this, hypothesis_engine extracts 0 papers and runs blind.
+    _ensure_papers_metadata(state.literature_dir)
+
+    return state
 
 
 def _do_hypothesis_generation(sm: StateManager, state: ResearchState, retry_feedback: str = "") -> ResearchState:
@@ -829,52 +837,51 @@ def _do_hypothesis_generation(sm: StateManager, state: ResearchState, retry_feed
 
     hypo_file = Path(state.hypothesis_dir) / "hypothesis_output.json"
 
-    # ── Retry with feedback: patch existing output via Claude ──
+    # ── Retry with feedback ──
     if retry_feedback and hypo_file.exists():
-        logger.info("Patching hypothesis output with review feedback via Claude …")
-        existing = hypo_file.read_text()
-        prompt = (
-            f"You are fixing a hypothesis generation output based on reviewer feedback.\n\n"
-            f"## Current hypothesis_output.json\n```json\n{existing[:15000]}\n```\n\n"
-            f"## Reviewer Feedback (MUST address every issue)\n{retry_feedback}\n\n"
-            f"## Instructions\n"
-            f"1. Fix ALL issues identified in the feedback\n"
-            f"2. If a hypothesis is truncated, complete it based on the topic context\n"
-            f"3. If papers_analyzed count is too low, add more paper analyses from the "
-            f"literature_review.md in {state.literature_dir}\n"
-            f"4. Keep valid hypotheses unchanged — only fix broken/incomplete ones\n"
-            f"5. Output the COMPLETE fixed JSON (same structure), no extra text\n"
-            f"6. Ensure every hypothesis has: title, description, method_outline, "
-            f"rationale, key_references, expected_outcome, feasibility, and score\n"
-            f"\nResearch topic: {state.topic}\n"
-        )
-        # Also include literature for papers_analyzed fix
-        lit = _read_or(state.literature_dir, "literature_review.md")
-        if lit:
-            prompt += f"\n## Literature Review (for supplementing paper analyses)\n{lit[:10000]}\n"
-
-        cmd = [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL,
-               "--max-turns", "5"]
-        result = subprocess.run(
-            cmd + [prompt], capture_output=True, text=True, timeout=600,
-            cwd=str(state.work_dir), env=_claude_subprocess_env(),
-        )
-        raw = result.stdout or ""
-        # Extract JSON
-        m = re.search(r'(\{.*\})', raw, re.DOTALL)
-        if m:
-            fixed = m.group(1).strip()
-            try:
-                json.loads(fixed)  # Validate JSON
-                hypo_file.write_text(fixed)
-                logger.info("Hypothesis output patched (%d chars → %d chars)",
-                            len(existing), len(fixed))
-            except json.JSONDecodeError:
-                logger.warning("Claude returned invalid JSON for hypothesis fix")
-        return sm.complete_stage(state, Stage.HYPOTHESIS_GENERATION, {
-            "hypotheses_count": len(json.loads(hypo_file.read_text()).get("hypotheses", [])),
-            "patched": True,
-        })
+        # Detect whether issues are data-level (can only be fixed by re-running
+        # the full engine with actual search + PDF download) or text-level
+        # (can be fixed by patching the JSON output).
+        if _has_data_level_issues(retry_feedback):
+            logger.info("Retry feedback indicates data-level issues — "
+                        "re-running full ReAct engine (not patching) …")
+            # Ensure papers_metadata.json exists so the engine can parse it
+            _ensure_papers_metadata(state.literature_dir)
+            # Delete react_state.json to force a fresh run
+            react_state_path = Path(state.hypothesis_dir) / "react_state.json"
+            if react_state_path.exists():
+                react_state_path.unlink()
+                logger.info("Cleared previous react_state.json to force full re-run")
+            # Re-run full engine with review feedback injected
+            engine = HypothesisEngine(
+                topic=state.topic,
+                literature_dir=Path(state.literature_dir),
+                work_dir=Path(state.hypothesis_dir),
+                max_react_rounds=HYPOTHESIS_MAX_REACT_ROUNDS,
+                top_k_pdfs=HYPOTHESIS_TOP_K_PDFS,
+                max_papers_per_search=HYPOTHESIS_MAX_PAPERS,
+                review_feedback=retry_feedback,
+            )
+            result = engine.run()
+            logger.info("Hypothesis re-run complete. %d hypotheses, %d papers analyzed.",
+                        len(result.get("hypotheses", [])),
+                        result.get("total_papers_analyzed", 0))
+            return sm.complete_stage(state, Stage.HYPOTHESIS_GENERATION, {
+                "hypotheses_count": len(result.get("hypotheses", [])),
+                "papers_analyzed": result.get("total_papers_analyzed", 0),
+                "re_run": True,
+            })
+        else:
+            # ── Text-level issues: patch existing output ──
+            # Strategy: parse reviewer feedback into individual issues, then fix
+            # each issue independently with a focused Claude call.  This avoids
+            # the "all-or-nothing" problem where Claude drops hypotheses or
+            # misses fixes when too many issues are crammed into one prompt.
+            # Large JSON is handled by extracting only the relevant chunk per issue.
+            state = _patch_hypothesis_with_segmented_fixes(
+                sm, state, hypo_file, retry_feedback,
+            )
+            return state
 
     # ── First run: full ReAct engine ──
     logger.info("Starting hypothesis generation (ReAct engine) ...")
@@ -930,7 +937,8 @@ def _do_baseline_fetching(sm: StateManager, state: ResearchState, retry_feedback
             # Extract baseline method names from the best hypothesis via LLM
             best = hypotheses[0] if hypotheses else {}
             if isinstance(best, dict):
-                method_names = _extract_baselines_via_llm(best, state.topic)
+                method_names = _extract_baselines_via_llm(best, state.topic,
+                                                          retry_feedback=retry_feedback)
         except Exception:
             pass
 
@@ -958,6 +966,54 @@ def _do_baseline_fetching(sm: StateManager, state: ResearchState, retry_feedback
             max_repos=BASELINE_MAX_REPOS,
         )
         contexts = bf.find_and_extract(papers=papers, method_names=method_names[:BASELINE_MAX_REPOS])
+
+        # ── Validate cloned repos and clear mismatches ──
+        # Retry feedback often points out wrong repos (e.g., "reform-swift"
+        # matched for Reformer).  Re-clone after clearing invalid caches.
+        valid_contexts = []
+        for ctx in contexts:
+            if _validate_baseline_repo(Path(ctx.local_path), ctx.method_name):
+                valid_contexts.append(ctx)
+            else:
+                logger.warning("Repo '%s' failed validation for method '%s' — "
+                               "clearing from cache for next retry", ctx.local_path, ctx.method_name)
+                import shutil
+                shutil.rmtree(ctx.local_path, ignore_errors=True)
+        if len(valid_contexts) < len(contexts):
+            logger.info("Repo validation: %d/%d passed, %d invalid repos cleared",
+                        len(valid_contexts), len(contexts),
+                        len(contexts) - len(valid_contexts))
+            # ── Resolve correct URLs for methods whose repos failed validation ──
+            # GitHub search can match wrong repos (Reform for Reformer, etc.).
+            # On retry, use LLM to get canonical URLs directly, bypassing search.
+            failed_methods = [
+                ctx.method_name for ctx in contexts
+                if ctx not in valid_contexts
+            ]
+            if retry_feedback and failed_methods:
+                resolved = _resolve_correct_baseline_urls(
+                    failed_methods, retry_feedback, state.topic,
+                )
+                for method_name, url in resolved:
+                    if url:
+                        logger.info("Resolved correct URL for '%s': %s", method_name, url)
+                        # Clone directly
+                        slug = bf._repo_slug(url, method_name)
+                        target_dir = bf.cache_dir / slug
+                        if bf._clone_repo(url, target_dir):
+                            from baseline_finder import BaselineSource
+                            src = BaselineSource(
+                                method_name=method_name,
+                                paper_title="",
+                                repo_url=url,
+                                source="llm_resolved",
+                            )
+                            ctx = bf._extract_context(target_dir, src)
+                            if _validate_baseline_repo(Path(ctx.local_path), method_name):
+                                valid_contexts.append(ctx)
+                                logger.info("✓ Corrected repo for '%s': %s", method_name, url)
+
+        contexts = valid_contexts
         prompt_block = bf.format_for_prompt(contexts)
 
         output_path = Path(state.experiment_dir) / "baseline_context.md"
@@ -2142,6 +2198,964 @@ Please explicitly acknowledge how you've addressed each issue above.
 
 
 # ======================================================================
+# Segmented hypothesis patching (text-level review fixes)
+# ======================================================================
+#
+# When reviewer feedback contains multiple issues (truncated H2, missing
+# cross-comparison, H3-H5 disappeared, …), dumping everything into one
+# Claude prompt causes: truncated JSON, dropped hypotheses, partial fixes.
+#
+# Solution: parse feedback → individual issues → fix each one independently
+# with only the RELEVANT JSON chunk.  Merges are applied sequentially.
+
+
+def _patch_hypothesis_with_segmented_fixes(
+    sm, state, hypo_file: Path, retry_feedback: str,
+) -> ResearchState:
+    """Fix hypothesis output by processing each review issue independently.
+
+    1. Parse feedback into a list of individual issues.
+    2. For each issue, extract only the relevant JSON chunk.
+    3. Call Claude to fix just that one issue on that chunk.
+    4. Merge the fix back.  Process sequentially so later fixes see earlier ones.
+    """
+    existing_text = hypo_file.read_text()
+    try:
+        existing_data = json.loads(existing_text)
+    except json.JSONDecodeError:
+        logger.error("Cannot patch: hypothesis_output.json is not valid JSON")
+        return sm.complete_stage(state, Stage.HYPOTHESIS_GENERATION, {
+            "hypotheses_count": 0, "patched": False,
+            "error": "invalid JSON",
+        })
+
+    hypotheses = existing_data.get("hypotheses", [])
+    existing_hypo_count = len(hypotheses)
+
+    # ── Step 1: Parse feedback into individual issues ──
+    issues = _parse_review_issues(retry_feedback)
+    if not issues:
+        logger.warning("Could not parse any individual issues from feedback — "
+                       "falling back to single-pass patch")
+        issues = [{"id": "all", "description": retry_feedback, "target": "__all__"}]
+
+    logger.info("Segmented patch: %d individual issues to fix across %d hypotheses",
+                len(issues), existing_hypo_count)
+
+    # ── Step 2-4: Fix each issue sequentially ──
+    lit_review = _read_or(str(Path(hypo_file).parent.parent / "literature"), "literature_review.md")
+    topic = state.topic
+    fixes_applied = 0
+    fixes_failed = 0
+
+    for i, issue in enumerate(issues):
+        issue_id = issue.get("id", f"issue_{i}")
+        logger.info("  [%d/%d] Fixing: %s", i + 1, len(issues), issue_id[:80])
+
+        try:
+            fixed_data = _call_patch_single_issue(
+                existing_data=existing_data,
+                issue=issue,
+                topic=topic,
+                lit_review=lit_review,
+            )
+            if fixed_data is not None:
+                existing_data = fixed_data
+                fixes_applied += 1
+                logger.info("  [%d/%d] ✓ Fixed: %s", i + 1, len(issues), issue_id[:80])
+            else:
+                fixes_failed += 1
+                logger.warning("  [%d/%d] ✗ Failed to fix: %s", i + 1, len(issues), issue_id[:80])
+        except Exception as exc:
+            fixes_failed += 1
+            logger.warning("  [%d/%d] ✗ Error fixing '%s': %s",
+                           i + 1, len(issues), issue_id[:80], exc)
+
+    # ── Write final result ──
+    final_text = json.dumps(existing_data, indent=2, ensure_ascii=False)
+    hypo_file.write_text(final_text)
+
+    final_count = len(existing_data.get("hypotheses", []))
+    if final_count < existing_hypo_count:
+        logger.warning(
+            "Segmented patch: hypothesis count dropped %d → %d "
+            "(some fixes may have removed hypotheses)",
+            existing_hypo_count, final_count,
+        )
+
+    logger.info("Segmented patch complete: %d/%d fixes applied, %d hypotheses (%d→%d)",
+                fixes_applied, len(issues), final_count,
+                existing_hypo_count, final_count)
+
+    return sm.complete_stage(state, Stage.HYPOTHESIS_GENERATION, {
+        "hypotheses_count": final_count,
+        "patched": True,
+        "fixes_applied": fixes_applied,
+        "fixes_failed": fixes_failed,
+        "total_issues": len(issues),
+    })
+
+
+# ---------------------------------------------------------------------------
+# Issue parsing — split reviewer feedback into individual actionable items
+# ---------------------------------------------------------------------------
+
+def _parse_review_issues(feedback: str) -> list[dict]:
+    """Split reviewer feedback into individual issues.
+
+    Handles two feedback formats:
+    1. Console-display format with `!! 【label】` markers (from progress emitter).
+    2. Stored review format with `Critical Issues:\n  - item` (from state_manager).
+
+    Each extracted issue becomes one focused Claude fix call.
+
+    Returns a list of dicts with keys: id, severity, target, description, fix_type.
+    """
+    issues: list[dict] = []
+    issue_idx = 0
+
+    # ── Try console-display format first (!! at line-start) ──
+    # Console format: "!! 【致命】..." on its own line.
+    # Stored format: "  - !! 致命问题..." (indented within list).
+    # Only enter this path if !! appears at the START of lines (console format).
+    if re.search(r'(?:^|\n)!!', feedback):
+        blocks = re.split(r'\n(?=!!)', feedback)
+        for block in blocks:
+            block = block.strip()
+            if not block or len(block) < 20:
+                continue
+            issue_idx += 1
+            severity = _extract_severity(block)
+            target = _classify_issue_target(block)
+            fix_type = _classify_fix_type(block)
+            description = re.sub(r'^!!\s*', '', block).strip()
+            description = re.sub(r'【[^】]*】\s*', '', description, count=1).strip()
+            issues.append({
+                "id": f"issue_{issue_idx:02d}_{target or 'general'}",
+                "severity": severity,
+                "target": target or "__all__",
+                "description": description[:2000],
+                "fix_type": fix_type,
+            })
+        if issues:
+            return issues
+
+    # ── Stored review format: extract from structured sections ──
+    # Critical Issues section
+    crit_section = _extract_section(feedback, "Critical Issues")
+    for item in _split_list_items(crit_section):
+        issue_idx += 1
+        target = _classify_issue_target(item)
+        issues.append({
+            "id": f"issue_{issue_idx:02d}_{target or 'critical'}",
+            "severity": "critical",
+            "target": target or "__all__",
+            "description": item[:2000],
+            "fix_type": _classify_fix_type(item),
+        })
+
+    # Weaknesses section
+    weak_section = _extract_section(feedback, "Weaknesses")
+    for item in _split_list_items(weak_section):
+        issue_idx += 1
+        target = _classify_issue_target(item)
+        issues.append({
+            "id": f"issue_{issue_idx:02d}_{target or 'weakness'}",
+            "severity": "high",
+            "target": target or "__all__",
+            "description": item[:2000],
+            "fix_type": _classify_fix_type(item),
+        })
+
+    # Suggestion section — single block, not a list
+    suggestion = _extract_section(feedback, "Suggestion")
+    if suggestion and len(suggestion) > 30:
+        issue_idx += 1
+        issues.append({
+            "id": f"issue_{issue_idx:02d}_suggestion",
+            "severity": "medium",
+            "target": "__all__",
+            "description": suggestion[:2000],
+            "fix_type": "fix_content",
+        })
+
+    # Detailed Feedback — may contain multiple paragraphs
+    detail = _extract_section(feedback, "Detailed Feedback")
+    if detail and len(detail) > 50:
+        # Split into paragraphs for very long feedback
+        paragraphs = [p.strip() for p in detail.split('\n\n') if p.strip() and len(p.strip()) > 30]
+        if len(paragraphs) <= 1:
+            # Single block — only add if we don't already have enough issues
+            if not issues:
+                issue_idx += 1
+                issues.append({
+                    "id": f"issue_{issue_idx:02d}_feedback",
+                    "severity": "medium",
+                    "target": "__all__",
+                    "description": detail[:2000],
+                    "fix_type": "fix_content",
+                })
+        else:
+            for para in paragraphs:
+                issue_idx += 1
+                target = _classify_issue_target(para)
+                issues.append({
+                    "id": f"issue_{issue_idx:02d}_{target or 'detail'}",
+                    "severity": "medium",
+                    "target": target or "__all__",
+                    "description": para[:2000],
+                    "fix_type": _classify_fix_type(para),
+                })
+
+    # ── Fallback: no structure detected — treat whole feedback as one issue ──
+    if not issues:
+        issue_idx += 1
+        issues.append({
+            "id": f"issue_{issue_idx:02d}_general",
+            "severity": "medium",
+            "target": "__all__",
+            "description": feedback[:2000],
+            "fix_type": "fix_content",
+        })
+
+    return issues
+
+
+def _extract_severity(text: str) -> str:
+    """Extract severity level from issue text."""
+    m = re.search(r'【(致命|严重|注意|未修复)[^】]*】', text)
+    if m:
+        label = m.group(1)
+        if "致命" in label:
+            return "critical"
+        elif "严重" in label:
+            return "high"
+        elif "未修复" in label:
+            return "high"
+    if re.search(r'CRITICAL|FATAL', text, re.IGNORECASE):
+        return "critical"
+    if re.search(r'WARNING|SEVERE', text, re.IGNORECASE):
+        return "high"
+    return "medium"
+
+
+def _extract_section(text: str, section_name: str) -> str:
+    """Extract a named section from the stored review format.
+
+    Sections look like:
+        SectionName:
+          - item 1
+          - item 2
+
+        NextSection:
+          ...
+    """
+    # Match from section_name: to the next section header or end
+    # Section headers are lines ending with ':' followed by indented content
+    pattern = rf'{re.escape(section_name)}:\s*\n(.*?)(?=\n\S+:\s*\n|\n##|\Z)'
+    m = re.search(pattern, text, re.DOTALL)
+    return m.group(1).strip() if m else ""
+
+
+def _split_list_items(section_text: str) -> list[str]:
+    """Split a section's text into individual list items.
+
+    Items are prefixed with '  - ' or '- ' or '!! '.
+    """
+    if not section_text:
+        return []
+    # Split on common item prefixes
+    items = re.split(r'\n\s*[-•!!]+\s*', section_text)
+    return [item.strip() for item in items if item.strip() and len(item.strip()) > 10]
+
+
+def _classify_issue_target(text: str) -> str:
+    """Determine which hypothesis or field an issue targets.
+
+    Looks for patterns like 'H1', 'H2假说', 'hypothesis 3', '假说交叉比较',
+    'selected_hypothesis', etc.
+
+    When multiple hypotheses are referenced (H3, H4, H5 all disappeared),
+    returns '__all__' to trigger the general fix path.
+    """
+    # ── Multi-hypothesis detection: "H3, H4, H5" or "H3-H5" or "H3、H4、H5" ──
+    h_refs = re.findall(r'\bH(\d{1,2})\b', text, re.IGNORECASE)
+    if len(h_refs) >= 2:
+        # Multiple hypotheses mentioned — use general path
+        return "__all__"
+    if len(h_refs) == 1 and re.search(r'H\d\s*[-–—to]+\s*H\d', text, re.IGNORECASE):
+        # Range: "H3-H5"
+        return "__all__"
+
+    # ── Single hypothesis reference ──
+    if h_refs:
+        return f"H{h_refs[0]}"
+
+    # ── Cross-cutting concerns ──
+    if re.search(r'交叉比较|cross.comparison|comparison.*matrix|对比.*矩阵', text):
+        return "cross_comparison"
+    if re.search(r'文献检索|literature.*search|papers_analyzed|search_rounds', text, re.IGNORECASE):
+        return "literature_grounding"
+    if re.search(r'selected_hypothesis|选择.*假说', text):
+        return "selected_hypothesis"
+    if re.search(r'gap_coverage|缺口.*覆盖', text):
+        return "gap_coverage"
+    if re.search(r'novelty|创新性', text):
+        return "novelty_assessment"
+    if re.search(r'feasibility|可行性', text):
+        return "feasibility"
+
+    # ── Generic field patterns ──
+    if re.search(r'truncat|截断|incomplete|不完整', text):
+        return "truncation"
+
+    return "__all__"
+
+
+def _classify_fix_type(text: str) -> str:
+    """Classify what kind of fix this issue needs."""
+    if re.search(r'truncat|截断|incomplete|不完整|cut.off', text, re.IGNORECASE):
+        return "complete_truncated"
+    if re.search(r'missing|缺失|消失|not.*present|removed', text, re.IGNORECASE):
+        return "restore_missing"
+    if re.search(r'交叉比较|cross.comparison|comparison.*matrix', text, re.IGNORECASE):
+        return "add_section"
+    if re.search(r'format|格式', text, re.IGNORECASE):
+        return "fix_format"
+    if re.search(r'novelty|创新|original', text, re.IGNORECASE):
+        return "improve_content"
+    return "fix_content"
+
+
+# ---------------------------------------------------------------------------
+# JSON chunking — extract only the relevant portion for each issue
+# ---------------------------------------------------------------------------
+
+def _extract_chunk_for_issue(existing_data: dict, issue: dict) -> tuple[str, str]:
+    """Extract only the JSON portion relevant to a specific issue.
+
+    Returns (json_snippet_str, context_note).
+    The snippet is what Claude should fix; the note describes what was omitted.
+    """
+    target = issue.get("target", "__all__")
+    hypotheses = existing_data.get("hypotheses", [])
+
+    # Build hypothesis index
+    hypo_by_id = {}
+    for h in hypotheses:
+        hid = h.get("id", "").upper()
+        if hid:
+            hypo_by_id[hid] = h
+
+    if target.startswith("H") and target in hypo_by_id:
+        # ── Single-hypothesis issue: send just that hypothesis ──
+        target_h = hypo_by_id[target]
+        # Also include a summary of other hypotheses for context
+        other_summaries = []
+        for h in hypotheses:
+            hid = h.get("id", "")
+            if hid.upper() != target:
+                other_summaries.append(
+                    f"{hid}: {h.get('title', 'untitled')[:60]} "
+                    f"(score={h.get('score', '?')})"
+                )
+        wrapper = {
+            "topic": existing_data.get("topic", ""),
+            "target_hypothesis": target,
+            "hypothesis_to_fix": target_h,
+            "other_hypotheses_summary": other_summaries,
+            "selected_hypothesis": existing_data.get("selected_hypothesis", {}),
+        }
+        snippet = json.dumps(wrapper, indent=2, ensure_ascii=False)
+        context = (f"Fixing hypothesis {target} only. "
+                   f"{len(other_summaries)} other hypotheses exist "
+                   f"({', '.join(h['id'] for h in hypotheses if h.get('id','').upper() != target)}). "
+                   f"Do NOT modify other hypotheses.")
+        return snippet, context
+
+    elif target == "cross_comparison":
+        # ── Cross-comparison: send top-level + hypothesis summaries ──
+        wrapper = {
+            "topic": existing_data.get("topic", ""),
+            "selected_hypothesis": existing_data.get("selected_hypothesis", {}),
+            "gap_coverage": existing_data.get("gap_coverage", ""),
+            "hypotheses_summary": [
+                {
+                    "id": h.get("id", ""),
+                    "title": h.get("title", "")[:100],
+                    "method_outline": (h.get("method_outline", "") or "")[:300],
+                    "expected_outcome": (h.get("expected_outcome", "") or "")[:200],
+                    "novelty_score": h.get("novelty_score", ""),
+                    "impact_score": h.get("impact_score", ""),
+                }
+                for h in hypotheses
+            ],
+            "_note": "You are adding a CROSS-COMPARISON MATRIX. Output the FULL "
+                      "hypothesis_output.json with the matrix added as a new "
+                      "'cross_comparison' field. Keep all existing fields intact.",
+        }
+        snippet = json.dumps(wrapper, indent=2, ensure_ascii=False)
+        context = (f"Adding cross-comparison matrix for {len(hypotheses)} hypotheses. "
+                   f"Must preserve all existing content.")
+        return snippet, context
+
+    elif target == "selected_hypothesis":
+        # ── Selected hypothesis: send top-level selection + hypothesis summaries ──
+        wrapper = {
+            "topic": existing_data.get("topic", ""),
+            "selected_hypothesis": existing_data.get("selected_hypothesis", {}),
+            "hypotheses_summary": [
+                {"id": h.get("id", ""), "title": h.get("title", "")[:100],
+                 "novelty_score": h.get("novelty_score", ""),
+                 "impact_score": h.get("impact_score", "")}
+                for h in hypotheses
+            ],
+            "_note": "Fix the selected_hypothesis field to match the best hypothesis. "
+                      "Keep all other content unchanged.",
+        }
+        snippet = json.dumps(wrapper, indent=2, ensure_ascii=False)
+        context = "Fixing selected_hypothesis field only."
+        return snippet, context
+
+    elif target == "truncation":
+        # ── Try to find which hypothesis is truncated by looking at lengths ──
+        truncated_hypo = None
+        for h in hypotheses:
+            text = json.dumps(h, ensure_ascii=False)
+            # Truncation usually ends mid-sentence without closing punctuation
+            if len(text) > 500 and not re.search(r'[.!?。！？]\s*$', text[-200:]):
+                truncated_hypo = h
+                break
+        if truncated_hypo:
+            return _extract_chunk_for_issue(existing_data, {
+                "target": truncated_hypo.get("id", "H?"),
+                "fix_type": "complete_truncated",
+                "description": issue.get("description", ""),
+            })
+        # Fallback: send everything but flag the issue
+        return json.dumps(existing_data, indent=2, ensure_ascii=False)[:20000], \
+               "Could not identify which hypothesis is truncated. Review all."
+
+    else:
+        # ── General / cross-cutting: send top-level + light hypothesis summaries ──
+        # This is the "catch-all" — keep it lean to avoid truncation
+        wrapper = {
+            "topic": existing_data.get("topic", ""),
+            "selected_hypothesis": existing_data.get("selected_hypothesis", {}),
+            "gap_coverage": existing_data.get("gap_coverage", ""),
+            "identified_gaps": existing_data.get("identified_gaps", [])[:20],
+            "total_papers_analyzed": existing_data.get("total_papers_analyzed", 0),
+            "hypotheses": [
+                # Strip to essential fields for context; full fix happens per-hypothesis
+                {k: v for k, v in h.items()
+                 if k in ("id", "title", "description", "method_outline",
+                          "rationale", "key_references", "expected_outcome",
+                          "feasibility", "novelty_score", "impact_score", "score")}
+                for h in hypotheses
+            ],
+        }
+        snippet = json.dumps(wrapper, indent=2, ensure_ascii=False)
+        context = (f"Fixing general issue across {len(hypotheses)} hypotheses. "
+                   f"Full JSON size: {len(json.dumps(existing_data, ensure_ascii=False))} chars.")
+        return snippet, context
+
+
+# ---------------------------------------------------------------------------
+# Single-issue fix — one focused Claude call per issue
+# ---------------------------------------------------------------------------
+
+def _call_patch_single_issue(
+    existing_data: dict,
+    issue: dict,
+    topic: str = "",
+    lit_review: str = "",
+) -> dict | None:
+    """Call Claude to fix ONE specific issue on ONE specific JSON chunk.
+
+    Returns the full updated existing_data dict on success, None on failure.
+    The caller merges fixes sequentially — later calls see earlier fixes.
+    """
+    snippet, context_note = _extract_chunk_for_issue(existing_data, issue)
+
+    fix_type = issue.get("fix_type", "fix_content")
+    target = issue.get("target", "__all__")
+    description = issue.get("description", "")
+
+    # ── Build focused prompt ──
+    fix_instructions = {
+        "complete_truncated": (
+            "This hypothesis has a TRUNCATED field — text was cut off mid-sentence. "
+            "Complete it based on the topic context. Make it a full, coherent paragraph "
+            "that ends properly. Do NOT change any other fields or hypotheses."
+        ),
+        "restore_missing": (
+            "One or more hypotheses are MISSING from the output. The reviewer noted "
+            "they disappeared (likely from JSON truncation in a previous fix attempt). "
+            "Use the literature context below to infer plausible hypotheses that fill "
+            "gaps in the research topic. Also check the 'identified_gaps' field in the "
+            "JSON for inspiration. Recreate the missing hypotheses with complete fields "
+            "(title, description, method_outline, rationale, key_references, "
+            "expected_outcome, feasibility, score). Do NOT remove any existing hypotheses."
+        ),
+        "add_section": (
+            "A required section is MISSING. Add it based on the existing content. "
+            "For cross-comparison: compare all hypotheses on novelty, feasibility, "
+            "expected impact, and methodological trade-offs. Include a priority ranking. "
+            "Do NOT modify existing hypotheses — only add the new section."
+        ),
+        "fix_format": (
+            "Fix FORMAT issues only. Ensure all fields use consistent structure. "
+            "Do NOT change content, only format."
+        ),
+        "improve_content": (
+            "Improve the CONTENT quality. Make descriptions more specific and "
+            "academically rigorous. Ground claims in the literature."
+        ),
+        "fix_content": (
+            "Fix the specific issue described in the feedback. Be precise and targeted. "
+            "Do NOT change anything unrelated to this issue."
+        ),
+    }
+
+    instruction = fix_instructions.get(fix_type, fix_instructions["fix_content"])
+
+    prompt = (
+        f"You are fixing ONE specific issue in a hypothesis generation output.\n\n"
+        f"## Research Topic\n{topic}\n\n"
+        f"## Issue to Fix (#{issue.get('id', '?')})\n"
+        f"**Severity**: {issue.get('severity', 'medium')}\n"
+        f"**Target**: {target}\n"
+        f"**Fix type**: {fix_type}\n"
+        f"**Problem**: {description}\n\n"
+        f"## Instructions\n"
+        f"{instruction}\n\n"
+        f"## Relevant JSON (only the portion that needs fixing)\n"
+        f"Context: {context_note}\n"
+        f"```json\n{snippet[:25000]}\n```\n\n"
+        f"## Output Format\n"
+        + (
+            f"Return the SAME wrapper JSON structure you received (with "
+            f"'hypothesis_to_fix' key). Fix only 'hypothesis_to_fix' — keep "
+            f"everything else as-is.\n"
+            if target.startswith("H")
+            else f"Return the COMPLETE fixed JSON. Keep the same structure as "
+                 f"the input. Do NOT change anything except what's needed to fix "
+                 f"this specific issue.\n"
+        )
+        + f"The output must be valid JSON. "
+          f"No explanation, no markdown — just valid JSON.\n"
+    )
+
+    # Include minimal literature context for content-heavy fix types
+    if fix_type in ("improve_content", "fix_content", "restore_missing") and lit_review:
+        prompt += f"\n## Literature Context (for reference)\n{lit_review[:3000]}\n"
+
+    cmd = [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL,
+           "--max-turns", "2"]
+    try:
+        result = subprocess.run(
+            cmd + [prompt], capture_output=True, text=True, timeout=300,
+            cwd=str(PROJECT_ROOT), env=_claude_subprocess_env(),
+        )
+        raw = result.stdout or ""
+        if result.returncode != 0 and not raw:
+            logger.warning("Claude call failed for issue '%s': %s",
+                           issue.get("id", "?"), (result.stderr or "")[:200])
+            return None
+
+        # Extract the fixed JSON
+        m = re.search(r'(\{.*\})', raw, re.DOTALL)
+        if not m:
+            logger.warning("No JSON found in Claude response for issue '%s'",
+                           issue.get("id", "?"))
+            return None
+
+        fixed_json_str = m.group(1).strip()
+        fixed_data = json.loads(fixed_json_str)
+        return _merge_fix_into_json(existing_data, fixed_data, issue)
+
+    except json.JSONDecodeError:
+        logger.warning("Claude returned invalid JSON for issue '%s'",
+                       issue.get("id", "?"))
+        return None
+    except subprocess.TimeoutExpired:
+        logger.warning("Claude timed out for issue '%s'", issue.get("id", "?"))
+        return None
+    except Exception as exc:
+        logger.warning("Error fixing issue '%s': %s", issue.get("id", "?"), exc)
+        return None
+
+
+def _merge_fix_into_json(
+    original: dict,
+    fixed: dict,
+    issue: dict,
+) -> dict:
+    """Merge a single-issue fix back into the full data.
+
+    Strategy depends on the target:
+    - Specific hypothesis (H2): replace only that hypothesis in the list,
+      preserving others verbatim.
+    - Cross-cutting (cross_comparison, gap_coverage): merge the new field.
+    - __all__: full replacement (last resort).
+    """
+    target = issue.get("target", "__all__")
+    fix_type = issue.get("fix_type", "fix_content")
+
+    # ── Handle wrapper-form response: Claude returned the chunk wrapper ──
+    # When the input was a wrapper (for single-hypothesis issues), Claude may
+    # return the same wrapper with hypothesis_to_fix updated.
+    if "hypothesis_to_fix" in fixed and target.startswith("H"):
+        fixed_h = fixed["hypothesis_to_fix"]
+        orig_hypos = original.get("hypotheses", [])
+        new_hypos = []
+        for h in orig_hypos:
+            hid = h.get("id", "").upper()
+            if hid == target:
+                new_hypos.append(fixed_h)
+            else:
+                new_hypos.append(h)
+        original["hypotheses"] = new_hypos
+        # Also merge any top-level fields that may have been in the wrapper
+        for field in ("cross_comparison", "gap_coverage", "selected_hypothesis"):
+            if field in fixed and field != "hypothesis_to_fix":
+                original[field] = fixed[field]
+        return original
+
+    if target.startswith("H") and "hypotheses" in fixed and "hypotheses" in original:
+        # ── Single-hypothesis fix ──
+        orig_hypos = original["hypotheses"]
+        fixed_hypos = fixed.get("hypotheses", [])
+
+        # Build lookup by ID in fixed output
+        fixed_by_id = {}
+        for h in fixed_hypos:
+            hid = h.get("id", "").upper()
+            if hid:
+                fixed_by_id[hid] = h
+
+        # Replace only the targeted hypothesis, keep others verbatim
+        new_hypos = []
+        for h in orig_hypos:
+            hid = h.get("id", "").upper()
+            if hid == target and hid in fixed_by_id:
+                new_hypos.append(fixed_by_id[hid])
+            else:
+                new_hypos.append(h)
+
+        # Also check if fixed added new hypotheses (shouldn't, but be safe)
+        for h in fixed_hypos:
+            hid = h.get("id", "").upper()
+            if hid and hid not in {oh.get("id", "").upper() for oh in orig_hypos}:
+                if hid != target:  # Only add if it wasn't the one we were replacing
+                    new_hypos.append(h)
+
+        original["hypotheses"] = new_hypos
+
+    elif target in ("cross_comparison", "gap_coverage", "selected_hypothesis",
+                    "literature_grounding", "novelty_assessment", "feasibility"):
+        # ── Field-level fix: merge specific fields ──
+        mergeable_fields = [
+            "cross_comparison", "gap_coverage", "selected_hypothesis",
+            "known_facts", "identified_gaps",
+        ]
+        for field in mergeable_fields:
+            if field in fixed:
+                original[field] = fixed[field]
+
+        # For non-hypothesis top-level changes, also check hypotheses didn't change
+        if "hypotheses" in original:
+            # Don't blindly replace — only take hypothesis fixes if targeted
+            pass
+
+    elif fix_type == "complete_truncated":
+        # ── Truncation fix: find and replace the truncated hypothesis ──
+        if "hypotheses" in fixed and "hypotheses" in original:
+            orig_hypos = original["hypotheses"]
+            fixed_hypos = fixed.get("hypotheses", [])
+            fixed_by_id = {h.get("id", "").upper(): h for h in fixed_hypos}
+            new_hypos = []
+            for h in orig_hypos:
+                hid = h.get("id", "").upper()
+                if hid in fixed_by_id:
+                    # Only replace if fixed version is actually longer (more complete)
+                    orig_len = len(json.dumps(h, ensure_ascii=False))
+                    fixed_len = len(json.dumps(fixed_by_id[hid], ensure_ascii=False))
+                    if fixed_len > orig_len * 1.1:  # At least 10% more content
+                        new_hypos.append(fixed_by_id[hid])
+                    else:
+                        new_hypos.append(h)
+                else:
+                    new_hypos.append(h)
+            original["hypotheses"] = new_hypos
+
+    else:
+        # ── Full replacement (last resort for general issues) ──
+        # Only replace top-level fields, preserve hypothesis count safety
+        orig_count = len(original.get("hypotheses", []))
+        fixed_count = len(fixed.get("hypotheses", []))
+
+        for key in fixed:
+            if key == "hypotheses":
+                if fixed_count >= orig_count:
+                    original["hypotheses"] = fixed["hypotheses"]
+                else:
+                    logger.warning(
+                        "Merge refused: fixed has %d hypotheses vs original %d — "
+                        "preserving original hypotheses to avoid data loss",
+                        fixed_count, orig_count,
+                    )
+                    # Still merge non-hypothesis fields
+            else:
+                original[key] = fixed[key]
+
+    return original
+
+
+# ======================================================================
+# Cross-stage data helpers
+# ======================================================================
+
+
+def _ensure_papers_metadata(literature_dir: str) -> bool:
+    """Ensure papers_metadata.json exists in the literature directory.
+
+    The literature_search stage produces a free-form markdown review, but the
+    downstream hypothesis_engine needs structured JSON with title/authors/year/
+    abstract/url per paper.  If papers_metadata.json doesn't exist, use LLM to
+    extract it from literature_review.md.
+
+    Returns True if metadata now exists (or already did), False on failure.
+    """
+    lit_dir = Path(literature_dir)
+    papers_json = lit_dir / "papers_metadata.json"
+    lit_review = lit_dir / "literature_review.md"
+
+    # ── Skip if metadata already exists and is newer than the review ──
+    # This prevents extracting stale data; on retry the review may be updated.
+    if papers_json.exists():
+        if not lit_review.exists():
+            return True
+        # Re-extract if review was modified AFTER metadata was created
+        if lit_review.stat().st_mtime <= papers_json.stat().st_mtime:
+            return True
+        logger.info("literature_review.md is newer than papers_metadata.json — "
+                     "re-extracting paper metadata")
+
+    if not lit_review.exists():
+        logger.warning("No literature_review.md to extract papers from")
+        return False
+
+    lit_text = lit_review.read_text()
+    logger.info("Extracting paper metadata from literature_review.md (%d chars) ...",
+                len(lit_text))
+
+    prompt = (
+        "Extract structured paper metadata from the following literature review. "
+        "For every paper mentioned, provide: title, authors (as a list of strings), "
+        "year (as a string), abstract (1-3 sentences), url (arxiv or DOI URL), "
+        "and arxiv_id if available.\n\n"
+        "Output ONLY a JSON array of paper objects, like this:\n"
+        '[{"title": "Attention Is All You Need", "authors": ["Vaswani A", "Shazeer N", ...], '
+        '"year": "2017", "abstract": "We propose the Transformer...", '
+        '"url": "https://arxiv.org/abs/1706.03762", "arxiv_id": "1706.03762", "citations": 0}, ...]\n\n'
+        "Extract ALL papers mentioned — do not skip any. Each paper gets one entry.\n\n"
+        f"## Literature Review\n{lit_text[:30000]}\n"
+    )
+
+    try:
+        result = subprocess.run(
+            [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL],
+            input=prompt, capture_output=True, text=True, timeout=300,
+            cwd=str(PROJECT_ROOT), env=_claude_subprocess_env(),
+        )
+        raw = result.stdout or ""
+        m = re.search(r'(\[.*\])', raw, re.DOTALL)
+        if m:
+            papers = json.loads(m.group(1))
+            if isinstance(papers, list) and len(papers) > 0:
+                papers_json.write_text(
+                    json.dumps(papers, indent=2, ensure_ascii=False)
+                )
+                logger.info("Extracted %d papers to papers_metadata.json", len(papers))
+                return True
+            else:
+                logger.warning("LLM extraction returned 0 papers")
+    except json.JSONDecodeError:
+        logger.warning("Failed to parse LLM paper extraction output as JSON")
+    except subprocess.TimeoutExpired:
+        logger.warning("LLM paper extraction timed out")
+    except Exception as exc:
+        logger.warning("Failed to extract paper metadata: %s", exc)
+
+    return False
+
+
+def _has_data_level_issues(retry_feedback: str) -> bool:
+    """Check if retry feedback indicates data-vacuum issues requiring full re-run.
+
+    These are problems text-patching cannot fix: zero papers analyzed, zero
+    search rounds, zero PDFs deep-read, or missing literature retrieval.
+    Full re-run of the ReAct engine (with actual search + PDF download) is
+    the only way to resolve them."""
+    if not retry_feedback:
+        return False
+
+    data_vacuum_patterns = [
+        r'total_papers_analyzed\s*[=:]\s*0',
+        r'papers_analyzed\s*[=:]\s*0',
+        r'search_rounds\s*[=:]\s*0',
+        r'pdfs_deep_read\s*[=:]\s*0',
+        r'文献检索完全缺失',
+        r'系统性文献检索.*未执行',
+        r'必须实际执行检索',
+        r'methodology.*缺陷.*检索',
+        # English / numeric patterns
+        r'\b0\s+papers?\s+(analyzed|collected|found|retrieved)',
+        r'(?:zero|no)\s+papers?\s+(?:were\s+)?analyzed',
+        r'without\s+(?:any\s+)?(?:systematic\s+)?(?:literature\s+)?search',
+        r'no\s+(?:literature\s+)?(?:search|retrieval)\s+(?:was\s+)?(?:performed|conducted|done)',
+        r'literature\s+(?:grounding|basis).*missing',
+        r'(?:missing|absent|skipped|bypassed).*(?:literature|papers?\s+search|retrieval)',
+    ]
+
+    for pat in data_vacuum_patterns:
+        if re.search(pat, retry_feedback, re.IGNORECASE):
+            logger.info("Detected data-level issue in feedback (pattern: %s) — "
+                        "full engine re-run required", pat)
+            return True
+    return False
+
+
+def _resolve_correct_baseline_urls(
+    failed_methods: list[str],
+    retry_feedback: str,
+    topic: str,
+) -> list[tuple[str, str]]:
+    """Use LLM to map method names to canonical GitHub URLs.
+
+    When GitHub search returns wrong repos (e.g., Reform for Reformer), the
+    reviewer feedback identifies the mismatch.  This function asks an LLM to
+    resolve the correct, canonical GitHub URL for each failed method, bypassing
+    the broken search.
+
+    Returns a list of (method_name, url_or_empty) tuples.
+    """
+    if not failed_methods:
+        return []
+
+    # Extract specific wrong-repo mentions from feedback to give the LLM context
+    wrong_repo_lines = []
+    for line in retry_feedback.split('\n'):
+        if re.search(r'(wrong|错误|incorrect|mismatch|matched|not.*correct)', line, re.IGNORECASE):
+            if len(line) > 20:
+                wrong_repo_lines.append(line.strip()[:200])
+    wrong_context = '\n'.join(wrong_repo_lines[:5]) if wrong_repo_lines else ""
+
+    prompt = (
+        f"For each baseline method listed below, provide the CANONICAL GitHub "
+        f"repository URL (the official or most popular implementation).\n\n"
+        f"## Research Topic\n{topic}\n\n"
+        f"## Methods that need correct URLs\n"
+        + "\n".join(f"- {m}" for m in failed_methods) + "\n\n"
+    )
+    if wrong_context:
+        prompt += (
+            f"## Previous Wrong Matches (from reviewer feedback)\n"
+            f"{wrong_context}\n\n"
+            f"These URLs were WRONG — do NOT suggest them. Find the correct ones.\n\n"
+        )
+    prompt += (
+        f"## Instructions\n"
+        f"For each method, output the correct GitHub URL. Use well-known repos:\n"
+        f"- Reformer → https://github.com/lucidrains/reformer-pytorch\n"
+        f"- Longformer → https://github.com/allenai/longformer\n"
+        f"- Performer → https://github.com/lucidrains/performer-pytorch\n"
+        f"- Linformer → https://github.com/lucidrains/linformer\n"
+        f"- BigBird → https://github.com/google-research/bigbird\n"
+        f"- Mamba → https://github.com/state-spaces/mamba\n"
+        f"- FlashAttention → https://github.com/Dao-AILab/flash-attention\n\n"
+        f"Output ONLY a JSON object mapping method_name → url:\n"
+        f'{{"Reformer": "https://github.com/lucidrains/reformer-pytorch", ...}}\n'
+        f"If you cannot find a URL for a method, set its value to empty string.\n"
+        f"No explanation, just JSON.\n"
+    )
+
+    try:
+        result = subprocess.run(
+            [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL],
+            input=prompt, capture_output=True, text=True, timeout=120,
+            cwd=str(PROJECT_ROOT), env=_claude_subprocess_env(),
+        )
+        raw = result.stdout or ""
+        m = re.search(r'(\{.*?\})', raw, re.DOTALL)
+        if m:
+            url_map = json.loads(m.group(1))
+            if isinstance(url_map, dict):
+                return [(name, url_map.get(name, "")) for name in failed_methods]
+    except Exception as exc:
+        logger.warning("LLM baseline URL resolution failed: %s", exc)
+
+    return [(name, "") for name in failed_methods]
+
+
+def _validate_baseline_repo(repo_dir: Path, method_name: str) -> bool:
+    """Quick validation that a cloned repo is actually about the expected method.
+
+    Checks README content for the method name to catch mismatches like:
+      - "Reform" (Swift vector graphics app) matched for "Reformer"
+      - "pysmb" (SMB file-sharing library) matched for "Samba"
+      - "GLaDOS" (voice assistant) matched for "GLA"
+      - "IPO prediction" matched for "Longformer"
+
+    Returns True if the repo appears relevant, False if it should be discarded.
+    """
+    name_lower = method_name.lower().strip()
+
+    # Check README
+    for readme_name in ["README.md", "README.rst", "readme.md", "README.md", "README.txt"]:
+        readme = repo_dir / readme_name
+        if readme.exists():
+            try:
+                content = readme.read_text(errors="replace")[:6000].lower()
+                # Method name should appear as a word (not just substring)
+                if name_lower in content:
+                    return True
+                # Allow hyphenated variants: "flash-attention" for FlashAttention
+                if "-" in name_lower and name_lower.replace("-", " ") in content:
+                    return True
+                # Mismatch: README doesn't mention the method → likely wrong repo
+                logger.warning(
+                    "Repo '%s' README (%d chars) does not mention method '%s'. "
+                    "First 300 chars: %s...",
+                    repo_dir.name, len(content), method_name,
+                    content[:300].replace('\n', ' ')
+                )
+                return False
+            except Exception:
+                pass
+
+    # Fallback: no README → check Python files for method references
+    py_files = list(repo_dir.glob("**/*.py"))[:20]
+    found_in_py = False
+    for f in py_files:
+        try:
+            if name_lower in f.read_text(errors="replace")[:2000].lower():
+                found_in_py = True
+                break
+        except Exception:
+            pass
+
+    if found_in_py:
+        logger.info("Repo '%s' validated via Python source (no README)", repo_dir.name)
+        return True
+
+    logger.warning("Repo '%s' could not be validated for method '%s' "
+                   "(no matching README or source files)", repo_dir.name, method_name)
+    return False
+
+
+# ======================================================================
 # Utilities
 # ======================================================================
 
@@ -2178,12 +3192,16 @@ def _render_template_file(template_path: str, **kwargs: str) -> str:
     return template
 
 
-def _extract_baselines_via_llm(best_hypothesis: dict, topic: str) -> list[str]:
+def _extract_baselines_via_llm(best_hypothesis: dict, topic: str,
+                              retry_feedback: str = "") -> list[str]:
     """Use Claude to intelligently extract baseline method names from a hypothesis.
 
     Unlike regex-based ``_extract_baselines_from_text``, this understands the
     research context and returns method names that actually make sense for the
-    topic (e.g. FlashAttention, Linformer for long-sequence attention)."""
+    topic (e.g. FlashAttention, Linformer for long-sequence attention).
+
+    When retry_feedback is provided, it includes reviewer corrections about
+    which baselines were wrong in previous attempts."""
     import json as _json
     # Build summary from ALL fields in the hypothesis (dynamic, not hardcoded)
     fields = []
@@ -2210,10 +3228,24 @@ def _extract_baselines_via_llm(best_hypothesis: dict, topic: str) -> list[str]:
     if not hypothesis_text.strip():
         return []
 
+    # ── Include retry feedback so LLM can correct previous wrong matches ──
+    feedback_note = ""
+    if retry_feedback:
+        feedback_note = (
+            f"\n\n## Previous Review Feedback (WRONG baselines to avoid)\n"
+            f"{retry_feedback[:2000]}\n\n"
+            f"IMPORTANT: The reviewer identified incorrect baseline repos in previous "
+            f"attempts. Do NOT suggest baselines that are acronym collisions (e.g., "
+            f"GLA → GLaDOS voice assistant, Samba → SMB file sharing). Use the "
+            f"canonical GitHub repo (e.g., allenai/longformer for Longformer, "
+            f"lucidrains/reformer-pytorch for Reformer).\n"
+        )
+
     prompt = (
         f"Given this research hypothesis about \"{topic}\", identify the baseline "
         f"methods / models / frameworks that should be compared against.\n\n"
-        f"{hypothesis_text[:6000]}\n\n"
+        f"{hypothesis_text[:6000]}"
+        f"{feedback_note}\n\n"
         f"Output ONLY a JSON array of method name strings. Include well-known "
         f"names (FlashAttention, Linformer, Longformer, Reformer, Performer, "
         f"BigBird, Mamba, RetNet, etc.) plus any methods explicitly mentioned in "
