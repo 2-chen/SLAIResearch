@@ -48,7 +48,7 @@ def submit_paper(
     logger.info("Step 3/3: confirming upload …")
     token = _confirm_upload(url_data["s3_key"], venue, email, timeout=timeout)
 
-    logger.info(f"Submission complete. Token = {token}")
+    logger.info("Submission complete. Token received.")
     return token
 
 
@@ -524,8 +524,8 @@ if __name__ == "__main__":
 
     try:
         token = submit_paper(str(test_pdf), venue="AAAI")
-        print(f"Upload OK — token: {token}")
-        print("(Use this token to check results later at paperreview.ai/review)")
+        print("Upload OK — token received")
+        print("(Check results later at paperreview.ai/review)")
     except Exception as e:
         print(f"Upload failed: {e}")
 

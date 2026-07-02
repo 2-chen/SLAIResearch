@@ -1389,7 +1389,7 @@ sm.save(state)
 
     TOKEN="$TOKEN_RAW"
     echo -e "${GREEN}审稿已提交${NC}"
-    echo -e "Token: ${YELLOW}${TOKEN}${NC}"
+    echo -e "Token: ${YELLOW}已获取（长度: ${#TOKEN}）${NC}"
 
     # 用文件传递 TOKEN 避免 shell 注入
     python -c "

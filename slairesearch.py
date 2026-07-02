@@ -467,9 +467,10 @@ def _run_pipeline(sm: StateManager, state: ResearchState) -> None:
                 state, verdict = _do_poll(sm, state)
             except TimeoutError:
                 tok = state.reviews[-1].get("token", "N/A") if state.reviews else "N/A"
-                print(f"\n[!] Review timed out. Token: {tok}")
-                print(f"[!] Check manually: https://paperreview.ai/review?token={tok}")
-                progress.substep(Stage.POLL_REVIEW.value, f"Review timed out. Token: {tok}")
+                print(f"\n[!] Review timed out (token: {'已获取' if tok and tok != 'N/A' else '未获取'})")
+                if tok and tok != "N/A":
+                    print(f"[!] Check manually: https://paperreview.ai/review?token={tok}")
+                progress.substep(Stage.POLL_REVIEW.value, "Review timed out (token saved)")
                 sm.save(state)
                 progress.pipeline_complete(False, "Review timed out")
                 return
@@ -1456,7 +1457,7 @@ def _do_submit(sm: StateManager, state: ResearchState) -> ResearchState:
 def _do_poll(sm: StateManager, state: ResearchState) -> tuple[ResearchState, str]:
     token = state.reviews[-1]["token"]
     print(f"\n  Iteration {state.iteration} — waiting for review …")
-    print(f"  Token: {token}")
+    print(f"  Token: 已获取")
     print(f"  URL:   https://paperreview.ai/review?token={token}\n")
 
     try:
@@ -2446,7 +2447,7 @@ def _print_status(state: ResearchState) -> None:
     if state.reviews:
         print(f"\nPaperReview.ai history:")
         for r in state.reviews:
-            print(f"  iter {r['iteration']}: verdict={r.get('verdict', 'pending'):15s}  token={r['token'][:30]}...")
+            print(f"  iter {r['iteration']}: verdict={r.get('verdict', 'pending'):15s}  token=已获取")
 
 
 # ======================================================================

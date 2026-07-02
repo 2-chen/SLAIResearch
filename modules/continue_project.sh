@@ -356,7 +356,7 @@ if reviews: print(reviews[-1].get('token', ''))
 " 2>/dev/null)
 
     if [[ -n "$TOKEN" ]]; then
-        echo "  轮询审稿 token: ${TOKEN:0:20}..."
+        echo "  轮询审稿 token: 已获取..."
         local ROUND_DIR="${WORKSPACE}/review/round_$(printf '%03d' ${ITERATION:-0})"
         mkdir -p "$ROUND_DIR"
         REVIEW_DATA=$(echo "$TOKEN" | python -c "

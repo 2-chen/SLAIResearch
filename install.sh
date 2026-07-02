@@ -173,13 +173,13 @@ from config import SEMANTIC_SCHOLAR_API_KEY, CLAUDE_API_KEY, PAPERREVIEW_EMAIL
 
 # Claude
 if CLAUDE_API_KEY:
-    print(f'  ANTHROPIC_API_KEY: ***{CLAUDE_API_KEY[-8:]}')
+    print('  ANTHROPIC_API_KEY: 已配置')
 else:
     print('  [WARN] ANTHROPIC_API_KEY 未设置 — Claude Code 无法使用')
 
 # Semantic Scholar
 if SEMANTIC_SCHOLAR_API_KEY and 's2k-' in SEMANTIC_SCHOLAR_API_KEY:
-    print(f'  SEMANTIC_SCHOLAR_API_KEY: ***{SEMANTIC_SCHOLAR_API_KEY[-8:]}')
+    print('  SEMANTIC_SCHOLAR_API_KEY: 已配置')
 else:
     print('  [WARN] SEMANTIC_SCHOLAR_API_KEY 未设置 — 文献搜索将被限流')
     print('         免费申请: https://api.semanticscholar.org/')
