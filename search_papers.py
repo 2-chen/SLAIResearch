@@ -63,12 +63,35 @@ def _paper_fingerprint(p: dict) -> str:
     title = " ".join((p.get("title") or "").lower().split())[:100]
     return f"title:{hashlib.md5(title.encode()).hexdigest()[:12]}"
 
+
+def _sanitize_query(query: str) -> str:
+    """Strip/replace unicode characters that break latin-1 URL encoding.
+
+    ``requests`` internally encodes query params with ``latin-1``, which
+    cannot represent smart quotes (“”), em-dashes, and other typographic
+    punctuation that sometimes sneaks into search strings from LLM prompts.
+    """
+    # Replace common unicode punctuation with ASCII equivalents
+    replacements = {
+        "“": '"', "”": '"',    # " "
+        "‘": "'", "’": "'",    # ' '
+        "–": "-", "—": "--",   # – —
+        "…": "...",                 # …
+        " ": " ",                   # non-breaking space
+    }
+    for uni, ascii in replacements.items():
+        query = query.replace(uni, ascii)
+    # Drop any remaining non-latin1 characters silently
+    return query.encode("latin-1", errors="replace").decode("latin-1")
+
+
 # ---------------------------------------------------------------------------
 # arXiv API (free, no key)
 # ---------------------------------------------------------------------------
 
 def search_arxiv(query: str, max_results: int = 20) -> list[dict]:
     """Search arXiv via official API. Returns list of paper dicts."""
+    query = _sanitize_query(query)
     url = "https://export.arxiv.org/api/query"
     params = {
         "search_query": f"all:{query}",
@@ -120,6 +143,7 @@ def search_arxiv(query: str, max_results: int = 20) -> list[dict]:
 
 def search_semantic_scholar(query: str, max_results: int = 20) -> list[dict]:
     """Search Semantic Scholar. Falls back gracefully if key is invalid."""
+    query = _sanitize_query(query)
     url = "https://api.semanticscholar.org/graph/v1/paper/search"
     headers = {}
     if SEMANTIC_SCHOLAR_API_KEY and "s2k-" in SEMANTIC_SCHOLAR_API_KEY:
@@ -165,6 +189,7 @@ def search_semantic_scholar(query: str, max_results: int = 20) -> list[dict]:
 
 def search_openalex(query: str, max_results: int = 20) -> list[dict]:
     """Search OpenAlex works. Polite to the API with rate limiting."""
+    query = _sanitize_query(query)
     url = "https://api.openalex.org/works"
     params = {
         "search": query,
@@ -220,6 +245,7 @@ def search_openalex(query: str, max_results: int = 20) -> list[dict]:
 def search_google_scholar(query: str, max_results: int = 20) -> list[dict]:
     """Search Google Scholar via scholarly. Gracefully returns [] if scholarly
     is not installed or the query is rate-limited."""
+    query = _sanitize_query(query)
     try:
         searcher = GoogleScholarSearch()
         results = searcher.search(query, max_results=max_results)
@@ -253,6 +279,7 @@ def search_google_scholar(query: str, max_results: int = 20) -> list[dict]:
 def search_datacite(query: str, max_results: int = 20) -> list[dict]:
     """Search DataCite for datasets/software. Returns paper-like dicts for
     compatibility with merge_results."""
+    query = _sanitize_query(query)
     try:
         client = DataCiteClient()
         results = client.search(query, max_results=max_results)
