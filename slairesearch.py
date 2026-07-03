@@ -96,6 +96,14 @@ _CLAUDE_RETRY_BASE_DELAY = 10       # seconds
 _CLAUDE_RETRY_BACKOFF_FACTOR = 2    # exponential multiplier
 _CLAUDE_RETRY_MAX_DELAY = 120       # seconds cap
 _CLAUDE_TIMEOUT = 600               # seconds per call
+# When true, use PTY instead of subprocess.PIPE for ALL claude calls.
+# PTY avoids the "claude -p" flag-parsing ambiguity and the pipe-buffer-
+# hang issue on NPU / headless environments.  subprocess.run(input=…)
+# is used as a lighter fallback on standard Linux.
+_CLAUDE_USE_PTY = (
+    os.environ.get("SLAIRESEARCH_CLAUDE_PTY", "").lower() in ("1", "true", "yes")
+    or NPU_ENABLED
+)
 
 
 def _claude_subprocess_env() -> dict:
@@ -1335,7 +1343,7 @@ and fix the shell script. Only make minimal, targeted fixes — do NOT rewrite t
         cmd = [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL,
                "--max-turns", "5"]
         result = subprocess.run(
-            cmd + [prompt], capture_output=True, text=True, timeout=300,
+            cmd, input=prompt, capture_output=True, text=True, timeout=300,
             cwd=str(state.work_dir), env=_claude_subprocess_env(),
         )
         output = result.stdout or ""
@@ -2162,20 +2170,18 @@ def _print_claude_diagnostics(base_url: str, api_key: str, settings_path: Path) 
 def _call_claude(sm: StateManager, state: ResearchState, stage: Stage,
                  prompt: str, retry_feedback: str = "",
                  max_retries: int = _CLAUDE_MAX_RETRIES) -> ResearchState:
-    """
-    Invoke Claude Code as an EXECUTION TOOL of this project.
+    """Invoke Claude Code as an EXECUTION TOOL of this project.
 
-    Includes retry with exponential backoff for transient failures
-    (network errors, timeouts, rate limits).
-
-    If retry_feedback is provided, it is appended to the prompt.
+    Prompt is passed via stdin — never as a positional CLI arg — so the
+    ``-p`` flag placement is irrelevant and long prompts don't hit OS argv
+    limits.  On NPU (Ascend / headless) the PTY wrapper avoids the pipe-buffer
+    hang that affects plain ``subprocess.Popen`` in those environments.
     """
     if retry_feedback:
-        feedback_block = f"""
+        prompt = prompt + f"""
 
 ---
 # IMPORTANT: Previous Review Feedback
-
 The previous attempt at this stage was reviewed and did NOT pass. You MUST
 address ALL of the following issues in this revision:
 
@@ -2184,45 +2190,55 @@ address ALL of the following issues in this revision:
 Please explicitly acknowledge how you've addressed each issue above.
 ---
 """
-        prompt = prompt + feedback_block
 
     prompt_file = Path(state.work_dir) / f"{stage.value}_prompt.md"
     prompt_file.write_text(prompt)
 
     output_file = Path(state.work_dir) / f"{stage.value}_output.md"
 
-    # Large prompts go via stdin — avoids OS argv limits and CLI arg-parsing issues.
-    # --max-turns: prevents infinite agent loops during tool-heavy stages.
-    # Use PIPE mode (not PTY) for text-heavy stages.  PTY is only needed
-    # for experiment scientist which issues heavy tool calls.
-    cmd = [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL,
-           "--max-turns", "30", prompt]
+    cmd = [
+        CLAUDE_CMD, "-p", "--output-format", "text",
+        "--model", CLAUDE_MODEL, "--max-turns", "30",
+    ]
+    claude_env = _claude_subprocess_env()
 
     last_error = ""
     for attempt in range(max_retries + 1):
         logger.info(
-            "Executing: %s (attempt %d/%d, timeout=%ds, prompt=%d chars) ...",
-            " ".join(cmd[:5]), attempt + 1, max_retries + 1, _CLAUDE_TIMEOUT,
+            "Executing: %s (attempt %d/%d, timeout=%ds, prompt=%d chars%s) ...",
+            " ".join(cmd), attempt + 1, max_retries + 1, _CLAUDE_TIMEOUT,
             len(prompt),
+            " [PTY]" if _CLAUDE_USE_PTY else "",
         )
 
         try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True,
-                timeout=_CLAUDE_TIMEOUT,
-                cwd=str(state.work_dir),
-                env=_claude_subprocess_env(),
-            )
-            output = result.stdout or ""
-            if result.returncode != 0 and not output.strip():
-                error_msg = (
-                    result.stderr[:300] if result.stderr
-                    else f"exit code {result.returncode}"
+            if _CLAUDE_USE_PTY:
+                rc, output = run_in_pty(
+                    cmd, prompt,
+                    timeout=_CLAUDE_TIMEOUT,
+                    cwd=str(state.work_dir),
+                    env=claude_env,
                 )
-                raise subprocess.CalledProcessError(
-                    result.returncode, cmd,
-                    output=output, stderr=result.stderr,
+                if rc != 0 and not output.strip():
+                    raise subprocess.CalledProcessError(
+                        rc, cmd, output=output, stderr="",
+                    )
+            else:
+                result = subprocess.run(
+                    cmd, input=prompt, capture_output=True, text=True,
+                    timeout=_CLAUDE_TIMEOUT,
+                    cwd=str(state.work_dir), env=claude_env,
                 )
+                output = result.stdout or ""
+                if result.returncode != 0 and not output.strip():
+                    error_msg = (
+                        result.stderr[:300] if result.stderr
+                        else f"exit code {result.returncode}"
+                    )
+                    raise subprocess.CalledProcessError(
+                        result.returncode, cmd,
+                        output=output, stderr=result.stderr,
+                    )
 
             output_file.write_text(output)
             logger.info("Claude output → %s (%d chars)", output_file, len(output))
@@ -2232,10 +2248,7 @@ Please explicitly acknowledge how you've addressed each issue above.
             })
 
         except FileNotFoundError:
-            logger.warning(
-                "`%s` CLI not found. Prompt saved to %s — run manually.",
-                CLAUDE_CMD, prompt_file,
-            )
+            logger.warning("`%s` CLI not found. Prompt saved to %s.", CLAUDE_CMD, prompt_file)
             raise
 
         except subprocess.TimeoutExpired:
@@ -2246,13 +2259,14 @@ Please explicitly acknowledge how you've addressed each issue above.
         except subprocess.CalledProcessError as exc:
             stderr_info = exc.stderr[:300] if exc.stderr else "no stderr"
             stdout_info = exc.output[:500] if exc.output else "no stdout"
-            last_error = f"Exit {exc.returncode}: stderr={stderr_info} | stdout={stdout_info}"
+            last_error = f"Exit {exc.returncode}: {stderr_info} | {stdout_info}"
             logger.warning("Claude call failed (attempt %d/%d): %s",
                           attempt + 1, max_retries + 1, last_error)
 
         except Exception as exc:
             last_error = str(exc)
-            logger.warning("Claude call error (attempt %d/%d): %s", attempt + 1, max_retries + 1, exc)
+            logger.warning("Claude call error (attempt %d/%d): %s",
+                          attempt + 1, max_retries + 1, exc)
 
         # ── Retry with backoff ──
         if attempt < max_retries:
@@ -2830,7 +2844,7 @@ def _call_patch_single_issue(
            "--max-turns", "2"]
     try:
         result = subprocess.run(
-            cmd + [prompt], capture_output=True, text=True, timeout=300,
+            cmd, input=prompt, capture_output=True, text=True, timeout=300,
             cwd=str(PROJECT_ROOT), env=_claude_subprocess_env(),
         )
         raw = result.stdout or ""
@@ -3387,9 +3401,8 @@ def _extract_baselines_via_llm_full_context(
 
     try:
         result = subprocess.run(
-            [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL,
-             prompt],
-            capture_output=True, text=True, timeout=120,
+            [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL],
+            input=prompt, capture_output=True, text=True, timeout=120,
             cwd=str(PROJECT_ROOT), env=_claude_subprocess_env(),
         )
         raw = result.stdout or ""
