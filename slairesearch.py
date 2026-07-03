@@ -842,7 +842,7 @@ def _do_hypothesis_generation(sm: StateManager, state: ResearchState, retry_feed
         # Detect whether issues are data-level (can only be fixed by re-running
         # the full engine with actual search + PDF download) or text-level
         # (can be fixed by patching the JSON output).
-        if _has_data_level_issues(retry_feedback):
+        if _has_data_level_issues(hypo_file):
             logger.info("Retry feedback indicates data-level issues — "
                         "re-running full ReAct engine (not patching) …")
             # Ensure papers_metadata.json exists so the engine can parse it
@@ -903,14 +903,31 @@ def _do_hypothesis_generation(sm: StateManager, state: ResearchState, retry_feed
 
 
 def _do_baseline_fetching(sm: StateManager, state: ResearchState, retry_feedback: str = "") -> ResearchState:
-    """Clone baseline GitHub repos for structural reference in experiment design."""
+    """Clone baseline GitHub repos for structural reference in experiment design.
+
+    The extraction of method names is topic-driven (not just one hypothesis),
+    and on retry with reviewer feedback indicating wrong baselines, the LLM
+    extraction is bypassed in favour of a well-known-baseline lookup + LLM URL
+    resolution.
+
+    Key safeguards:
+      - minimum baseline count enforced (expands from topic DB if needed)
+      - retry clears stale caches for wrong methods
+      - repo validation checks both method name AND topic relevance
+    """
     from config import BASELINE_CLONING_ENABLED, BASELINE_MAX_REPOS
+    import shutil as _shutil
 
     if not BASELINE_CLONING_ENABLED:
         logger.info("Baseline cloning disabled — skipping")
         (Path(state.experiment_dir) / "baseline_context.md").write_text("")
         return sm.complete_stage(state, Stage.BASELINE_FETCHING, {"skipped": True})
 
+    topic = state.topic
+    lit_dir = Path(state.literature_dir)
+    hypo_dir = Path(state.hypothesis_dir)
+
+    # ── Load context ──
     try:
         from literature_context import LiteratureContext
         lc = LiteratureContext(state.work_dir)
@@ -920,110 +937,169 @@ def _do_baseline_fetching(sm: StateManager, state: ResearchState, retry_feedback
         logger.warning("Could not parse literature for baselines: %s", e)
         papers = []
 
-    # Extract baseline method names: prefer selected hypothesis, fall back to all
-    method_names: list[str] = []
-    hypo_file = Path(state.hypothesis_dir) / "hypothesis_output.json"
-    if hypo_file.exists():
-        try:
-            import json
-            hypo = json.loads(hypo_file.read_text())
-            hypotheses = hypo.get("hypotheses", [])
-            # Sort by score descending, prefer selected hypothesis as tiebreaker
-            selected_id = hypo.get("selected_hypothesis", "")
-            hypotheses.sort(key=lambda h: (
-                0 if h.get("id", "") == selected_id else 1,
-                -(h.get("score", 0) if isinstance(h, dict) else 0),
-            ))
-            # Extract baseline method names from the best hypothesis via LLM
-            best = hypotheses[0] if hypotheses else {}
-            if isinstance(best, dict):
-                method_names = _extract_baselines_via_llm(best, state.topic,
-                                                          retry_feedback=retry_feedback)
-        except Exception:
-            pass
+    lit_review = _read_or(str(lit_dir), "literature_review.md")
 
-    # Deduplicate while preserving order
+    # Load all hypotheses as JSON string for context
+    all_hypotheses_json = ""
+    try:
+        hypo_file = hypo_dir / "hypothesis_output.json"
+        if hypo_file.exists():
+            hypo_data = json.loads(hypo_file.read_text())
+            all_hypotheses_json = json.dumps(hypo_data, indent=2, ensure_ascii=False)
+            hypotheses = hypo_data.get("hypotheses", [])
+    except Exception:
+        hypotheses = []
+
+    # ── Determine method names ──
+    MIN_BASELINES = 3
+    method_names: list[str] = []
+
+    # Always start with topic-driven DB lookup (deterministic, no LLM).
+    # This ensures a minimum set of relevant baselines regardless of LLM quality.
+    topic_defaults = _resolve_baselines_from_topic(topic, lit_review)
+    method_names.extend(topic_defaults)
+
+    # Supplement with LLM extraction from full context (hypotheses + literature).
+    extra = _extract_baselines_via_llm_full_context(
+        topic=topic,
+        all_hypotheses_json=all_hypotheses_json[:8000],
+        lit_review=lit_review[:8000],
+        retry_feedback=retry_feedback,
+        known_baselines=method_names,
+    )
+    for m in extra:
+        if m not in method_names:
+            method_names.append(m)
+
+    # On retry, purge cached repos whose methods are no longer in the list.
+    # This prevents stale wrong repos from being reused.
+    if retry_feedback:
+        _purge_stale_baseline_caches(state, method_names)
+
+    # Deduplicate
     seen: set[str] = set()
     method_names = [n for n in method_names if n and not (n in seen or seen.add(n))]
 
-    # Also try to extract from experiment plan if it exists (from literature context)
-    if not method_names and papers:
-        method_names = list(landscape.standard_baselines) if landscape else []
+    # ── Enforce minimum baseline count ──
+    if len(method_names) < MIN_BASELINES:
+        logger.info("Only %d methods extracted (min %d) — expanding from topic DB",
+                     len(method_names), MIN_BASELINES)
+        for m in topic_defaults:
+            if m not in seen and m not in method_names:
+                method_names.append(m)
+                seen.add(m)
+            if len(method_names) >= max(MIN_BASELINES, BASELINE_MAX_REPOS):
+                break
 
     if not method_names:
         logger.info("No baseline method names found — skipping baseline fetching")
         (Path(state.experiment_dir) / "baseline_context.md").write_text("")
         return sm.complete_stage(state, Stage.BASELINE_FETCHING, {
             "skipped": True,
-            "reason": "no methods found (hypothesis output missing 'baselines' field; update prompt template to include it)",
+            "reason": "no methods found",
         })
 
-    logger.info("Fetching baseline repos for %d methods...", len(method_names))
+    # ── Clone + validate repos ──
+    logger.info("Fetching baseline repos for %d methods: %s",
+                 len(method_names), ", ".join(method_names[:10]))
+
     try:
-        from baseline_finder import BaselineFinder
+        from baseline_finder import BaselineFinder, BaselineSource
         bf = BaselineFinder(
             cache_dir=Path(state.work_dir) / ".." / ".shared" / "baselines",
             max_repos=BASELINE_MAX_REPOS,
         )
+
         contexts = bf.find_and_extract(papers=papers, method_names=method_names[:BASELINE_MAX_REPOS])
 
-        # ── Validate cloned repos and clear mismatches ──
-        # Retry feedback often points out wrong repos (e.g., "reform-swift"
-        # matched for Reformer).  Re-clone after clearing invalid caches.
-        valid_contexts = []
+        # Validate: method name match + topic relevance
+        valid_contexts: list = []
+        failed_infos: list[tuple[str, str]] = []  # (method_name, reason)
+
         for ctx in contexts:
-            if _validate_baseline_repo(Path(ctx.local_path), ctx.method_name):
+            repo_dir = Path(ctx.local_path)
+            is_valid, reason = _validate_baseline_repo_v2(repo_dir, ctx.method_name, topic)
+            if is_valid:
                 valid_contexts.append(ctx)
             else:
-                logger.warning("Repo '%s' failed validation for method '%s' — "
-                               "clearing from cache for next retry", ctx.local_path, ctx.method_name)
-                import shutil
-                shutil.rmtree(ctx.local_path, ignore_errors=True)
-        if len(valid_contexts) < len(contexts):
-            logger.info("Repo validation: %d/%d passed, %d invalid repos cleared",
+                logger.warning("Repo '%s' failed validation: %s — clearing cache",
+                               repo_dir.name, reason)
+                failed_infos.append((ctx.method_name, reason))
+                _shutil.rmtree(repo_dir, ignore_errors=True)
+
+        if failed_infos:
+            logger.info("Repo validation: %d/%d passed — %d failed: %s",
                         len(valid_contexts), len(contexts),
-                        len(contexts) - len(valid_contexts))
-            # ── Resolve correct URLs for methods whose repos failed validation ──
-            # GitHub search can match wrong repos (Reform for Reformer, etc.).
-            # On retry, use LLM to get canonical URLs directly, bypassing search.
-            failed_methods = [
-                ctx.method_name for ctx in contexts
-                if ctx not in valid_contexts
-            ]
-            if retry_feedback and failed_methods:
+                        len(failed_infos),
+                        ", ".join(f"{m}:{r[:40]}" for m, r in failed_infos[:3]))
+
+            # ── Retry: resolve correct URLs for failed methods via LLM ──
+            failed_names = [m for m, _ in failed_infos]
+            if retry_feedback:
                 resolved = _resolve_correct_baseline_urls(
-                    failed_methods, retry_feedback, state.topic,
+                    failed_names, retry_feedback, topic,
                 )
                 for method_name, url in resolved:
-                    if url:
-                        logger.info("Resolved correct URL for '%s': %s", method_name, url)
-                        # Clone directly
-                        slug = bf._repo_slug(url, method_name)
-                        target_dir = bf.cache_dir / slug
-                        if bf._clone_repo(url, target_dir):
-                            from baseline_finder import BaselineSource
-                            src = BaselineSource(
-                                method_name=method_name,
-                                paper_title="",
-                                repo_url=url,
-                                source="llm_resolved",
-                            )
-                            ctx = bf._extract_context(target_dir, src)
-                            if _validate_baseline_repo(Path(ctx.local_path), method_name):
-                                valid_contexts.append(ctx)
-                                logger.info("✓ Corrected repo for '%s': %s", method_name, url)
+                    if not url:
+                        continue
+                    logger.info("Resolved correct URL for '%s': %s", method_name, url)
+                    slug = bf._repo_slug(url, method_name)
+                    target_dir = bf.cache_dir / slug
+                    if bf._clone_repo(url, target_dir):
+                        src = BaselineSource(
+                            method_name=method_name, paper_title="",
+                            repo_url=url, source="llm_resolved",
+                        )
+                        ctx2 = bf._extract_context(target_dir, src)
+                        is_valid2, _ = _validate_baseline_repo_v2(
+                            Path(ctx2.local_path), method_name, topic,
+                        )
+                        if is_valid2:
+                            valid_contexts.append(ctx2)
+                            logger.info("✓ Corrected repo for '%s': %s", method_name, url)
 
-        contexts = valid_contexts
-        prompt_block = bf.format_for_prompt(contexts)
+        # ── Also try well-known URLs if still too few ──
+        if len(valid_contexts) < MIN_BASELINES and retry_feedback:
+            logger.info("Only %d valid baselines — expanding with known URLs", len(valid_contexts))
+            known_urls = _KNOWN_BASELINE_URLS.get("_default_search_queries", {})
+            for method_name, known_url in list(known_urls.items())[:BASELINE_MAX_REPOS]:
+                if any(ctx.method_name.lower() == method_name.lower() for ctx in valid_contexts):
+                    continue
+                # Clone directly from the known URL (no search needed)
+                slug = bf._repo_slug(known_url, method_name)
+                target_dir = bf.cache_dir / slug
+                if bf._clone_repo(known_url, target_dir):
+                    src = BaselineSource(
+                        method_name=method_name, paper_title="",
+                        repo_url=known_url, source="known_url",
+                    )
+                    ctx3 = bf._extract_context(target_dir, src)
+                    is_valid3, _ = _validate_baseline_repo_v2(
+                        Path(ctx3.local_path), method_name, topic,
+                    )
+                    if is_valid3:
+                        valid_contexts.append(ctx3)
+                        logger.info("✓ Known-URL baseline: %s → %s", method_name, known_url)
+                    else:
+                        _shutil.rmtree(target_dir, ignore_errors=True)
 
+        # ── Write output ──
+        prompt_block = bf.format_for_prompt(valid_contexts)
         output_path = Path(state.experiment_dir) / "baseline_context.md"
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(prompt_block)
-        logger.info("Baseline context saved (%d chars, %d repos)", len(prompt_block), len(contexts))
+        logger.info("Baseline context saved (%d chars, %d repos)",
+                     len(prompt_block), len(valid_contexts))
+
+        # Validate output quality before declaring success
+        methods_found = [ctx.method_name for ctx in valid_contexts]
+        logger.info("Final baselines: %s", ", ".join(methods_found) if methods_found else "(none)")
 
         return sm.complete_stage(state, Stage.BASELINE_FETCHING, {
-            "repos_found": len(contexts),
+            "repos_found": len(valid_contexts),
             "methods_searched": len(method_names[:BASELINE_MAX_REPOS]),
+            "methods": methods_found,
+            "retry": bool(retry_feedback),
         })
     except Exception as e:
         logger.warning("Baseline fetching failed (non-fatal): %s", e)
@@ -2991,39 +3067,40 @@ def _ensure_papers_metadata(literature_dir: str) -> bool:
     return False
 
 
-def _has_data_level_issues(retry_feedback: str) -> bool:
-    """Check if retry feedback indicates data-vacuum issues requiring full re-run.
+def _has_data_level_issues(hypo_file: Path) -> bool:
+    """Check hypothesis output JSON for data-vacuum conditions.
 
-    These are problems text-patching cannot fix: zero papers analyzed, zero
-    search rounds, zero PDFs deep-read, or missing literature retrieval.
-    Full re-run of the ReAct engine (with actual search + PDF download) is
-    the only way to resolve them."""
-    if not retry_feedback:
+    Reads the JSON directly instead of pattern-matching reviewer feedback
+    text — these fields are produced by our own code and reliable.
+
+    A data-level issue means text-patching cannot help; the full ReAct engine
+    must be re-run (with actual search + PDF download).
+    """
+    if not hypo_file.exists():
         return False
 
-    data_vacuum_patterns = [
-        r'total_papers_analyzed\s*[=:]\s*0',
-        r'papers_analyzed\s*[=:]\s*0',
-        r'search_rounds\s*[=:]\s*0',
-        r'pdfs_deep_read\s*[=:]\s*0',
-        r'文献检索完全缺失',
-        r'系统性文献检索.*未执行',
-        r'必须实际执行检索',
-        r'methodology.*缺陷.*检索',
-        # English / numeric patterns
-        r'\b0\s+papers?\s+(analyzed|collected|found|retrieved)',
-        r'(?:zero|no)\s+papers?\s+(?:were\s+)?analyzed',
-        r'without\s+(?:any\s+)?(?:systematic\s+)?(?:literature\s+)?search',
-        r'no\s+(?:literature\s+)?(?:search|retrieval)\s+(?:was\s+)?(?:performed|conducted|done)',
-        r'literature\s+(?:grounding|basis).*missing',
-        r'(?:missing|absent|skipped|bypassed).*(?:literature|papers?\s+search|retrieval)',
-    ]
+    try:
+        data = json.loads(hypo_file.read_text())
+    except (json.JSONDecodeError, OSError):
+        return False
 
-    for pat in data_vacuum_patterns:
-        if re.search(pat, retry_feedback, re.IGNORECASE):
-            logger.info("Detected data-level issue in feedback (pattern: %s) — "
-                        "full engine re-run required", pat)
+    # Numeric fields: zero means no real work was done
+    for field in ("total_papers_analyzed", "papers_analyzed",
+                  "search_rounds", "pdfs_deep_read"):
+        val = data.get(field)
+        if isinstance(val, (int, float)) and val == 0:
+            logger.info("Data-level issue: %s=%s → full engine re-run required",
+                         field, val)
             return True
+
+    # Structural fields: empty when they should have content
+    for field in ("identified_gaps", "hypotheses"):
+        val = data.get(field)
+        if isinstance(val, list) and len(val) == 0:
+            logger.info("Data-level issue: empty %s → full engine re-run required",
+                         field)
+            return True
+
     return False
 
 
@@ -3099,62 +3176,6 @@ def _resolve_correct_baseline_urls(
     return [(name, "") for name in failed_methods]
 
 
-def _validate_baseline_repo(repo_dir: Path, method_name: str) -> bool:
-    """Quick validation that a cloned repo is actually about the expected method.
-
-    Checks README content for the method name to catch mismatches like:
-      - "Reform" (Swift vector graphics app) matched for "Reformer"
-      - "pysmb" (SMB file-sharing library) matched for "Samba"
-      - "GLaDOS" (voice assistant) matched for "GLA"
-      - "IPO prediction" matched for "Longformer"
-
-    Returns True if the repo appears relevant, False if it should be discarded.
-    """
-    name_lower = method_name.lower().strip()
-
-    # Check README
-    for readme_name in ["README.md", "README.rst", "readme.md", "README.md", "README.txt"]:
-        readme = repo_dir / readme_name
-        if readme.exists():
-            try:
-                content = readme.read_text(errors="replace")[:6000].lower()
-                # Method name should appear as a word (not just substring)
-                if name_lower in content:
-                    return True
-                # Allow hyphenated variants: "flash-attention" for FlashAttention
-                if "-" in name_lower and name_lower.replace("-", " ") in content:
-                    return True
-                # Mismatch: README doesn't mention the method → likely wrong repo
-                logger.warning(
-                    "Repo '%s' README (%d chars) does not mention method '%s'. "
-                    "First 300 chars: %s...",
-                    repo_dir.name, len(content), method_name,
-                    content[:300].replace('\n', ' ')
-                )
-                return False
-            except Exception:
-                pass
-
-    # Fallback: no README → check Python files for method references
-    py_files = list(repo_dir.glob("**/*.py"))[:20]
-    found_in_py = False
-    for f in py_files:
-        try:
-            if name_lower in f.read_text(errors="replace")[:2000].lower():
-                found_in_py = True
-                break
-        except Exception:
-            pass
-
-    if found_in_py:
-        logger.info("Repo '%s' validated via Python source (no README)", repo_dir.name)
-        return True
-
-    logger.warning("Repo '%s' could not be validated for method '%s' "
-                   "(no matching README or source files)", repo_dir.name, method_name)
-    return False
-
-
 # ======================================================================
 # Utilities
 # ======================================================================
@@ -3192,66 +3213,178 @@ def _render_template_file(template_path: str, **kwargs: str) -> str:
     return template
 
 
-def _extract_baselines_via_llm(best_hypothesis: dict, topic: str,
-                              retry_feedback: str = "") -> list[str]:
-    """Use Claude to intelligently extract baseline method names from a hypothesis.
+# ══════════════════════════════════════════════════════════════════════
+# Topic-driven baseline extraction (replaces fragile single-hypothesis approach)
+# ══════════════════════════════════════════════════════════════════════
 
-    Unlike regex-based ``_extract_baselines_from_text``, this understands the
-    research context and returns method names that actually make sense for the
-    topic (e.g. FlashAttention, Linformer for long-sequence attention).
+# ── Well-known baseline URL table (topic keywords → canonical repos) ──
+# Used as fallback when LLM extraction returns too few methods (common in
+# NPU environments where the LLM has limited context), and as the primary
+# source on retry when the reviewer says all baselines are wrong.
+_KNOWN_BASELINE_URLS: dict[str, dict[str, str]] = {
+    # Attention / Transformers — multi-word to avoid matching "attention" everywhere
+    "attention mechanism|transformer|self-attention|cross-attention|long sequence": {
+        "Transformer (vanilla)": "https://github.com/huggingface/transformers",
+        "FlashAttention": "https://github.com/Dao-AILab/flash-attention",
+        "Linformer": "https://github.com/lucidrains/linformer",
+        "Reformer": "https://github.com/lucidrains/reformer-pytorch",
+        "Longformer": "https://github.com/allenai/longformer",
+        "Performer": "https://github.com/lucidrains/performer-pytorch",
+        "BigBird": "https://github.com/google-research/bigbird",
+    },
+    "mamba|ssm|state space": {
+        "Mamba": "https://github.com/state-spaces/mamba",
+        "S4": "https://github.com/state-spaces/s4",
+    },
+    "linear attention|efficient attention": {
+        "Linear Transformer": "https://github.com/lucidrains/linear-attention-transformer",
+        "Fast Transformer (PyTorch)": "https://github.com/idiap/fast-transformers",
+    },
+    # RL
+    "reinforcement learning|policy gradient|deep RL": {
+        "Stable-Baselines3": "https://github.com/DLR-RM/stable-baselines3",
+        "DQN (baselines)": "https://github.com/openai/baselines",
+    },
+    # NLP — removed "text" (too greedy)
+    "language model|LLM|NLP|BERT|GPT|pretrained": {
+        "BERT": "https://github.com/google-research/bert",
+        "GPT-2": "https://github.com/openai/gpt-2",
+    },
+    # Vision
+    "vision|image classification|ViT|object detection": {
+        "ResNet": "https://github.com/pytorch/vision",
+        "Vision Transformer": "https://github.com/lucidrains/vit-pytorch",
+    },
+    # ── Known-URL fallback (method → url, used when all else fails) ──
+    "_default_search_queries": {
+        "FlashAttention": "https://github.com/Dao-AILab/flash-attention",
+        "Mamba": "https://github.com/state-spaces/mamba",
+        "Bert (transformers)": "https://github.com/huggingface/transformers",
+        "ResNet": "https://github.com/pytorch/vision",
+    },
+}
 
-    When retry_feedback is provided, it includes reviewer corrections about
-    which baselines were wrong in previous attempts."""
-    import json as _json
-    # Build summary from ALL fields in the hypothesis (dynamic, not hardcoded)
-    fields = []
-    for k, v in best_hypothesis.items():
-        if k.startswith("_") or k in ("id", "score", "selected"):
+
+def _resolve_baselines_from_topic(topic: str, lit_review: str = "") -> list[str]:
+    """Match topic + literature review against well-known baseline DB.
+
+    Returns a deduplicated list of method names.  This is deterministic
+    (no LLM call) and serves as a reliable fallback when LLM extraction
+    returns too few or wrong methods.
+    """
+    combined = (topic + " " + lit_review[:5000]).lower()
+    found: list[str] = []
+
+    for pattern_key, methods in _KNOWN_BASELINE_URLS.items():
+        if pattern_key.startswith("_"):
             continue
-        if isinstance(v, str) and v.strip():
-            fields.append(f"## {k}\n{v}")
-        elif isinstance(v, list) and v:
-            # List of strings or list of dicts with title
-            items = []
-            for item in v:
-                if isinstance(item, str):
-                    items.append(f"- {item}")
-                elif isinstance(item, dict):
-                    title = item.get("title") or item.get("name") or _json.dumps(item)[:200]
-                    items.append(f"- {title}")
-            if items:
-                fields.append(f"## {k}\n" + "\n".join(items[:15]))
-        elif isinstance(v, dict) and v:
-            fields.append(f"## {k}\n{_json.dumps(v, ensure_ascii=False)[:2000]}")
+        # Match any keyword in the pattern (OR logic)
+        keywords = pattern_key.split("|")
+        if any(kw in combined for kw in keywords):
+            for name in methods:
+                if name not in found:
+                    found.append(name)
 
-    hypothesis_text = "\n\n".join(fields)
-    if not hypothesis_text.strip():
+    return found
+
+
+def _extract_baselines_via_llm_full_context(
+    topic: str = "",
+    all_hypotheses_json: str = "",
+    lit_review: str = "",
+    retry_feedback: str = "",
+    known_baselines: list[str] | None = None,
+) -> list[str]:
+    """LLM-driven baseline extraction from FULL context (not just one hypothesis).
+
+    Previous version only saw one hypothesis JSON → returned generic methods
+    like "LSTM" for a Transformer attention topic.  This version passes:
+      - Research topic
+      - ALL hypotheses (title + method_outline summaries)
+      - Literature review excerpts
+      - Reviewer feedback from failed attempts
+      - Known baselines (as hints to include or avoid)
+
+    Returns a list of method name strings (deduplicated by caller).
+    """
+    # Build compact hypothesis summary (titles + method outlines only)
+    hypo_context = ""
+    if all_hypotheses_json:
+        try:
+            hypo_data = json.loads(all_hypotheses_json)
+            hypotheses = hypo_data.get("hypotheses", [])
+            hypo_lines = []
+            for h in hypotheses:
+                hid = h.get("id", "?")
+                title = h.get("title", "")[:120]
+                method = (h.get("method_outline") or "")[:300]
+                key_refs = h.get("key_references", [])
+                refs_str = ", ".join(key_refs[:5]) if isinstance(key_refs, list) else str(key_refs)[:200]
+                hypo_lines.append(
+                    f"**{hid}**: {title}\n  Method: {method}\n  Key refs: {refs_str}"
+                )
+            hypo_context = "\n\n".join(hypo_lines)
+        except Exception:
+            hypo_context = all_hypotheses_json[:4000]
+
+    if not hypo_context and not topic:
         return []
 
-    # ── Include retry feedback so LLM can correct previous wrong matches ──
+    # Reviewer guidance
     feedback_note = ""
     if retry_feedback:
+        # Extract the core complaint from feedback (trim noise)
+        core = retry_feedback[:1500]
         feedback_note = (
-            f"\n\n## Previous Review Feedback (WRONG baselines to avoid)\n"
-            f"{retry_feedback[:2000]}\n\n"
-            f"IMPORTANT: The reviewer identified incorrect baseline repos in previous "
-            f"attempts. Do NOT suggest baselines that are acronym collisions (e.g., "
-            f"GLA → GLaDOS voice assistant, Samba → SMB file sharing). Use the "
-            f"canonical GitHub repo (e.g., allenai/longformer for Longformer, "
-            f"lucidrains/reformer-pytorch for Reformer).\n"
+            f"\n\n## Reviewer Feedback from Previous Failed Attempt\n"
+            f"{core}\n\n"
+            f"CRITICAL: The previous baselines were WRONG. Do NOT repeat them. "
+            f"Choose baselines that are actually RELEVANT to the research topic "
+            f"and the hypotheses below. Focus on methods explicitly mentioned in "
+            f"the hypotheses' method_outline and key_references fields.\n"
+        )
+
+    # Known baselines as positive hints or negative indicators
+    known_note = ""
+    if known_baselines:
+        known_note = (
+            f"\n\n## Suggested baselines from topic analysis\n"
+            + ", ".join(known_baselines[:15])
+            + "\nInclude these if they match the hypotheses. You may add more.\n"
         )
 
     prompt = (
-        f"Given this research hypothesis about \"{topic}\", identify the baseline "
-        f"methods / models / frameworks that should be compared against.\n\n"
-        f"{hypothesis_text[:6000]}"
-        f"{feedback_note}\n\n"
-        f"Output ONLY a JSON array of method name strings. Include well-known "
-        f"names (FlashAttention, Linformer, Longformer, Reformer, Performer, "
-        f"BigBird, Mamba, RetNet, etc.) plus any methods explicitly mentioned in "
-        f"the hypothesis. No explanation, just the JSON array.\n"
-        f'Example: ["FlashAttention", "Linformer", "Reformer"]'
+        f"You are identifying BASELINE methods for a research project. "
+        f"Your job is to find 5-10 specific, well-known methods/models that "
+        f"the proposed method should be COMPARED AGAINST in experiments.\n\n"
+        f"## Research Topic\n{topic}\n\n"
     )
+    if hypo_context:
+        prompt += (
+            f"## All Research Hypotheses (look for method names in method_outline "
+            f"and key_references)\n{hypo_context[:6000]}\n\n"
+        )
+    if lit_review:
+        prompt += (
+            f"## Literature Review Context\n{lit_review[:4000]}\n\n"
+        )
+    prompt += (
+        f"{feedback_note}"
+        f"{known_note}"
+        f"\n## Instructions\n"
+        f"1. Extract method names explicitly mentioned in the hypotheses "
+        f"(especially method_outline and key_references fields)\n"
+        f"2. Add canonically well-known baselines for this topic area\n"
+        f"3. Aim for 5-10 methods total — not 1 or 2\n"
+        f"4. Use the EXACT canonical name (e.g., 'FlashAttention' not 'flash attn')\n"
+        f"5. Do NOT include generic names like 'LSTM', 'CNN', 'MLP' unless the "
+        f"hypothesis explicitly targets them as primary baselines\n\n"
+        f"Output ONLY a JSON array of method name strings:\n"
+        f'["FlashAttention", "Linformer", "Reformer", "Mamba", "Performer", '
+        f'"BigBird", "Longformer", "Linear Transformer"]\n'
+        f"No explanation, no markdown — just the JSON array.\n"
+    )
+
     try:
         result = subprocess.run(
             [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL,
@@ -3260,58 +3393,143 @@ def _extract_baselines_via_llm(best_hypothesis: dict, topic: str,
             cwd=str(PROJECT_ROOT), env=_claude_subprocess_env(),
         )
         raw = result.stdout or ""
-        # Extract JSON array
         m = re.search(r'\[.*?\]', raw, re.DOTALL)
         if m:
-            names = _json.loads(m.group(0))
+            names = json.loads(m.group(0))
             if isinstance(names, list):
                 return [n for n in names if isinstance(n, str) and len(n) > 1]
     except Exception as e:
-        logger.warning("LLM baseline extraction failed: %s", e)
+        logger.warning("LLM baseline extraction (full context) failed: %s", e)
     return []
 
 
-def _extract_baselines_from_text(text: str) -> list[str]:
-    """Extract potential baseline method names from free-text fields.
+def _purge_stale_baseline_caches(state, keep_methods: list[str]) -> None:
+    """Clear cached repos from previous runs whose method names aren't in keep_methods.
 
-    Looks for patterns like:
-      - "outperforms X, Y, Z"
-      - "compared to X and Y"
-      - "baseline X / baseline method X"
-      - Capitalized acronyms (BERT, ResNet, DQN, etc.)
-    Returns a list of candidate baseline names.
+    Prevents the "cache always wins" problem where retry reuses a wrong repo
+    (e.g., LSTM tutorial) because it was cached in a previous attempt.
     """
-    import re
-    names: list[str] = []
+    import shutil as _shutil
+    cache_dir = (Path(state.work_dir) / ".." / ".shared" / "baselines").resolve()
+    if not cache_dir.exists():
+        return
 
-    if not text:
-        return names
+    keep_lower = {m.lower().strip() for m in keep_methods}
+    purged = 0
+    for entry in cache_dir.iterdir():
+        if not entry.is_dir():
+            continue
+        # Determine if this cache entry matches any kept method
+        keep = False
+        for m in keep_lower:
+            slug = hashlib.md5(m.encode()).hexdigest()[:8]
+            if slug in entry.name:
+                keep = True
+                break
+            # Also check if method name appears at the start (legacy slug format)
+            if m.replace(" ", "_").lower() in entry.name.lower():
+                keep = True
+                break
 
-    # Pattern 1: "compared to / outperforms / against X, Y, Z"
-    for pat in [
-        r'(?:outperforms?|beats?|surpasses?|vs\.?|versus|against|compared\s*to)\s+([A-Z][\w\s,()-]+?)(?:\.|,|\s+by|\s+in|\s+on|\s+with|\s+and\s+[a-z]|\s*$)',
-        r'(?:baselines?|baseline\s*methods?)[:\s]+([A-Z][\w\s,()-]+?)(?:\.|,|\s*$)',
-        r'(?:such\s+as|like|e\.g\.|including)\s+([A-Z][\w\s,()-]+?)(?:\.|,|\s+and\s+[a-z]|\s*$)',
-    ]:
-        for m in re.finditer(pat, text, re.IGNORECASE):
-            segment = m.group(1).strip()
-            # Split on commas and "and"
-            for part in re.split(r',\s*|\s+and\s+', segment):
-                part = part.strip().rstrip(')')
-                if len(part) >= 2 and len(part) <= 60 and not part.lower().startswith(('the ', 'our ', 'this ')):
-                    names.append(part)
+        if not keep:
+            logger.info("Purging stale baseline cache: %s", entry.name)
+            _shutil.rmtree(entry, ignore_errors=True)
+            purged += 1
 
-    # Pattern 2: Known baseline acronyms/names
-    acronym_pat = re.compile(
-        r'\b(?:ResNet\d*|ViT|BERT|GPT\d*|LLaMA\d*|DQN|PPO|A2C|SAC|TD3|DDPG|'
-        r'Transformer|UNet|Diffusion|CLIP|DiT|MoE|MoD|LoRA|RAG|GRPO|'
-        r'AdamW?|SGD|CNN|RNN|LSTM|GRU|GAN|VAE|WGAN|StyleGAN)\b'
+    if purged:
+        logger.info("Purged %d stale baseline cache(s)", purged)
+
+
+def _validate_baseline_repo_v2(repo_dir: Path, method_name: str, topic: str = "") -> tuple[bool, str]:
+    """Validate a cloned repo for method name AND topic relevance.
+
+    Returns (is_valid, reason_string).
+
+    Gate 1 (hard): method name must appear in README or source files.
+    Gate 2 (LLM): repo content is evaluated by an LLM for semantic
+        relevance to the research topic.  This replaces keyword / stop-word
+        heuristics that break on content we don't control.
+    """
+    name_lower = method_name.lower().strip()
+
+    readme_content = ""
+    for readme_name in ["README.md", "README.rst", "readme.md", "README.txt"]:
+        readme = repo_dir / readme_name
+        if readme.exists():
+            try:
+                readme_content = readme.read_text(errors="replace")
+                break
+            except Exception:
+                pass
+
+    if not readme_content:
+        py_files = list(repo_dir.glob("**/*.py"))[:20]
+        for f in py_files:
+            try:
+                readme_content += f.read_text(errors="replace")[:2000]
+            except Exception:
+                pass
+
+    # ── Gate 1: method name presence (fast, no LLM) ──
+    content_lower = readme_content[:8000].lower()
+    name_found = name_lower in content_lower
+    if not name_found and "-" in name_lower:
+        name_found = name_lower.replace("-", " ") in content_lower
+
+    if not name_found:
+        return False, f"method '{method_name}' not mentioned in README/source"
+
+    # ── Gate 2: LLM topic relevance (replaces keyword heuristics) ──
+    if topic and len(readme_content) > 100:
+        is_relevant, reason = _llm_judge_repo_relevance(
+            readme_content, method_name, topic,
+        )
+        return is_relevant, reason
+
+    return True, "ok (no topic filter)"
+
+
+def _llm_judge_repo_relevance(
+    readme: str, method_name: str, topic: str,
+) -> tuple[bool, str]:
+    """Ask an LLM whether a repo's README is relevant to the research topic.
+
+    This replaces brittle keyword / stop-word heuristics with semantic
+    understanding.  The LLM sees ~3 KB of README + topic and returns a
+    binary yes/no judgment.
+    """
+    # Escape code fences in README content so they don't confuse the LLM
+    safe_readme = readme[:3000].replace("```", "'''")
+    prompt = (
+        f"Does this GitHub repository contain an implementation of, or code "
+        f"directly related to, the method **{method_name}** in the context of "
+        f"this research topic?\n\n"
+        f"Research topic: {topic}\n\n"
+        f"## Repository README (first 3000 chars, code fences escaped as ''')"
+        f"\n{safe_readme}\n\n"
+        f"Return ONLY a single JSON object with two fields:\n"
+        f'- "relevant": true or false\n'
+        f'- "reason": a one-sentence explanation (max 120 chars)\n'
+        f"No other output.\n"
     )
-    for m in acronym_pat.finditer(text):
-        if m.group() not in names:
-            names.append(m.group())
+    try:
+        result = subprocess.run(
+            [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL],
+            input=prompt, capture_output=True, text=True, timeout=60,
+            cwd=str(PROJECT_ROOT), env=_claude_subprocess_env(),
+        )
+        raw = result.stdout or ""
+        m = re.search(r'\{[^}]*"relevant"[^}]*\}', raw, re.DOTALL)
+        if m:
+            data = json.loads(m.group(0))
+            relevant = data.get("relevant", False)
+            reason = data.get("reason", "LLM relevance check")
+            return relevant, reason
+    except Exception as e:
+        logger.warning("LLM repo relevance check failed for '%s': %s", method_name, e)
 
-    return names
+    # Fallback: allow through (Gate 1 already passed)
+    return True, "LLM check failed — allowing through"
 
 
 def _check_npu_broken() -> str:

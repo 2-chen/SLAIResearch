@@ -85,6 +85,59 @@ def _sanitize_query(query: str) -> str:
     return query.encode("latin-1", errors="replace").decode("latin-1")
 
 
+def _retry_request(
+    method: str,
+    url: str,
+    *,
+    params: dict | None = None,
+    headers: dict | None = None,
+    timeout: float = 30,
+    max_retries: int = 3,
+    backoff_base: float = 2.0,
+) -> "requests.Response | None":
+    """GET with exponential backoff + jitter for transient server errors.
+
+    Retries on 429 (rate-limit), 502 (bad gateway), 503 (unavailable),
+    504 (gateway timeout).  Returns None if exhausted so callers degrade
+    gracefully instead of crashing the pipeline.
+    """
+    import random as _random
+    last_status = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.request(method, url, params=params, headers=headers, timeout=timeout)
+            if resp.status_code in (429, 502, 503, 504):
+                last_status = resp.status_code
+                if attempt < max_retries:
+                    wait = backoff_base ** (attempt + 1) * (0.75 + 0.5 * _random.random())
+                    logger.warning(
+                        "%s %s... -> %d, retry in %.1fs (%d/%d)",
+                        method, url[:60], resp.status_code, wait, attempt + 1, max_retries,
+                    )
+                    time.sleep(wait)
+                    continue
+            resp.raise_for_status()
+            return resp
+        except requests.Timeout:
+            if attempt < max_retries:
+                wait = backoff_base ** (attempt + 1)
+                logger.warning("request timeout, retry in %.1fs (%d/%d)", wait, attempt + 1, max_retries)
+                time.sleep(wait)
+                continue
+            logger.warning("request timed out after %d retries", max_retries)
+            return None
+        except requests.RequestException as e:
+            if attempt < max_retries:
+                wait = backoff_base ** (attempt + 1)
+                logger.warning("request error (%s), retry in %.1fs", e, wait)
+                time.sleep(wait)
+                continue
+            logger.warning("request failed after %d retries: %s", max_retries, e)
+            return None
+    logger.warning("exhausted %d retries (last=%s)", max_retries, last_status)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # arXiv API (free, no key)
 # ---------------------------------------------------------------------------
@@ -101,20 +154,10 @@ def search_arxiv(query: str, max_results: int = 20) -> list[dict]:
         "sortOrder": "descending",
     }
     logger.info("arXiv: searching %d papers for '%s' ...", max_results, query[:60])
-    for attempt in range(3):
-        try:
-            resp = requests.get(url, params=params, timeout=30)
-            if resp.status_code == 429:
-                wait = 5 * (attempt + 1)
-                logger.warning("arXiv rate limited, retrying in %ds ...", wait)
-                time.sleep(wait)
-                continue
-            resp.raise_for_status()
-            break
-        except (requests.RequestException, UnicodeError):
-            if attempt == 2:
-                raise
-            time.sleep(3)
+    resp = _retry_request("GET", url, params=params, timeout=30)
+    if resp is None:
+        logger.warning("arXiv search failed after retries")
+        return []
 
     import xml.etree.ElementTree as ET
     ns = {
@@ -155,14 +198,9 @@ def search_semantic_scholar(query: str, max_results: int = 20) -> list[dict]:
         "fields": "title,authors,year,abstract,url,externalIds,citationCount,venue,openAccessPdf",
     }
     logger.info("Semantic Scholar: searching %d papers for '%s' ...", max_results, query[:60])
-    try:
-        resp = requests.get(url, params=params, headers=headers, timeout=30)
-        if resp.status_code == 429:
-            logger.warning("Semantic Scholar rate limited, skipping")
-            return []
-        resp.raise_for_status()
-    except (requests.RequestException, UnicodeError) as e:
-        logger.warning("Semantic Scholar error: %s", e)
+    resp = _retry_request("GET", url, params=params, headers=headers, timeout=30)
+    if resp is None:
+        logger.warning("Semantic Scholar search failed after retries")
         return []
 
     data = resp.json()
@@ -197,11 +235,9 @@ def search_openalex(query: str, max_results: int = 20) -> list[dict]:
         "sort": "cited_by_count:desc",
     }
     logger.info("OpenAlex: searching %d papers for '%s' ...", max_results, query[:60])
-    try:
-        resp = requests.get(url, params=params, timeout=30)
-        resp.raise_for_status()
-    except (requests.RequestException, UnicodeError) as e:
-        logger.warning("OpenAlex error: %s", e)
+    resp = _retry_request("GET", url, params=params, timeout=30)
+    if resp is None:
+        logger.warning("OpenAlex search failed after retries")
         return []
 
     data = resp.json()
