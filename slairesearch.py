@@ -16,6 +16,7 @@ import os
 import json
 import re
 import time
+import hashlib
 import subprocess
 import logging
 from datetime import datetime, timezone
@@ -3417,33 +3418,29 @@ def _extract_baselines_via_llm_full_context(
 
 
 def _purge_stale_baseline_caches(state, keep_methods: list[str]) -> None:
-    """Clear cached repos from previous runs whose method names aren't in keep_methods.
+    """On retry, purge cached repos whose method names aren't in the current list.
 
-    Prevents the "cache always wins" problem where retry reuses a wrong repo
-    (e.g., LSTM tutorial) because it was cached in a previous attempt.
+    Slug format from ``BaselineFinder._repo_slug`` is:
+        ``safe_method_name_md5(url)[:8]``
+
+    We can't reconstruct the URL hash, but we know the safe_name prefix.
+    Any cache entry whose prefix doesn't match a kept method name is stale.
     """
     import shutil as _shutil
     cache_dir = (Path(state.work_dir) / ".." / ".shared" / "baselines").resolve()
     if not cache_dir.exists():
         return
 
-    keep_lower = {m.lower().strip() for m in keep_methods}
+    keep_prefixes = {
+        re.sub(r'[^a-zA-Z0-9_-]', '_', m.lower().strip())[:30]
+        for m in keep_methods
+    }
+
     purged = 0
     for entry in cache_dir.iterdir():
         if not entry.is_dir():
             continue
-        # Determine if this cache entry matches any kept method
-        keep = False
-        for m in keep_lower:
-            slug = hashlib.md5(m.encode()).hexdigest()[:8]
-            if slug in entry.name:
-                keep = True
-                break
-            # Also check if method name appears at the start (legacy slug format)
-            if m.replace(" ", "_").lower() in entry.name.lower():
-                keep = True
-                break
-
+        keep = any(entry.name.startswith(p) for p in keep_prefixes)
         if not keep:
             logger.info("Purging stale baseline cache: %s", entry.name)
             _shutil.rmtree(entry, ignore_errors=True)
@@ -3484,11 +3481,20 @@ def _validate_baseline_repo_v2(repo_dir: Path, method_name: str, topic: str = ""
                 pass
 
     # ── Gate 1: method name presence (fast, no LLM) ──
+    # Don't require literal match of full name like "Transformer (vanilla)" —
+    # READMEs say "Transformer" not "Transformer (vanilla)".  Try multiple
+    # forms: full name, without parenthetical qualifiers, core words only.
     content_lower = readme_content[:8000].lower()
-    name_found = name_lower in content_lower
-    if not name_found and "-" in name_lower:
-        name_found = name_lower.replace("-", " ") in content_lower
+    name_forms = [
+        name_lower,                              # "transformer (vanilla)"
+        re.sub(r'\s*\([^)]*\)', '', name_lower).strip(),  # "transformer"
+    ]
+    if "-" in name_lower:
+        name_forms.append(name_lower.replace("-", " "))    # "flash attention"
+    if "_" in name_lower:
+        name_forms.append(name_lower.replace("_", " "))
 
+    name_found = any(form in content_lower for form in name_forms)
     if not name_found:
         return False, f"method '{method_name}' not mentioned in README/source"
 
@@ -3525,13 +3531,28 @@ def _llm_judge_repo_relevance(
         f'- "reason": a one-sentence explanation (max 120 chars)\n'
         f"No other output.\n"
     )
+    cmd = [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL,
+           "--max-turns", "1"]
+    call_failed = False  # True when the subprocess/PTY itself failed
     try:
-        result = subprocess.run(
-            [CLAUDE_CMD, "-p", "--output-format", "text", "--model", CLAUDE_MODEL],
-            input=prompt, capture_output=True, text=True, timeout=60,
-            cwd=str(PROJECT_ROOT), env=_claude_subprocess_env(),
-        )
-        raw = result.stdout or ""
+        if _CLAUDE_USE_PTY:
+            rc, raw = run_in_pty(cmd, prompt, timeout=60,
+                                 cwd=str(PROJECT_ROOT), env=_claude_subprocess_env())
+            if rc != 0 or not raw.strip():
+                call_failed = True
+                logger.warning("PTY call failed for '%s' (rc=%d, output_bytes=%d)",
+                               method_name, rc, len(raw))
+        else:
+            result = subprocess.run(
+                cmd, input=prompt, capture_output=True, text=True, timeout=60,
+                cwd=str(PROJECT_ROOT), env=_claude_subprocess_env(),
+            )
+            raw = result.stdout or ""
+            if result.returncode != 0 or not raw.strip():
+                call_failed = True
+                logger.warning("subprocess call failed for '%s' (rc=%d, stderr=%s)",
+                               method_name, result.returncode,
+                               (result.stderr or "")[:200])
         m = re.search(r'\{[^}]*"relevant"[^}]*\}', raw, re.DOTALL)
         if m:
             data = json.loads(m.group(0))
@@ -3539,12 +3560,17 @@ def _llm_judge_repo_relevance(
             reason = data.get("reason", "LLM relevance check")
             return relevant, reason
     except Exception as e:
+        call_failed = True
         logger.warning("LLM repo relevance check failed for '%s': %s", method_name, e)
 
-    # Fallback: allow through (Gate 1 already passed)
-    return True, "LLM check failed — allowing through"
-
-
+    if call_failed:
+        # Transient infra error (timeout, OOM, CANN log flood) — allow through.
+        # Gate 1 (method-name presence) already passed; a false negative here
+        # (dropping a valid repo) silently starves downstream experiments of
+        # baselines, which is worse than a false positive that Gate 2 can catch.
+        return True, "LLM check unavailable — allowing through"
+    # LLM responded but we couldn't parse its output — reject.
+    return False, "LLM check failed — rejecting to be safe"
 def _check_npu_broken() -> str:
     """Test if torch_npu can actually run ops.  Returns CANN version string if
     broken (kernel parse error), empty string if NPU is usable."""
