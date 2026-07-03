@@ -304,8 +304,11 @@ class StageReviewer:
         ]
 
         try:
+            # Pass prompt via stdin — never as a CLI argument — so long
+            # review prompts (20K+ chars of stage output) don't hit OS argv
+            # limits or cause the process to be SIGKILL'd.
             result = subprocess.run(
-                cmd + [prompt], capture_output=True, text=True,
+                cmd, input=prompt, capture_output=True, text=True,
                 timeout=300, cwd=str(PROJECT_ROOT), env={**os.environ},
             )
             raw = result.stdout or ""
@@ -316,7 +319,7 @@ class StageReviewer:
                     stage=stage_name,
                     passed=False,
                     score=0,
-                    feedback=f"评审系统错误: claude exited {rc}",
+                    feedback=f"评审系统错误: claude exited {result.returncode}",
                     critical_issues=["Review system error"],
                     raw_output=raw,
                     reviewer_mode=self.mode,

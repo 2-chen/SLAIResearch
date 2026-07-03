@@ -178,7 +178,10 @@ def run_in_pty(
     import threading
     import io as _io
 
-    full_cmd = list(cmd) + [prompt]
+    # Pass prompt via stdin (consistent with subprocess.run(…, input=prompt))
+    # rather than as a CLI argument.  Large prompts as argv can hit OS limits
+    # or cause the process to be SIGKILL'd before producing any output.
+    full_cmd = list(cmd)
     if env is None:
         env = {}
 
@@ -229,14 +232,38 @@ def run_in_pty(
         reader = threading.Thread(target=_reader, daemon=True)
         reader.start()
 
+        # Feed prompt to child's stdin via the PTY master, then send EOF
+        # so the child sees the same input as the subprocess.run(…, input=…)
+        # path.  Use a separate writer thread so a blocked PTY buffer (child
+        # not reading yet) doesn't stall the output reader.
+        write_done = threading.Event()
+        write_error: list[Exception | None] = [None]
+
+        def _writer() -> None:
+            try:
+                prompt_bytes = prompt.encode("utf-8")
+                # Write in chunks in case the prompt is very large
+                chunk_size = 65536
+                for offset in range(0, len(prompt_bytes), chunk_size):
+                    os.write(master_fd, prompt_bytes[offset:offset + chunk_size])
+                os.write(master_fd, b'\x04')  # Ctrl-D = VEOF
+            except OSError as e:
+                write_error[0] = e
+            finally:
+                write_done.set()
+
+        writer = threading.Thread(target=_writer, daemon=True)
+        writer.start()
+
         # Wait for process OR timeout
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             pass  # Timeout — kill + collect partial output below
 
-        # Give the reader thread up to 30 s to drain remaining data
+        # Give the reader and writer threads up to 30 s to finish
         read_done.wait(timeout=30)
+        write_done.wait(timeout=10)
 
         # If process is still alive after timeout, kill it
         if proc.poll() is None:
@@ -248,7 +275,11 @@ def run_in_pty(
 
         stdout_bytes = out_buf.getvalue()
         stdout = stdout_bytes.decode("utf-8", errors="replace")
-        rc = proc.returncode or 0
+        # Don't use `or 0` — when proc.returncode is None it would
+        # silently become 0 (false success).  Use -1 as sentinel instead.
+        rc = proc.returncode if proc.returncode is not None else -1
+        if write_error[0] is not None:
+            logger.warning("PTY writer thread error: %s", write_error[0])
         if read_error[0] is not None:
             logger.warning("PTY reader thread error: %s", read_error[0])
         if not stdout_bytes:

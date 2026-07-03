@@ -56,6 +56,10 @@ from review_synthesis import ReviewSynthesizer, SynthesisResult
 from claude_pty import run_in_pty
 from exceptions import CheckpointError
 from progress import ProgressEmitter
+from search_papers import (
+    search_arxiv, search_semantic_scholar, search_openalex,
+    merge_results,
+)
 
 try:
     from review_tools import detect_ai_artifacts, run_automated_checks, format_issues_for_llm
@@ -819,20 +823,141 @@ def _find_stage_output(
 
 
 def _do_literature_search(sm: StateManager, state: ResearchState, retry_feedback: str = "") -> ResearchState:
+    """Run real searches then have Claude synthesize a literature review.
+
+    The original flow sent only a prompt to Claude — Claude had no search tools
+    and fabricated paper references, producing ~2k chars of hallucinated content
+    and review scores of 1.5/10.
+
+    Target: 10-15 relevant papers (matches reviewer criteria).  We search 10 per
+    source (30 raw) expecting ~15-20 after dedup, which is a comfortable buffer.
+    """
+    lit_dir = Path(state.literature_dir)
+    lit_dir.mkdir(parents=True, exist_ok=True)
+
+    _MAX_PER_SOURCE = 10   # 3 sources × 10 → 30 raw, 15-20 after dedup
+    _PROMPT_CAP = 20       # papers shown in prompt (enough for review, not waste)
+
+    # ── Step 1: Real searches (cached on retry — paper set doesn't change) ──
+    search_json = lit_dir / "search_results.json"
+    if not search_json.exists() or not retry_feedback:
+        logger.info("Searching arXiv + Semantic Scholar + OpenAlex for: %s", state.topic)
+        all_papers: list[dict] = []
+        for engine, fn in [
+            ("arxiv", search_arxiv),
+            ("semantic_scholar", search_semantic_scholar),
+            ("openalex", search_openalex),
+        ]:
+            try:
+                results = fn(state.topic, max_results=_MAX_PER_SOURCE)
+                logger.info("  %s: %d results", engine, len(results))
+                all_papers.extend(results)
+            except Exception as exc:
+                logger.warning("  %s search failed: %s", engine, exc)
+
+        deduped = merge_results(all_papers)
+        search_json.write_text(json.dumps(deduped, indent=2, ensure_ascii=False))
+        logger.info("Unique papers found: %d → %s", len(deduped), search_json)
+
+        # Save papers_metadata.json for downstream hypothesis_engine.
+        # hypothesis_engine only reads the first 15k chars of this file, so
+        # saving more than ~25 papers is wasted disk I/O.  Already sorted by
+        # citation count (merge_results output).
+        metadata_json = lit_dir / "papers_metadata.json"
+        metadata_json.write_text(
+            json.dumps(deduped[:25], indent=2, ensure_ascii=False)
+        )
+    else:
+        logger.info("Reusing cached search results: %s", search_json)
+
+    # ── Step 2: Prompt Claude to synthesize the review from real papers ──
+    papers = json.loads(search_json.read_text() if search_json.exists() else "[]")
+    papers_context = _format_papers_for_prompt(papers, cap=_PROMPT_CAP)
+
+    # Adapt guidance to paper count
+    n = len(papers)
+    if n >= 15:
+        source_note = (
+            f"Good coverage — {n} papers found.  Use these as your primary source "
+            f"list.  Select the most relevant 10-15 and focus your review on them."
+        )
+    elif n >= 5:
+        source_note = (
+            f"{n} papers found — moderate coverage.  Use all of these as your "
+            f"source list.  You MAY supplement with papers you know to be real, "
+            f"but you MUST provide arXiv IDs or DOIs for any added paper."
+        )
+    else:
+        source_note = (
+            f"Only {n} papers found via automated search (the topic may be niche "
+            f"or the query too specific).  Work with what's available.  You MAY "
+            f"fill gaps from your training data, but every added paper MUST "
+            f"include a verifiable arXiv ID or DOI.  Be honest about limitations "
+            f"in coverage — don't fabricate."
+        )
+
     prompt = _load_prompt("literature_search.md",
         TOPIC=state.topic,
         OUTPUT_DIR=state.literature_dir,
     )
-    logger.info("Calling Claude Code for literature search …")
+    prompt += f"""
+
+---
+## SEARCH RESULTS ({n} real papers from arXiv, Semantic Scholar, OpenAlex)
+
+{source_note}
+
+{papers_context}
+
+IMPORTANT:
+- Every citation MUST come from the list above OR include a verifiable arXiv ID / DOI.
+- Do NOT invent paper titles.  Note gaps honestly.
+- Save the review to: {state.literature_dir}/literature_review.md
+- Save BibTeX to: {state.literature_dir}/references.bib
+"""
+    logger.info("Calling Claude for literature review synthesis (%d papers in context, "
+                "%d in prompt)", n, min(n, _PROMPT_CAP))
     state = _call_claude(sm, state, Stage.LITERATURE_SEARCH, prompt, retry_feedback)
 
-    # ── Ensure structured paper metadata exists for downstream hypothesis_engine ──
-    # The literature review is free-form markdown, but hypothesis_engine needs
-    # papers_metadata.json with structured title/authors/year/abstract/url fields.
-    # Without this, hypothesis_engine extracts 0 papers and runs blind.
-    _ensure_papers_metadata(state.literature_dir)
-
     return state
+
+
+def _format_papers_for_prompt(papers: list[dict], cap: int = 20) -> str:
+    """Format paper list as compact markdown entries for the Claude prompt.
+
+    Keeps entries brief (~250 chars each) so 20 papers ≈ 5k chars — well under
+    the prompt budget while leaving room for the review template and instructions.
+    """
+    if not papers:
+        return "(No papers found.)"
+
+    shown = papers[:cap]
+    omitted = len(papers) - len(shown)
+
+    entries: list[str] = []
+    for i, p in enumerate(shown, 1):
+        title = p.get("title", "Untitled")
+        authors = ", ".join((p.get("authors") or [])[:3])
+        if len(p.get("authors") or []) > 3:
+            authors += " et al."
+        year = p.get("year", "?")
+        url = p.get("url", "")
+        arxiv_id = p.get("arxiv_id", "")
+        abstract = (p.get("abstract") or "")[:200]
+        citations = p.get("citations", 0) or 0
+
+        id_str = arxiv_id if arxiv_id else url
+        entries.append(
+            f"**{i}.** {title}\n"
+            f"  {authors} ({year}) — cited {citations}×\n"
+            f"  {id_str}\n"
+            f"  {abstract}\n"
+        )
+
+    result = "\n".join(entries)
+    if omitted > 0:
+        result += f"\n\n*(+ {omitted} more papers in {papers[0].get('source','?') if shown else ''} results — see search_results.json)*"
+    return result
 
 
 def _do_hypothesis_generation(sm: StateManager, state: ResearchState, retry_feedback: str = "") -> ResearchState:
@@ -2001,9 +2126,21 @@ Please explicitly acknowledge how you've addressed each issue above.
             )
             output = output or ""
             if rc != 0 and not output.strip():
-                raise RuntimeError(
-                    f"Experiment scientist exited {rc} with no output"
+                logger.warning(
+                    "PTY call failed for experiment scientist (rc=%d) — "
+                    "falling back to stdin-PIPE", rc,
                 )
+                result = subprocess.run(
+                    cmd, input=task_prompt, capture_output=True, text=True,
+                    timeout=timeout, cwd=str(state.work_dir),
+                    env=_claude_subprocess_env(),
+                )
+                output = (result.stdout or "")
+                if result.returncode != 0 and not output.strip():
+                    raise RuntimeError(
+                        f"Experiment scientist exited {result.returncode} "
+                        f"with no output (PTY rc={rc})"
+                    )
 
             output_file.write_text(output)
             logger.info(
@@ -2213,6 +2350,7 @@ Please explicitly acknowledge how you've addressed each issue above.
         )
 
         try:
+            output = None  # sentinel: None means "not yet obtained"
             if _CLAUDE_USE_PTY:
                 rc, output = run_in_pty(
                     cmd, prompt,
@@ -2221,10 +2359,14 @@ Please explicitly acknowledge how you've addressed each issue above.
                     env=claude_env,
                 )
                 if rc != 0 and not output.strip():
-                    raise subprocess.CalledProcessError(
-                        rc, cmd, output=output, stderr="",
+                    logger.warning(
+                        "PTY call failed (rc=%d, 0 bytes) — "
+                        "falling back to stdin-PIPE for this attempt",
+                        rc,
                     )
-            else:
+                    output = None  # trigger stdin-PIPE fallback below
+
+            if output is None:
                 result = subprocess.run(
                     cmd, input=prompt, capture_output=True, text=True,
                     timeout=_CLAUDE_TIMEOUT,
