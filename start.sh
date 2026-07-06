@@ -118,11 +118,9 @@ except Exception as e:
 你拥有完全权限来修复项目。目标是让项目能继续顺利运行到下一阶段。
 CRASHPROMPT
 
-    cat /tmp/slai_crash_recovery_prompt.txt | claude -p \
-        --model "${CLAUDE_MODEL:-deepseek-v4-pro}" \
-        --output-format text \
-        --verbose \
-        --append-system-prompt "$(cat ${SCRIPT_DIR}/prompts/sco_debugger_system.md 2>/dev/null || echo '')" 2>&1 | stdbuf -oL tee /tmp/slai_crash_recovery_output.log
+    _claude_task "$(cat /tmp/slai_crash_recovery_prompt.txt)" \
+        "/tmp/slai_crash_recovery_output.log" \
+        "${SCRIPT_DIR}/prompts/sco_debugger_system.md"
 
     echo ""
     echo -e "${GREEN}  自动修复完成，系统继续运行...${NC}"
@@ -186,11 +184,9 @@ CRASHPROMPT
     echo -e "${CYAN}  Claude Code 故障恢复中...${NC}"
     echo "  (读取日志、诊断问题、自动修复)"
 
-    cat /tmp/slai_crash_recovery_prompt.txt | claude -p \
-        --model "${CLAUDE_MODEL:-deepseek-v4-pro}" \
-        --output-format text \
-        --verbose \
-        --append-system-prompt "$(cat ${SCRIPT_DIR}/prompts/sco_debugger_system.md 2>/dev/null || echo '')" 2>&1 | stdbuf -oL tee /tmp/slai_crash_recovery_output.log
+    _claude_task "$(cat /tmp/slai_crash_recovery_prompt.txt)" \
+        "/tmp/slai_crash_recovery_output.log" \
+        "${SCRIPT_DIR}/prompts/sco_debugger_system.md"
 
     local _rc=$?
     echo ""
@@ -235,7 +231,7 @@ fi
 
 # 检查 settings.json 中的 API Key 是否有效（容器重启可能重置）
 if [[ -f ".claude/settings.json" ]]; then
-    SETTINGS_KEY=$(python -c "
+    SETTINGS_KEY=$(python3 -c "
 import json
 d = json.load(open('.claude/settings.json'))
 print(d.get('env',{}).get('ANTHROPIC_API_KEY',''))
@@ -293,12 +289,17 @@ if [[ "$NEED_CONFIG" == "1" ]]; then
     read -rp "SCO 存储挂载: " SCO_STORAGE_MOUNT
     SCO_STORAGE_MOUNT="${SCO_STORAGE_MOUNT:-}"
 
+    # Conda 环境名（昇腾容器中通常不是 "chen"）
+    read -rp "Conda 环境名 [base]: " CONDA_ENV
+    CONDA_ENV="${CONDA_ENV:-base}"
+
     cat > .env <<EOF
 export CLAUDE_MODEL="${CLAUDE_MODEL}"
 export CLAUDE_BASE_URL="${CLAUDE_BASE_URL}"
 export ANTHROPIC_BASE_URL="${CLAUDE_BASE_URL}"
 export ANTHROPIC_API_KEY="${CLAUDE_API_KEY}"
 export CLAUDE_API_KEY="${CLAUDE_API_KEY}"
+export CONDA_ENV="${CONDA_ENV}"
 export SEMANTIC_SCHOLAR_API_KEY="${SEMANTIC_SCHOLAR_API_KEY}"
 export PAPERREVIEW_EMAIL="${PAPERREVIEW_EMAIL}"
 export PAPERREVIEW_VENUE="AAAI"
@@ -351,14 +352,14 @@ source .env 2>/dev/null || true
 
 # ★ 自动修复 settings.json（容器重启可能导致 key 变回占位符）
 if [[ -f ".claude/settings.json" ]] && [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
-    SETTINGS_KEY=$(python -c "
+    SETTINGS_KEY=$(python3 -c "
 import json
 d = json.load(open('.claude/settings.json'))
 print(d.get('env',{}).get('ANTHROPIC_API_KEY',''))
 " 2>/dev/null)
     if [[ "$SETTINGS_KEY" == "your-api-key-here" ]] || [[ -z "$SETTINGS_KEY" ]]; then
         echo -e "${YELLOW}[auto-fix] 修复 settings.json 中的 API Key ...${NC}"
-        python -c "
+        python3 -c "
 import json
 d = json.load(open('.claude/settings.json'))
 d['env']['ANTHROPIC_API_KEY'] = '${ANTHROPIC_API_KEY}'
@@ -416,12 +417,24 @@ _setup_logging() {
 }
 
 # ---------------------------------------------------------------------------
-# Claude Code 调用辅助
+# NPU/Ascend 环境检测
+# ---------------------------------------------------------------------------
+_detect_npu() {
+    # torch_npu is the Ascend NPU bridge — if importable, we're on Ascend.
+    python3 -c "import torch_npu" 2>/dev/null && return 0
+    # Fallback: NPU_ENABLED env var (set by config.py / .env)
+    [[ "${NPU_ENABLED:-}" == "1" ]] && return 0
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Claude Code 调用辅助 (+ PTY on NPU to avoid pipe-buffer hang)
 # ---------------------------------------------------------------------------
 _claude_task() {
     local prompt="$1"
     local log="${2:-/tmp/slai_claude_output.txt}"
     local sys_prompt_file="${3:-}"
+    local extra_claude_flags="${4:-}"  # e.g. "--max-turns 100"
 
     echo -e "${CYAN}  Claude Code 正在工作中...${NC}"
     echo "  (输出实时显示，可能需要几分钟)"
@@ -431,8 +444,33 @@ _claude_task() {
         _sys_flag=("--append-system-prompt" "$(cat "$sys_prompt_file")")
     fi
 
-    echo "$prompt" | claude -p --model "${CLAUDE_MODEL:-deepseek-v4-pro}" --output-format text --verbose \
-        "${_sys_flag[@]}" 2>&1 | stdbuf -oL tee "$log"
+    local _extra_flag=()
+    [[ -n "$extra_claude_flags" ]] && read -ra _extra_flag <<< "$extra_claude_flags"
+
+    # ── PTY wrapper on Ascend/NPU ──
+    if _detect_npu; then
+        local PTY_WRAPPER="${SCRIPT_DIR}/claude_pty.py"
+        if [[ -f "$PTY_WRAPPER" ]]; then
+            echo "  (PTY mode — Ascend/NPU detected)"
+            echo "$prompt" | python3 "$PTY_WRAPPER" claude -p \
+                --model "${CLAUDE_MODEL:-deepseek-v4-pro}" \
+                --output-format text --verbose \
+                "${_sys_flag[@]}" "${_extra_flag[@]}" 2>&1 | stdbuf -oL tee "$log"
+            local rc=${PIPESTATUS[0]}
+            echo ""
+            if [[ $rc -eq 0 ]]; then
+                echo -e "${GREEN}  Claude Code 完成${NC}"
+            else
+                echo -e "${YELLOW}  Claude Code 退出码: $rc${NC}"
+            fi
+            return $rc
+        fi
+        echo "  (PTY wrapper not found, falling back to pipe mode)"
+    fi
+
+    echo "$prompt" | claude -p --model "${CLAUDE_MODEL:-deepseek-v4-pro}" \
+        --output-format text --verbose \
+        "${_sys_flag[@]}" "${_extra_flag[@]}" 2>&1 | stdbuf -oL tee "$log"
 
     local rc=${PIPESTATUS[0]}
     echo ""
@@ -475,7 +513,7 @@ _claude_experiment_design() {
 $(head -100 "$BASELINE_FILE" 2>/dev/null || echo '')"
 
     # 读取 SCO 配置
-    source <(python -c "
+    source <(python3 -c "
 from config import (SCO_WORKSPACE, SCO_AEC2, SCO_IMAGE, SCO_STORAGE_MOUNT,
                     SCO_WORKER_SPEC_MAP, MAX_COMPUTE_BUDGET_GPU_HOURS,
                     EXPERIMENT_MAX_DEBUG_ROUNDS,
@@ -564,7 +602,7 @@ $(tail -5 "$TRACE_FILE" 2>/dev/null)
     fi
 
     # 保存执行轨迹
-    python -c "
+    python3 -c "
 import json
 from datetime import datetime, timezone
 trace = {
@@ -586,7 +624,7 @@ _stage_review() {
     local stage_name="$1"
     local output_file="$2"
 
-    local enabled=$(python -c "import sys; sys.path.insert(0,'${SCRIPT_DIR}'); from config import STAGE_REVIEW_ENABLED; print('1' if STAGE_REVIEW_ENABLED else '0')" 2>/dev/null || echo "1")
+    local enabled=$(python3 -c "import sys; sys.path.insert(0,'${SCRIPT_DIR}'); from config import STAGE_REVIEW_ENABLED; print('1' if STAGE_REVIEW_ENABLED else '0')" 2>/dev/null || echo "1")
     if [[ "$enabled" == "0" ]]; then
         REVIEW_PASSED="True"; REVIEW_SCORE="7.0"; REVIEW_FEEDBACK="[disabled]"
         return 0
@@ -605,7 +643,7 @@ _stage_review() {
     echo "$TOPIC" > /tmp/slai_review_topic.txt
     echo "${STAGE_REVIEW_MODE:-llm}" > /tmp/slai_review_mode.txt
 
-    python -c "
+    python3 -c "
 import sys, json
 sys.path.insert(0, '${SCRIPT_DIR}')
 from stage_reviewer import StageReviewer
@@ -632,10 +670,10 @@ json.dump(result, open('/tmp/slai_review_result.json', 'w'), ensure_ascii=False)
 	local _review_rc=$?
 
     if [[ $_review_rc -eq 0 ]] && [[ -f /tmp/slai_review_result.json ]]; then
-        REVIEW_PASSED=$(python -c "import json; print(json.load(open('/tmp/slai_review_result.json')).get('passed', True))")
-        REVIEW_SCORE=$(python -c "import json; print(json.load(open('/tmp/slai_review_result.json')).get('score', 7.0))")
-        REVIEW_FEEDBACK=$(python -c "import json; print(json.load(open('/tmp/slai_review_result.json')).get('feedback', ''))")
-        REVIEW_SUGGESTION=$(python -c "import json; print(json.load(open('/tmp/slai_review_result.json')).get('suggestion', ''))")
+        REVIEW_PASSED=$(python3 -c "import json; print(json.load(open('/tmp/slai_review_result.json')).get('passed', True))")
+        REVIEW_SCORE=$(python3 -c "import json; print(json.load(open('/tmp/slai_review_result.json')).get('score', 7.0))")
+        REVIEW_FEEDBACK=$(python3 -c "import json; print(json.load(open('/tmp/slai_review_result.json')).get('feedback', ''))")
+        REVIEW_SUGGESTION=$(python3 -c "import json; print(json.load(open('/tmp/slai_review_result.json')).get('suggestion', ''))")
     else
         echo -e "  ${RED}⚠ Stage review 执行失败 (exit=$_review_rc)，无法评估阶段质量${NC}" >&2
         REVIEW_PASSED="True"  # 放行避免阻塞，但标记异常
@@ -661,7 +699,7 @@ json.dump(result, open('/tmp/slai_review_result.json', 'w'), ensure_ascii=False)
 _render_prompt() {
     local template="$1"
     local output="$2"
-    python "${SCRIPT_DIR}/prompt_render.py" "${SCRIPT_DIR}/prompts/${template}" > "$output"
+    python3 "${SCRIPT_DIR}/prompt_render.py" "${SCRIPT_DIR}/prompts/${template}" > "$output"
 }
 
 # ---- _stage_retry_fix: re-run a stage with review feedback via Claude ----
@@ -689,7 +727,7 @@ _on_error() {
 
     # 保存错误状态（项目不丢）
     if [[ -n "${SLUG:-}" ]]; then
-        python -c "
+        python3 -c "
 from state_manager import StateManager
 sm = StateManager('${WORKSPACE}')
 try:
@@ -756,7 +794,7 @@ if isinstance(ds, list):
 
     # ── 1. Wheels ──
     echo "[1/3] 检查/下载 Python wheels..."
-    python -c "
+    python3 -c "
 from sco_runner import _ensure_wheels
 _ensure_wheels()
 print('  Wheels OK')
@@ -766,7 +804,7 @@ print('  Wheels OK')
     echo "[2/3] 预下载模型..."
     if [[ -f "$exp_script" ]]; then
         # 有 run_experiment.sh → 扫描脚本中的模型引用
-        python -c "
+        python3 -c "
 from sco_runner import _ensure_model_cache
 from pathlib import Path
 ok = _ensure_model_cache(Path('$exp_script'))
@@ -775,7 +813,7 @@ print('  Models OK' if ok else '  Models 部分失败（非致命）')
     elif [[ -n "$MANIFEST_MODEL" ]]; then
         # 无脚本但有 manifest → 直接从 manifest 预下载模型
         echo "  从 manifest 预下载模型: ${MANIFEST_MODEL}"
-        python -c "
+        python3 -c "
 from model_downloader import ThreeLayerDownloader
 dl = ThreeLayerDownloader()
 result = dl.download('${MANIFEST_MODEL}')
@@ -788,7 +826,7 @@ print('  Model OK' if result.success else f'  Model 下载失败: {result.error}
     # ── 3. Datasets ──
     echo "[3/3] 预下载数据集..."
     if [[ -f "$exp_script" ]]; then
-        python -c "
+        python3 -c "
 from sco_runner import _ensure_dataset_cache
 from pathlib import Path
 ok = _ensure_dataset_cache(Path('$exp_script'))
@@ -796,7 +834,7 @@ print('  Datasets OK' if ok else '  Datasets 部分失败（非致命）')
 " 2>&1 || echo "  Datasets 预下载跳过"
     elif [[ -n "$MANIFEST_DATASETS" ]]; then
         echo "  从 manifest 预下载数据集: ${MANIFEST_DATASETS}"
-        python -c "
+        python3 -c "
 from model_downloader import ThreeLayerDownloader
 import os
 dl = ThreeLayerDownloader()
@@ -820,7 +858,7 @@ for ds in '${MANIFEST_DATASETS}'.split(','):
     # 只要有 experiment 目录就尝试安装 — 即使 .py 文件此刻不存在，
     # manifest 中的 model_type 字段可以提示需要哪些包
     if [[ -d "$exp_dir" ]]; then
-        python -c "
+        python3 -c "
 from sco_runner import _prepare_env_for_sco
 from pathlib import Path
 ok = _prepare_env_for_sco(Path('$exp_dir'))
@@ -873,14 +911,14 @@ cd "$SCRIPT_DIR"
 # 激活 conda 环境 (如果存在)
 if command -v conda &>/dev/null; then
     source "$(conda info --base)/etc/profile.d/conda.sh" 2>/dev/null || true
-    conda activate chen 2>/dev/null || conda activate base 2>/dev/null || true
+    conda activate base 2>/dev/null || true
 fi
 
 # 安装依赖（如 requirements.txt 存在）
 pip install -r requirements.txt -q 2>/dev/null || true
 
 # 运行实验
-exec python run_experiment.py "$@"
+exec python3 run_experiment.py "$@"
 WRAPPER_EOF
         chmod +x "$EXP_SCRIPT"
         echo -e "${GREEN}  已生成: ${EXP_SCRIPT}${NC}"
@@ -890,7 +928,7 @@ WRAPPER_EOF
     if [[ -f "$RESULTS" ]]; then
         echo -e "${GREEN}实验已有结果 → ${RESULTS}${NC}"
         echo "跳过执行，继续到论文撰写..."
-        python -c "
+        python3 -c "
 from state_manager import StateManager, Stage
 sm = StateManager('${WORKSPACE}')
 state = sm.load('${SLUG}')
@@ -907,7 +945,7 @@ sm.complete_stage(state, Stage.EXPERIMENT_EXECUTION, {'results_file': '${RESULTS
     [[ -f "$BASELINE_FILE" ]] && BASELINE_CTX="- **基线参考**: ${BASELINE_FILE}"
 
     # 读取 SCO 配置
-    source <(python -c "
+    source <(python3 -c "
 from config import (SCO_WORKSPACE, SCO_AEC2, SCO_IMAGE, SCO_STORAGE_MOUNT,
                     SCO_WORKER_SPEC_MAP, MAX_COMPUTE_BUDGET_GPU_HOURS,
                     EXPERIMENT_MAX_DEBUG_ROUNDS, EXPERIMENT_CLAUDE_TIMEOUT,
@@ -1000,7 +1038,7 @@ $(tail -5 "$TRACE_FILE" 2>/dev/null)
 
     # 通过 PTY 运行 claude — 消除 Node.js 管道缓冲，实现逐行实时输出
     local OUT_LOG="${WORKSPACE}/experiment/claude_session_$(date +%Y%m%d-%H%M%S).log"
-    echo "$TASK_PROMPT" | python "${SCRIPT_DIR}/claude_pty.py" \
+    echo "$TASK_PROMPT" | python3 "${SCRIPT_DIR}/claude_pty.py" \
         claude -p \
         --model "${CLAUDE_MODEL:-deepseek-v4-pro}" \
         --output-format text \
@@ -1020,7 +1058,7 @@ $(tail -5 "$TRACE_FILE" 2>/dev/null)
         # 保存执行轨迹
         local OUT_CONTENT
         OUT_CONTENT=$(tail -100 "$OUT_LOG" 2>/dev/null || echo "")
-        python -c "
+        python3 -c "
 import json, sys
 from datetime import datetime, timezone
 trace = {
@@ -1036,7 +1074,7 @@ with open('${TRACE_FILE}', 'a') as f:
 " 2>/dev/null || true
 
         # 标记完成
-        python -c "
+        python3 -c "
 from state_manager import StateManager, Stage
 sm = StateManager('${WORKSPACE}')
 state = sm.load('${SLUG}')
@@ -1079,7 +1117,7 @@ _do_paper_writing() {
         echo ""
         echo -e "${CYAN}── 生成发表级图表 (figure_generation.py) ──${NC}"
         # 生成标准图表集：对比柱状图 + 消融图 + 结果表格
-        python -c "
+        python3 -c "
 import sys; sys.path.insert(0, '${SCRIPT_DIR}')
 from figure_generation import FigureGenerator, TableGenerator, configure_matplotlib
 from pathlib import Path
@@ -1153,7 +1191,7 @@ except Exception as e:
         _stage_review "paper_writing" "${WORKSPACE}/paper/paper.tex" || true
     fi
 
-    python -c "
+    python3 -c "
 from state_manager import StateManager, Stage
 sm = StateManager('${WORKSPACE}')
 state = sm.load('${SLUG}')
@@ -1282,7 +1320,7 @@ else:
     # 与上面的项目级 reviewer_pool.json 互补：evolution 更新全局审稿员能力
     echo ""
     echo -e "${CYAN}── 审稿员进化：从外部审稿中学习新检查维度 ──${NC}"
-    python reviewer_evolution.py auto-evolve --workspace "${WORKSPACE}" 2>&1 || {
+    python3 reviewer_evolution.py auto-evolve --workspace "${WORKSPACE}" 2>&1 || {
         echo -e "  ${YELLOW}[evolution] 审稿员进化跳过（非致命）${NC}"
     }
 
@@ -1338,7 +1376,7 @@ _do_submit_review() {
     local MAX_EXTERNAL_RETRIES=5
 
     while [[ $EXTERNAL_RETRY -lt $MAX_EXTERNAL_RETRIES ]]; do
-        TOKEN_RAW=$(python -c "
+        TOKEN_RAW=$(python3 -c "
 import sys; sys.path.insert(0, '.')
 from paperreview_api import submit_paper
 token = submit_paper('${PDF_FILE}', email='${PAPERREVIEW_EMAIL}', venue='AAAI')
@@ -1374,7 +1412,7 @@ print(token)
         _internal_review_gate 5
 
         ITERATION=$((ITERATION + 1))
-        python -c "
+        python3 -c "
 from state_manager import StateManager
 sm = StateManager('${WORKSPACE}')
 state = sm.load('${SLUG}')
@@ -1392,7 +1430,7 @@ sm.save(state)
     echo -e "Token: ${YELLOW}已获取（长度: ${#TOKEN}）${NC}"
 
     # 用文件传递 TOKEN 避免 shell 注入
-    python -c "
+    python3 -c "
 import sys; sys.path.insert(0, '.')
 from state_manager import StateManager, Stage, ReviewRecord
 sm = StateManager('${WORKSPACE}')
@@ -1402,7 +1440,7 @@ sm.add_review(state, record)
 sm.start_stage(state, Stage.POLL_REVIEW)
 " 2>/dev/null || {
         echo "$TOKEN" > /tmp/slai_token.txt
-        python -c "
+        python3 -c "
 import sys; sys.path.insert(0, '.')
 from state_manager import StateManager, Stage, ReviewRecord
 sm = StateManager('${WORKSPACE}')
@@ -1416,11 +1454,11 @@ sm.start_stage(state, Stage.POLL_REVIEW)
     # 内部审稿 + 外部审稿（并行）
     ROUND_DIR="${WORKSPACE}/review/round_$(printf "%03d" ${ITERATION:-0})"
     mkdir -p "${ROUND_DIR}/internal"
-    python internal_review.py "${PDF_FILE}" -o "${ROUND_DIR}/internal/" &
+    python3 internal_review.py "${PDF_FILE}" -o "${ROUND_DIR}/internal/" &
     INTERNAL_REVIEW_PID=$!
 
     echo "等待 paperreview.ai 审稿结果..."
-    REVIEW_DATA=$(echo "$TOKEN" | python -c "
+    REVIEW_DATA=$(echo "$TOKEN" | python3 -c "
 import sys; sys.path.insert(0, '.')
 from paperreview_api import poll_review, review_to_markdown, extract_verdict
 token = sys.stdin.read().strip()
@@ -1451,7 +1489,7 @@ print(f'VERDICT={verdict}')
     echo "$VERDICT" > /tmp/slai_verdict.txt
 
     # 写入 state
-    python -c "
+    python3 -c "
 import sys; sys.path.insert(0, '.')
 from state_manager import StateManager, Stage
 sm = StateManager('${WORKSPACE}')
@@ -1466,7 +1504,7 @@ sm.complete_stage(state, Stage.POLL_REVIEW, {'verdict': _verdict})
 
     if [[ "$VERDICT" == "accept" ]] || [[ "$VERDICT" == "weak accept" ]]; then
         echo -e "${GREEN}★ 论文已通过审稿！${NC}"
-        python -c "
+        python3 -c "
 from state_manager import StateManager
 sm = StateManager('${WORKSPACE}')
 state = sm.load('${SLUG}')
@@ -1569,7 +1607,7 @@ for d in workspace/*/; do
     if [[ -f "$sf" ]]; then
         slug=$(basename "$d")
         SEEN_SLUGS["$slug"]=1
-        WORK_DIR=$(python -c "
+        WORK_DIR=$(python3 -c "
 import json
 d = json.load(open('$sf'))
 print(d.get('work_dir', ''))
@@ -1578,8 +1616,8 @@ print(d.get('work_dir', ''))
             continue
         fi
         PROJECT_SLUGS+=("$slug")
-        PROJECT_TOPICS+=("$(python -c "import json; print(json.load(open('$sf'))['topic'])" 2>/dev/null || echo "?")")
-        PROJECT_STAGES+=("$(python -c "
+        PROJECT_TOPICS+=("$(python3 -c "import json; print(json.load(open('$sf'))['topic'])" 2>/dev/null || echo "?")")
+        PROJECT_STAGES+=("$(python3 -c "
 import json
 d=json.load(open('$sf'))
 s=d.get('stage','?')
@@ -1587,7 +1625,7 @@ for v in d.get('stages',{}).values():
     if isinstance(v,dict) and v.get('status')=='error': s+=' [有错误]'; break
 print(s)
 " 2>/dev/null || echo "?")")
-        PROJECT_ITERS+=("$(python -c "import json; print(json.load(open('$sf'))['iteration'])" 2>/dev/null || echo "0")")
+        PROJECT_ITERS+=("$(python3 -c "import json; print(json.load(open('$sf'))['iteration'])" 2>/dev/null || echo "0")")
         PROJECT_WORKSPACES+=("$WORK_DIR")
     fi
 done
@@ -1643,7 +1681,7 @@ if [[ ${#PROJECT_SLUGS[@]} -gt 0 ]]; then
         MENU_ARGS+=("${PROJECT_TOPICS[$idx]:0:60}  [${s_disp}] [迭代 ${PROJECT_ITERS[$idx]}]")
     done
 
-    python menu.py "${MENU_ARGS[@]}"
+    python3 menu.py "${MENU_ARGS[@]}"
     stty sane 2>/dev/null || true  # 恢复终端状态，防吞字
     CHOICE=$(cat /tmp/slai_menu_result.txt 2>/dev/null || echo "__QUIT__")
 
@@ -1778,7 +1816,7 @@ print(state.topic_slug)
 
     # 1. LLM 提取关键词组
     echo -e "${CYAN}提取搜索关键词...${NC}"
-    python keyword_extractor.py "${TOPIC}" --groups 3 > /tmp/slai_kw.json 2>/dev/null || true
+    python3 keyword_extractor.py "${TOPIC}" --groups 3 > /tmp/slai_kw.json 2>/dev/null || true
 
     # 2. 提取关键词并搜索
     if [[ -f /tmp/slai_kw.json ]]; then
@@ -1794,20 +1832,20 @@ print(query[:200])
         echo -e "  关键词: ${KW_QUERY:0:120}..."
 
         # 用关键词搜索（比全主题效果好）
-        python search_papers.py "${KW_QUERY:-${TOPIC}}" -n 20 -o "${WORKSPACE}/literature/" \
+        python3 search_papers.py "${KW_QUERY:-${TOPIC}}" -n 20 -o "${WORKSPACE}/literature/" \
             --save-json "${WORKSPACE}/literature/papers_metadata.json" 2>&1
 
         # 补充：也用原始主题搜一次（覆盖可能遗漏的）
-        python search_papers.py "${TOPIC:0:200}" -n 10 -o "${WORKSPACE}/literature/" \
+        python3 search_papers.py "${TOPIC:0:200}" -n 10 -o "${WORKSPACE}/literature/" \
             --save-json "${WORKSPACE}/literature/papers_metadata.json" 2>&1 || true
     else
         # Fallback
-        python search_papers.py "${TOPIC}" -n 20 -o "${WORKSPACE}/literature/" \
+        python3 search_papers.py "${TOPIC}" -n 20 -o "${WORKSPACE}/literature/" \
             --save-json "${WORKSPACE}/literature/papers_metadata.json" 2>&1
     fi
 
     # 3. Tavily 补充（学术 + 相关方法搜索）
-    python tavily_search.py "${TOPIC:0:200}" --max-results 8 --mode academic --output "${WORKSPACE}/literature/tavily_results.md" 2>/dev/null || true
+    python3 tavily_search.py "${TOPIC:0:200}" --max-results 8 --mode academic --output "${WORKSPACE}/literature/tavily_results.md" 2>/dev/null || true
 
     # 4. Claude Code 补充分析和整理
     if [[ -f "${WORKSPACE}/literature/literature_review.md" ]]; then
@@ -1827,7 +1865,7 @@ print(query[:200])
         _stage_review "literature_search" "${WORKSPACE}/literature/literature_review.md" || true
     fi
 
-    python -c "
+    python3 -c "
 from state_manager import StateManager, Stage
 sm = StateManager('${WORKSPACE}')
 state = sm.load('${SLUG}')
@@ -1841,7 +1879,7 @@ sm.complete_stage(state, Stage.LITERATURE_SEARCH, {'papers_found': 0})
 
     mkdir -p "${WORKSPACE}/hypothesis/"
 
-    python hypothesis_engine.py \
+    python3 hypothesis_engine.py \
         --topic "${TOPIC}" \
         --literature-dir "${WORKSPACE}/literature/" \
         --work-dir "${WORKSPACE}/hypothesis/" \
@@ -1865,7 +1903,7 @@ sm.complete_stage(state, Stage.LITERATURE_SEARCH, {'papers_found': 0})
         _stage_review "hypothesis_generation" "${WORKSPACE}/hypothesis/hypothesis_report.md" || true
     fi
 
-    python -c "
+    python3 -c "
 from state_manager import StateManager, Stage
 sm = StateManager('${WORKSPACE}')
 state = sm.load('${SLUG}')
@@ -1883,7 +1921,7 @@ sm.start_stage(state, Stage.BASELINE_FETCHING)
 
     HYPO_FILE="${WORKSPACE}/hypothesis/hypothesis_output.json"
     if [ -f "$HYPO_FILE" ]; then
-        python -c "
+        python3 -c "
 import json, sys
 try:
     data = json.load(open('$HYPO_FILE'))
@@ -1901,7 +1939,7 @@ except Exception:
 " 2>/dev/null && BASELINE_METHODS_ARG="--methods $(cat /tmp/slai_baseline_methods.txt | tr ',' ' ')" || BASELINE_METHODS_ARG=""
     fi
 
-    python "${SCRIPT_DIR}/baseline_finder.py" \
+    python3 "${SCRIPT_DIR}/baseline_finder.py" \
         ${BASELINE_METHODS_ARG} \
         --cache-dir "${WORKSPACE}/../.shared/baselines" \
         --max 5 \
@@ -1912,7 +1950,7 @@ except Exception:
 
     BASELINE_CONTEXT=$(cat "${BASELINE_CTX_FILE}" 2>/dev/null || echo "")
 
-    python -c "
+    python3 -c "
 from state_manager import StateManager, Stage
 sm = StateManager('${WORKSPACE}')
 state = sm.load('${SLUG}')
@@ -1935,7 +1973,7 @@ sm.start_stage(state, Stage.EXPERIMENT_DESIGN)
         mkdir -p "$(dirname "$MANIFEST")"
         echo '{"gpu_count": 4}' > "$MANIFEST"
     else
-        MANIFEST_INFO=$(python -c "
+        MANIFEST_INFO=$(python3 -c "
 import json
 d = json.load(open('$MANIFEST'))
 gpu = d.get('gpu_count', 0)
@@ -1957,7 +1995,7 @@ else:
         _stage_review "experiment_design" "${WORKSPACE}/experiment/experiment_plan.md" || true
     fi
 
-    python -c "
+    python3 -c "
 from state_manager import StateManager, Stage
 sm = StateManager('${WORKSPACE}')
 state = sm.load('${SLUG}')
@@ -1991,7 +2029,7 @@ sm.start_stage(state, Stage.ENVIRONMENT_PREPARATION)
     fi
     echo ""
 
-    python -c "
+    python3 -c "
 from state_manager import StateManager, Stage
 sm = StateManager('${WORKSPACE}')
 state = sm.load('${SLUG}')
@@ -2018,10 +2056,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 if command -v conda &>/dev/null; then
     source "$(conda info --base)/etc/profile.d/conda.sh" 2>/dev/null || true
-    conda activate chen 2>/dev/null || conda activate base 2>/dev/null || true
+    conda activate base 2>/dev/null || true
 fi
 pip install -r requirements.txt -q 2>/dev/null || true
-exec python run_experiment.py "$@"
+exec python3 run_experiment.py "$@"
 WRAPPER_EOF
         chmod +x "$EXP_SCRIPT"
         echo -e "${GREEN}  已生成: ${EXP_SCRIPT}${NC}"
@@ -2031,8 +2069,26 @@ WRAPPER_EOF
         JOB_NAME="cr-${SLUG:0:30}"
 
         # 使用新的 local-first 执行器
+        # ── 检测 NPU (Ascend) ──
+        HAS_NPU=0
+        if _detect_npu; then
+            HAS_NPU=1
+            NPU_INFO=$(python3 -c "
+try:
+    import torch_npu
+    count = torch_npu.device_count()
+    print(f'NPU_AVAILABLE=True')
+    print(f'NPU_COUNT={count}')
+except Exception:
+    print('NPU_AVAILABLE=False')
+    print('NPU_COUNT=0')
+" 2>&1) || true
+            echo "检测到 NPU (Ascend): ${NPU_INFO}"
+        fi
+
+        # ── 检测 GPU ──
         echo "检测本地 GPU ..."
-        GPU_INFO=$(python -c "
+        GPU_INFO=$(python3 -c "
 from sco_runner import detect_gpu
 info = detect_gpu()
 print(f'GPU_AVAILABLE={info[\"available\"]}')
@@ -2043,12 +2099,16 @@ print(f'GPU_COUNT={info[\"count\"]}')
         HAS_GPU=$(echo "$GPU_INFO" | grep "GPU_AVAILABLE=True" && echo 1 || echo 0)
         GPU_COUNT=$(echo "$GPU_INFO" | grep -oP 'GPU_COUNT=\K\d+')
 
-        if [[ "$HAS_GPU" == "1" ]]; then
+        # ── Execution strategy ──
+        if [[ "$HAS_NPU" == "1" ]]; then
+            echo -e "${GREEN}检测到 Ascend NPU — 本地执行（NPU 不通过 SCO 提交）${NC}"
+            SCO_FORCE_LOCAL="True"
+        elif [[ "$HAS_GPU" == "1" ]]; then
             echo -e "${GREEN}检测到 ${GPU_COUNT} 个本地 GPU，优先本地执行${NC}"
             SCO_FORCE_LOCAL="False"
         else
-            echo -e "${YELLOW}未检测到本地 GPU${NC}"
-            NEEDS_GPU=$(python -c "
+            echo -e "${YELLOW}未检测到本地 GPU 或 NPU${NC}"
+            NEEDS_GPU=$(python3 -c "
 from sco_runner import needs_gpu_heuristic
 from pathlib import Path
 print('NEEDS_GPU=' + ('True' if needs_gpu_heuristic(Path('${EXP_SCRIPT}')) else 'False'))
@@ -2070,7 +2130,7 @@ print('NEEDS_GPU=' + ('True' if needs_gpu_heuristic(Path('${EXP_SCRIPT}')) else 
         echo ""
 
         # 使用统一执行器 (local-first)
-        EXEC_OUTPUT=$(python -c "
+        EXEC_OUTPUT=$(python3 -c "
 from sco_runner import run_experiment
 from pathlib import Path
 result = run_experiment(
@@ -2099,7 +2159,7 @@ print(f'ERROR={result.error_summary}')
         if [[ "$BACKEND" == "sco" ]] && [[ -n "$JOB_ID" ]]; then
             echo "$JOB_ID" > /tmp/slai_job_id.txt
             echo "sco" > /tmp/slai_job_backend.txt
-            python -c "
+            python3 -c "
 from state_manager import StateManager
 sm = StateManager('${WORKSPACE}')
 state = sm.load('${SLUG}')
@@ -2155,7 +2215,7 @@ sm.save(state)
                 # ── 修复后重试 ──
                 echo ""
                 echo -e "${YELLOW}修复完成，重新执行实验...${NC}"
-                EXEC_OUTPUT=$(python -c "
+                EXEC_OUTPUT=$(python3 -c "
 from sco_runner import run_experiment
 from pathlib import Path
 result = run_experiment(
@@ -2200,7 +2260,7 @@ print(f'LOG_PATH={result.log_path}')
 import json
 json.dump({'job_id': '''${JOB_ID}''', 'backend': '''${BACKEND}''', 'status': '''${SUCCESS}'''}, open('/tmp/slai_job_result.json','w'))
 " 2>/dev/null
-        python -c "
+        python3 -c "
 from state_manager import StateManager, Stage
 import json
 sm = StateManager('${WORKSPACE}')
